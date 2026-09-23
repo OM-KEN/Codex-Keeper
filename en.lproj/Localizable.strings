@@ -63,7 +63,14 @@
 "从每天的开始时间起，每隔 5 小时安排一次保活，共 4 次。" = "Starting at this time, schedule four keep-alives each day, 5 hours apart.";
 "计划保活点：%@" = "Scheduled keep-alive times: %@";
 "额度恢复后自动继续" = "Resume After Quota Resets";
-"默认发送给 Codex 的内容" = "Default Message to Codex";
+"发送给 Codex 的内容" = "Message to Codex";
+"默认发送“%@”" = "Default: %@";
+"自定义内容" = "Custom Message";
+"编辑自定义内容" = "Edit Custom Message";
+"尚未填写自定义内容" = "No custom message yet";
+"输入发送给 Codex 的内容。" = "Enter the message to send to Codex.";
+"取消" = "Cancel";
+"保存" = "Save";
 "任务因额度用尽而暂停后，会在额度恢复后自动继续。默认继续所有待续任务，你可以在菜单中选择要继续的任务，并为每个任务修改发送内容。" = "When a task pauses because your quota runs out, Keeper tries to resume it after the quota resets. All eligible tasks are selected by default. You can choose tasks and edit each message from the menu.";
 "继续前提醒 Codex 检查项目" = "Remind Codex to Check the Project Before Resuming";
 "项目文件有变化，或无法确认是否变化时，会在发送内容中提醒 Codex 先检查项目和任务进度。关闭后只发送你选定的内容。" = "If project files changed, or Keeper cannot tell, it asks Codex to check the project and task progress first. Turn this off to send only your chosen message.";

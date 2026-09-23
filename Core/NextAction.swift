@@ -16,17 +16,27 @@ struct NextAction {
 enum ResumeMessageMode: String, Codable { case fixed, composerDraft }
 
 enum ResumeMessagePreferences {
+    enum Mode: String { case localizedDefault = "default", custom }
+
+    static let modeKey = "resumeMessageMode"
     static let customizedKey = "resumeMessageCustomized"
 
-    static func effective(_ saved: String?, customized: Bool, localizedDefault: String) -> String {
-        guard let saved else { return localizedDefault }
-        if !customized && (saved == "继续" || saved == "Continue") { return localizedDefault }
+    static func mode(saved: String?, storedMode: String?, legacyCustomized: Bool) -> Mode {
+        if let storedMode, let mode = Mode(rawValue: storedMode) { return mode }
+        if let saved, !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           legacyCustomized || (saved != "继续" && saved != "Continue") { return .custom }
+        return .localizedDefault
+    }
+
+    static func content(saved: String?, mode: Mode, localizedDefault: String) -> String {
+        guard mode == .custom, let saved, !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return localizedDefault }
         return saved
     }
 
     static func current(defaults: UserDefaults = .standard) -> String {
-        effective(defaults.string(forKey: "resumeMessage"), customized: defaults.bool(forKey: customizedKey),
-            localizedDefault: L10n.text("继续"))
+        let saved = defaults.string(forKey: "resumeMessage")
+        return content(saved: saved, mode: mode(saved: saved, storedMode: defaults.string(forKey: modeKey),
+            legacyCustomized: defaults.bool(forKey: customizedKey)), localizedDefault: L10n.text("继续"))
     }
 }
 

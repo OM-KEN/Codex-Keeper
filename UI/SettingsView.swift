@@ -6,10 +6,13 @@ struct SettingsView: View {
     @AppStorage("dailyAnchorMinutes") private var dailyAnchorMinutes = 480
     @AppStorage("autoResume") private var autoResume = true
     @AppStorage("resumeMessage") private var savedResumeMessage = L10n.text("继续")
+    @AppStorage(ResumeMessagePreferences.modeKey) private var savedResumeMessageMode = ""
     @AppStorage(ResumeMessagePreferences.customizedKey) private var resumeMessageCustomized = false
     @AppStorage("resumeWorkspaceReminder") private var resumeWorkspaceReminder = true
     @State private var loginEnabled = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
+    @State private var showingCustomMessageEditor = false
+    @State private var customMessageDraft = ""
     private var dailySchedule: String {
         let calendar = Calendar.current
         let today = Date()
@@ -25,14 +28,24 @@ struct SettingsView: View {
             dailyAnchorMinutes = (c.hour ?? 8) * 60 + (c.minute ?? 0)
         })
     }
-    private var resumeMessage: Binding<String> {
-        Binding(get: {
-            ResumeMessagePreferences.effective(savedResumeMessage, customized: resumeMessageCustomized,
-                localizedDefault: L10n.text("继续"))
-        }, set: {
-            savedResumeMessage = $0
-            resumeMessageCustomized = true
+    private var resumeMessageMode: ResumeMessagePreferences.Mode {
+        ResumeMessagePreferences.mode(saved: savedResumeMessage, storedMode: savedResumeMessageMode,
+            legacyCustomized: resumeMessageCustomized)
+    }
+    private var resumeMessageSelection: Binding<ResumeMessagePreferences.Mode> {
+        Binding(get: { resumeMessageMode }, set: { mode in
+            if mode == .custom { openCustomMessageEditor() }
+            else { savedResumeMessageMode = mode.rawValue }
         })
+    }
+    private var customMessagePreview: String {
+        let flattened = savedResumeMessage.components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return flattened.isEmpty ? L10n.text("尚未填写自定义内容") : flattened
+    }
+    private func openCustomMessageEditor() {
+        let hasCustomText = resumeMessageCustomized || (savedResumeMessage != "继续" && savedResumeMessage != "Continue")
+        customMessageDraft = hasCustomText ? savedResumeMessage : ""
+        showingCustomMessageEditor = true
     }
     var body: some View {
         Form {
@@ -54,14 +67,23 @@ struct SettingsView: View {
             Section(L10n.text("自动继续任务")) {
                 Toggle(L10n.text("额度恢复后自动继续"), isOn: $autoResume)
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(L10n.text("默认发送给 Codex 的内容")).font(.caption).foregroundStyle(.secondary)
-                    TextEditor(text: resumeMessage)
-                        .keeperEditorStyle()
-                        .scrollContentBackground(.hidden)
-                        .font(.body).frame(height: 110)
-                        .padding(5).background(.background, in: RoundedRectangle(cornerRadius: 5))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.separator))
+                    Text(L10n.text("发送给 Codex 的内容")).font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: resumeMessageSelection) {
+                        Text(L10n.format("默认发送“%@”", L10n.text("继续"))).tag(ResumeMessagePreferences.Mode.localizedDefault)
+                        Text(L10n.text("自定义内容")).tag(ResumeMessagePreferences.Mode.custom)
+                    }
+                    .labelsHidden().pickerStyle(.radioGroup)
+                    if resumeMessageMode == .custom {
+                        Button(action: openCustomMessageEditor) {
+                            HStack(spacing: 8) {
+                                Text(customMessagePreview).lineLimit(1).truncationMode(.tail)
+                                Spacer(minLength: 0)
+                                Image(systemName: "pencil").foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.bordered).help(L10n.text("编辑自定义内容"))
+                    }
                 }
                 Text(L10n.text("任务因额度用尽而暂停后，会在额度恢复后自动继续。默认继续所有待续任务，你可以在菜单中选择要继续的任务，并为每个任务修改发送内容。"))
                     .font(.caption).foregroundStyle(.secondary)
@@ -83,6 +105,32 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(12)
         .frame(minWidth: 480, idealWidth: 480, minHeight: 540, idealHeight: 620)
+        .sheet(isPresented: $showingCustomMessageEditor) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(L10n.text("编辑自定义内容")).font(.headline)
+                Text(L10n.text("输入发送给 Codex 的内容。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $customMessageDraft)
+                    .keeperEditorStyle()
+                    .font(.body).frame(height: 150)
+                    .padding(5).background(.background, in: RoundedRectangle(cornerRadius: 5))
+                    .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.separator))
+                HStack {
+                    Spacer()
+                    Button(L10n.text("取消")) { showingCustomMessageEditor = false }
+                        .keyboardShortcut(.cancelAction)
+                    Button(L10n.text("保存")) {
+                        savedResumeMessage = customMessageDraft
+                        resumeMessageCustomized = true
+                        savedResumeMessageMode = ResumeMessagePreferences.Mode.custom.rawValue
+                        showingCustomMessageEditor = false
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(customMessageDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(20).frame(width: 440)
+        }
     }
 }
 

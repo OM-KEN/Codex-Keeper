@@ -24,6 +24,7 @@ This is a beta for local Codex tasks. Keep-alive requires access to `gpt-5.6-lun
 The Codex desktop app may be closed, but Keeper must keep running and your Mac must be awake and online. Keeper skips keep-alive when a valid quota window is already active. Disabling Keeper pauses automatic actions.
 
 The interface supports Simplified Chinese and English and follows the macOS language setting for the app. Changing languages does not overwrite a message you customized for auto-resume.
+In Settings, choose the language-aware default “Continue” or edit a custom message in a dialog.
 
 The disk image is not notarized. If macOS blocks the first launch, verify the download source and follow [Apple's instructions for opening the app](https://support.apple.com/en-us/102445).
 
