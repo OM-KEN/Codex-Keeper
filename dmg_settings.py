@@ -1,0 +1,23 @@
+"""Drag-to-Applications layout shared with the Copied packaging design."""
+format = "UDZO"
+filesystem = "HFS+"
+files = [defines.get("app", ".build/CodexKeeper.app")]
+symlinks = {"Applications": "/Applications"}
+background = "assets/dmg_background.png"
+window_rect = ((200, 200), (440, 299))
+default_view = "icon-view"
+show_status_bar = False
+show_tab_view = False
+show_toolbar = False
+show_pathbar = False
+show_sidebar = False
+icon_size = 80
+text_size = 12
+arrange_by = None
+grid_spacing = 54
+grid_offset = (0, 0)
+scroll_position = (0, 0)
+label_pos = "bottom"
+show_icon_preview = True
+show_item_info = False
+icon_locations = {"CodexKeeper.app": (110, 120), "Applications": (330, 120)}
