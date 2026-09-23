@@ -25,16 +25,23 @@ import Darwin
         check(OnboardingPreferences.needsSetup(defaults: onboardingDefaults, domainName: onboardingSuite), "unfinished setup opens again")
         OnboardingPreferences.complete(anchorMinutes: 615, defaults: onboardingDefaults)
         check(onboardingDefaults.integer(forKey: "dailyAnchorMinutes") == 615 && !OnboardingPreferences.needsSetup(defaults: onboardingDefaults, domainName: onboardingSuite), "chosen time persists and completed setup never repeats")
-        check(ResumeMessagePreferences.effective("继续", customized: false, localizedDefault: "Continue") == "Continue",
-            "legacy Chinese default follows the English app language")
-        check(ResumeMessagePreferences.effective("Continue", customized: false, localizedDefault: "继续") == "继续",
-            "legacy English default follows the Chinese app language")
-        check(ResumeMessagePreferences.effective("检查项目", customized: false, localizedDefault: "Continue") == "检查项目" &&
-            ResumeMessagePreferences.effective("继续", customized: true, localizedDefault: "Continue") == "继续",
-            "custom resume messages keep their exact text")
-        check(ResumeMessagePreferences.effective("", customized: true, localizedDefault: "Continue") == "" &&
-            ResumeMessagePreferences.effective(nil, customized: false, localizedDefault: "Continue") == "Continue",
-            "empty custom text and absent defaults stay distinct")
+        let defaultMode = ResumeMessagePreferences.Mode.localizedDefault
+        let customMode = ResumeMessagePreferences.Mode.custom
+        check(ResumeMessagePreferences.mode(saved: "继续", storedMode: nil, legacyCustomized: false) == defaultMode &&
+            ResumeMessagePreferences.mode(saved: "Continue", storedMode: nil, legacyCustomized: false) == defaultMode &&
+            ResumeMessagePreferences.content(saved: "继续", mode: defaultMode, localizedDefault: "Continue") == "Continue",
+            "legacy built-in text follows the app language")
+        check(ResumeMessagePreferences.mode(saved: "检查项目", storedMode: nil, legacyCustomized: false) == customMode &&
+            ResumeMessagePreferences.mode(saved: "继续", storedMode: nil, legacyCustomized: true) == customMode &&
+            ResumeMessagePreferences.content(saved: "继续", mode: customMode, localizedDefault: "Continue") == "继续",
+            "legacy custom text stays unchanged")
+        check(ResumeMessagePreferences.mode(saved: "检查项目", storedMode: "default", legacyCustomized: true) == defaultMode &&
+            ResumeMessagePreferences.mode(saved: "继续", storedMode: "custom", legacyCustomized: false) == customMode,
+            "explicit selection takes precedence over legacy preferences")
+        check(ResumeMessagePreferences.content(saved: "检查项目", mode: defaultMode, localizedDefault: "Continue") == "Continue" &&
+            ResumeMessagePreferences.content(saved: "检查项目", mode: customMode, localizedDefault: "Continue") == "检查项目" &&
+            ResumeMessagePreferences.content(saved: "", mode: customMode, localizedDefault: "Continue") == "Continue",
+            "default selection ignores stored custom text and empty custom text does not send a blank prompt")
         for message in ["workspace routing discovery timed out", "workspace routing discovery timedout"] {
             check(CodexConnectionError.server(message).localizedDescription == "Codex 服务连接超时，请检查网络或代理后重新同步。" &&
                 CodexConnectionError.serverFailureReason(message) == "workspace_routing_timeout",
