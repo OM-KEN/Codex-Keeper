@@ -35,7 +35,7 @@ import UserNotifications
                   self.appState.execution.activeMode == .keepAlive, !self.notifiedCurrentPing else { return }
             self.notifiedCurrentPing = true
             let content = UNMutableNotificationContent()
-            content.title = "Codex Keeper 保活仍在等待"
+            content.title = L10n.text("Codex Keeper 保活仍在等待")
             content.body = warning
             content.sound = .default
             notifications.add(UNNotificationRequest(identifier: "keeper-ping-wait-" + UUID().uuidString,
@@ -77,12 +77,12 @@ import UserNotifications
     private func rebuildMenu() {
         let enabled = UserDefaults.standard.bool(forKey: "enabled")
         let summary = makeSummary()
-        let statusText = appState.execution.running ? summary.headline : summary.statusText
+        let statusText = appState.execution.running ? L10n.text(summary.headline) : summary.statusText
         let action = summary.action.isEmpty ? summary.headline : summary.action
         statusItem.button?.title = enabled ? " " + statusText : ""
-        statusItem.button?.image = NSImage(systemSymbolName: summary.statusSymbol, accessibilityDescription: action)
+        statusItem.button?.image = NSImage(systemSymbolName: summary.statusSymbol, accessibilityDescription: L10n.text(action))
         statusItem.button?.image?.isTemplate = true
-        statusItem.button?.toolTip = "Codex Keeper · " + action + (summary.isTime ? " · " + summary.statusText : "") + (summary.warning.isEmpty ? "" : " · " + summary.warning)
+        statusItem.button?.toolTip = "Codex Keeper · " + L10n.text(action) + (summary.isTime ? " · " + summary.statusText : "") + (summary.warning.isEmpty ? "" : " · " + summary.warning)
         let view = MenuSummaryView(summary: summary,
             openTasks: { [weak self] in self?.menu.cancelTracking(); self?.openTasks() },
             showError: { [weak self] in self?.menu.cancelTracking(); self?.showExecutionIssue() },
@@ -96,10 +96,10 @@ import UserNotifications
             summaryHost = host
             summaryItem.view = host
             menu.addItem(summaryItem)
-            cancelResumeItem = row("取消下一次自动继续", action: #selector(useKeepAlive))
+            cancelResumeItem = row(L10n.text("取消下一次自动继续"), action: #selector(useKeepAlive))
             menu.addItem(.separator())
-            row("设置…", action: #selector(openSettings)).keyEquivalent = ","
-            row("退出 Codex Keeper", action: #selector(quitApp)).keyEquivalent = "q"
+            row(L10n.text("设置…"), action: #selector(openSettings)).keyEquivalent = ","
+            row(L10n.text("退出 Codex Keeper"), action: #selector(quitApp)).keyEquivalent = "q"
         }
         host.layoutSubtreeIfNeeded()
         host.frame.size = NSSize(width: 304, height: host.fittingSize.height)
@@ -145,9 +145,9 @@ import UserNotifications
 
     @objc private func showExecutionIssue() {
         let alert = NSAlert()
-        alert.messageText = "Codex Keeper 遇到问题"
-        alert.informativeText = makeSummary().error
-        alert.addButton(withTitle: "好")
+        alert.messageText = L10n.text("Codex Keeper 遇到问题")
+        alert.informativeText = L10n.text(makeSummary().error)
+        alert.addButton(withTitle: L10n.text("好"))
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
@@ -160,21 +160,21 @@ import UserNotifications
         guard let plan = appState.cancellationPlan else {
             appState.refresh()
             let alert = NSAlert()
-            alert.messageText = "正在同步"
-            alert.informativeText = "同步完成后即可确认取消时间。"
-            alert.addButton(withTitle: "好"); alert.runModal()
+            alert.messageText = L10n.text("正在同步")
+            alert.informativeText = L10n.text("同步完成后即可确认取消时间。")
+            alert.addButton(withTitle: L10n.text("好")); alert.runModal()
             return
         }
         let clock = DateFormatter(); clock.dateFormat = "HH:mm"
-        let full = DateFormatter(); full.dateFormat = "M月d日 HH:mm"
+        let full = DateFormatter(); full.dateFormat = L10n.text("M月d日 HH:mm")
         func time(_ date: Date) -> String {
             Calendar.current.isDateInToday(date) ? clock.string(from: date) : full.string(from: date)
         }
         let alert = NSAlert()
-        alert.messageText = "取消下一次自动继续？"
-        alert.informativeText = "取消后，所有因达到使用上限而停止的会话不会在\(time(plan.resume))自动继续，Keeper 将会按照计划在\(time(plan.keepAlive))继续保持活动。"
-        alert.addButton(withTitle: "取消自动继续")
-        alert.addButton(withTitle: "保留自动继续")
+        alert.messageText = L10n.text("取消下一次自动继续？")
+        alert.informativeText = L10n.format("取消后，所有因达到使用上限而停止的会话不会在%@自动继续，Keeper 将会按照计划在%@继续保持活动。", time(plan.resume), time(plan.keepAlive))
+        alert.addButton(withTitle: L10n.text("取消自动继续"))
+        alert.addButton(withTitle: L10n.text("保留自动继续"))
         alert.buttons[0].keyEquivalent = ""
         alert.buttons[1].keyEquivalent = "\r"
         NSApp.activate(ignoringOtherApps: true)
@@ -183,7 +183,7 @@ import UserNotifications
     @objc private func openTasks() {
         if tasksWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 500), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            window.title = "自动继续任务"
+            window.title = L10n.text("自动继续任务")
             window.contentView = NSHostingView(rootView: ResumeTasksView(state: appState))
             window.center(); window.isReleasedWhenClosed = false
             tasksWindow = window
@@ -194,7 +194,7 @@ import UserNotifications
     @objc func openSettings() {
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 540), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            window.title = "Codex Keeper 设置"
+            window.title = L10n.text("Codex Keeper 设置")
             window.contentView = NSHostingView(rootView: SettingsView())
             window.center(); window.isReleasedWhenClosed = false
             window.collectionBehavior.insert(.moveToActiveSpace)

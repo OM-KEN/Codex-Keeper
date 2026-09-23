@@ -33,6 +33,7 @@ SOURCES=(
     App/CodexKeeperApp.swift
     App/AppState.swift
     App/MenuBarController.swift
+    Core/Localization.swift
     Core/OnboardingPreferences.swift
     Core/ScheduleEngine.swift
     Core/DecisionEngine.swift
@@ -55,7 +56,7 @@ SOURCES=(
     UI/SettingsView.swift
     UI/OnboardingView.swift
 )
-RESOURCES=(Info.plist assets/NOTICE.md)
+RESOURCES=(Info.plist assets/NOTICE.md en.lproj/Localizable.strings zh-Hans.lproj/Localizable.strings)
 BUILD_FILES=(build.sh VERSION)
 
 echo "🔨 Building CodexKeeper..."
@@ -93,6 +94,7 @@ plutil -replace CFBundleShortVersionString -string "$VERSION" "$STAGED_APP/Conte
 plutil -replace CFBundleVersion -string "$VERSION" "$STAGED_APP/Contents/Info.plist"
 
 cp assets/NOTICE.md "$STAGED_APP/Contents/Resources/ThirdPartyNotices.md"
+cp -R en.lproj zh-Hans.lproj "$STAGED_APP/Contents/Resources/"
 
 # Match Copied: development signing when available, no notarization requirement.
 codesign -s "$IDENTITY" -f "$STAGED_APP"

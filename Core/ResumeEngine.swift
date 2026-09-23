@@ -54,7 +54,7 @@ final class OwnedSessionResumeTransport: ResumeTransport {
             guard !cancelled else { throw CodexConnectionError.ended }
             let data = try file.read(upToCount: 65536) ?? Data()
             if try monitor.consume(data) {
-                return ResumeReceipt(threadID: target.id, turnID: turnID, message: "桌面原任务续跑轮次已完成")
+                return ResumeReceipt(threadID: target.id, turnID: turnID, message: L10n.text("桌面原任务续跑轮次已完成"))
             }
             if data.isEmpty { Thread.sleep(forTimeInterval: 1) }
         }
@@ -127,7 +127,7 @@ final class AppServerResumeTransport: ResumeTransport {
                 guard let params = message["params"] as? [String: Any], params["threadId"] as? String == target.id else { continue }
                 if message["method"] as? String == "turn/completed", let result = params["turn"] as? [String: Any], result["id"] as? String == turnID {
                     guard result["status"] as? String == "completed" else { throw CodexConnectionError.server("续跑已停止，请在 Codex 检查原任务") }
-                    return ResumeReceipt(threadID: target.id, turnID: turnID, message: "续跑轮次已完成")
+                    return ResumeReceipt(threadID: target.id, turnID: turnID, message: L10n.text("续跑轮次已完成"))
                 }
             }
         } catch {
@@ -139,7 +139,7 @@ final class AppServerResumeTransport: ResumeTransport {
 }
 
 enum WorkspaceGuard {
-    static let reminder = "Keeper 自动续跑提醒：请先检查项目当前文件和任务进度，再继续。"
+    static var reminder: String { L10n.text("Keeper 自动续跑提醒：请先检查项目当前文件和任务进度，再继续。") }
 
     static func resumePrompt(_ body: String, before: String?, after: String?, reminderEnabled: Bool) -> String {
         guard reminderEnabled else { return body }

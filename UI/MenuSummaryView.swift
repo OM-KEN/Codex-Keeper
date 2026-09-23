@@ -13,29 +13,29 @@ struct MenuSummaryView: View {
                 Button(action: showError) {
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                        Text(summary.error).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                        Text(L10n.text(summary.error)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
                         Image(systemName: "chevron.right").font(.system(size: 9))
                     }
                     .font(.system(size: 11)).foregroundStyle(.red)
                     .padding(8).background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                }.buttonStyle(.plain).help(summary.error)
+                }.buttonStyle(.plain).help(L10n.text(summary.error))
             }
             HStack {
                 Text("Codex Keeper").font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Text(summary.badge)
+                Text(L10n.text(summary.badge))
                     .font(.system(size: summary.badge == "计划外" ? 13 : 11, weight: .semibold))
                     .foregroundStyle(summary.badge == "计划外" ? Color.orange : Color.secondary)
             }
             VStack(alignment: .leading, spacing: 5) {
                 if !summary.eyebrow.isEmpty {
-                    Text(summary.eyebrow).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(L10n.text(summary.eyebrow)).font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(summary.headline)
+                    Text(L10n.text(summary.headline))
                         .font(.system(size: summary.isTime ? 38 : 24, weight: .semibold)).monospacedDigit()
                     if !summary.action.isEmpty {
-                        Text(summary.action).font(.system(size: 17, weight: .semibold))
+                        Text(L10n.text(summary.action)).font(.system(size: 17, weight: .semibold))
                     }
                     Button(action: refresh) {
                         ZStack {
@@ -50,14 +50,14 @@ struct MenuSummaryView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
-                    .help(summary.isRefreshing ? "正在同步；点击可在完成后重新读取" : "重新同步额度")
-                    .accessibilityLabel(summary.isRefreshing ? "正在同步额度" : "重新同步额度")
+                    .help(L10n.text(summary.isRefreshing ? "正在同步；点击可在完成后重新读取" : "重新同步额度"))
+                    .accessibilityLabel(L10n.text(summary.isRefreshing ? "正在同步额度" : "重新同步额度"))
                     .accessibilityValue(summary.refreshMessage)
                 }
                 if !summary.refreshMessage.isEmpty {
                     Text(summary.refreshMessage).font(.system(size: 11)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityLabel("同步状态：" + summary.refreshMessage)
+                        .accessibilityLabel(L10n.format("同步状态：%@", summary.refreshMessage))
                 }
                 if let title = summary.tasks.first {
                     Button(action: openTasks) {
@@ -65,7 +65,7 @@ struct MenuSummaryView: View {
                             Image(systemName: summary.taskCount > 1 ? "bubble.left.and.text.bubble.right" : "text.bubble")
                             Text(title).lineLimit(1).truncationMode(.tail)
                             if summary.taskCount > 1 {
-                                Text("等\(summary.taskCount)个会话").foregroundStyle(.primary).fixedSize()
+                                Text(L10n.format("等%d个会话", summary.taskCount)).foregroundStyle(.primary).fixedSize()
                             }
                             Spacer(minLength: 0)
                             Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
@@ -75,14 +75,14 @@ struct MenuSummaryView: View {
                         .background(tasksHovered ? Color.accentColor.opacity(0.10) : Color.clear,
                             in: RoundedRectangle(cornerRadius: 5))
                         .contentShape(Rectangle())
-                    }.buttonStyle(.plain).padding(.top, 4).help("选择会话和续跑方式")
+                    }.buttonStyle(.plain).padding(.top, 4).help(L10n.text("选择会话和续跑方式"))
                         .onHover { tasksHovered = $0 }
                 }
                 if summary.timeline.count > 1 {
                     MenuTimelineView(points: summary.timeline).padding(.top, 10)
                 }
                 if !summary.note.isEmpty {
-                    Text(summary.note).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(L10n.text(summary.note)).font(.system(size: 11)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true).padding(.top, 3)
                 }
             }
@@ -91,22 +91,22 @@ struct MenuSummaryView: View {
                 VStack(spacing: 10) {
                     ForEach(summary.quotas) { quota in
                         HStack(spacing: 6) {
-                            Text(quota.name).foregroundStyle(.secondary).frame(width: 31, alignment: .leading)
+                            Text(L10n.text(quota.name)).foregroundStyle(.secondary).frame(width: 31, alignment: .leading)
                             if quota.remaining.rounded() <= 0 {
                                 // Native ProgressView keeps a minimum fill even at zero.
                                 Capsule().fill(Color.primary.opacity(0.05))
                                     .overlay(Capsule().strokeBorder(Color.primary.opacity(0.05)))
                                     .frame(height: 8)
-                                    .accessibilityLabel("\(quota.name)剩余额度")
+                                    .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
                                     .accessibilityValue("0%")
                             } else {
                                 ProgressView(value: max(0, min(100, quota.remaining)), total: 100)
                                     .progressViewStyle(.linear).tint(.accentColor)
-                                    .accessibilityLabel("\(quota.name)剩余额度")
+                                    .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
                             }
                             Text("\(Int(max(0, min(100, quota.remaining)).rounded()))%")
                                 .monospacedDigit().frame(width: 32, alignment: .trailing)
-                            Text(quota.detail).foregroundStyle(.secondary)
+                            Text(L10n.text(quota.detail)).foregroundStyle(.secondary)
                                 .frame(width: 106, alignment: .trailing).lineLimit(1)
                         }.font(.system(size: 11))
                     }
@@ -138,12 +138,12 @@ private struct MenuTimelineView: View {
                         .foregroundStyle(point.isAction ? Color.accentColor : Color.secondary)
                         .frame(width: 16, height: 16)
                         .alignmentGuide(.timelineSymbol) { $0[VerticalAlignment.center] }
-                    Text(point.label).font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(L10n.text(point.label)).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 .layoutPriority(1)
-                .help(point.kind == .keepAlive || point.kind == .scheduled ? "计划节点；已有有效额度窗口时跳过" : point.label)
+                .help(L10n.text(point.kind == .keepAlive || point.kind == .scheduled ? "计划节点；已有有效额度窗口时跳过" : point.label))
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(point.day) \(point.time) \(point.label)")
+                .accessibilityLabel("\(point.day) \(point.time) \(L10n.text(point.label))")
                 if index + 1 < points.count {
                     GeometryReader { geometry in
                         Path { path in

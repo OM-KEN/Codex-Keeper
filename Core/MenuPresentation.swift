@@ -76,10 +76,10 @@ extension MenuSummary {
         if plan?.note == "已停用" { return MenuSummary(headline: "已停用") }
         guard let usage, usage.isFresh(at: now), let plan else { return MenuSummary(headline: "正在同步", isSyncing: true) }
         let clock = DateFormatter(); clock.dateFormat = "HH:mm"
-        let day = DateFormatter(); day.dateFormat = "M月d日"
+        let day = DateFormatter(); day.dateFormat = L10n.text("M月d日")
         func dayText(_ date: Date) -> String {
-            if Calendar.current.isDate(date, inSameDayAs: now) { return "今天" }
-            if let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: now), Calendar.current.isDate(date, inSameDayAs: tomorrow) { return "明天" }
+            if Calendar.current.isDate(date, inSameDayAs: now) { return L10n.text("今天") }
+            if let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: now), Calendar.current.isDate(date, inSameDayAs: tomorrow) { return L10n.text("明天") }
             return day.string(from: date)
         }
         var result = MenuSummary(action: plan.mode.title)
@@ -98,7 +98,7 @@ extension MenuSummary {
         if let date = plan.date {
             result.headline = clock.string(from: date)
             result.statusDatePrefix = Calendar.current.isDate(date, inSameDayAs: now) ? "" : dayText(date)
-            result.eyebrow = "下一次 · " + dayText(date)
+            result.eyebrow = L10n.format("下一次 · %@", dayText(date))
             result.isTime = true
         } else {
             let syncing = plan.note.contains("同步") || plan.note.contains("确认")
@@ -116,7 +116,7 @@ extension MenuSummary {
             if result.badge == "计划外", plan.mode != .resume {
                 result.headline = clock.string(from: five.resetsAt)
                 result.statusDatePrefix = Calendar.current.isDate(five.resetsAt, inSameDayAs: now) ? "" : dayText(five.resetsAt)
-                result.eyebrow = "当前额度 · " + dayText(five.resetsAt)
+                result.eyebrow = L10n.format("当前额度 · %@", dayText(five.resetsAt))
                 result.action = "额度重置"
                 result.isTime = true
             }

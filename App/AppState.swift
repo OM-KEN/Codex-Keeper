@@ -136,7 +136,7 @@ import Network
         let chosen = selectedTasks
         let requests = chosen.map { target in
             ResumeRequest(target: target,
-                prompt: choices.message(for: target, default: UserDefaults.standard.string(forKey: "resumeMessage") ?? "继续"),
+                prompt: choices.message(for: target, default: UserDefaults.standard.string(forKey: "resumeMessage") ?? L10n.text("继续")),
                 accountID: accountBindings[target.id], workspace: workspaceAtBlock[target.episodeKey], messageMode: choices.mode(for: target))
         }
         execution.resume(requests, schedule: schedule, manual: manual,

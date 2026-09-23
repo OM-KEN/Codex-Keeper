@@ -175,7 +175,7 @@ final class SessionWatcher: ObservableObject {
             if let range = name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) { id = String(name[range]) }
         }
         guard UUID(uuidString: id) != nil else { return nil }
-        return SessionActivity(id: id, project: cwd.isEmpty ? "未知项目" : URL(fileURLWithPath: cwd).lastPathComponent,
+        return SessionActivity(id: id, project: cwd.isEmpty ? L10n.text("未知项目") : URL(fileURLWithPath: cwd).lastPathComponent,
             cwd: cwd, fileURL: url, lastActivityAt: activity, fiveHour: five, weekly: weekly,
             sawErrorEvent: sawError, taskRunning: running, lastUserMessageAt: userAt, quotaBlockedAt: blockedAt,
             lastCompletedAt: completedAt, blockingFiveReset: blockedFive, blockingWeeklyReset: blockedWeekly, lastAssistantMessageAt: assistantAt, lastTaskStartedAt: startedAt, lastAbortedAt: abortedAt, isSubagent: isSubagent, createdAt: createdAt)
