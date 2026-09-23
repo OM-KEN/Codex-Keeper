@@ -5,7 +5,8 @@ struct SettingsView: View {
     @AppStorage("enabled") private var enabled = true
     @AppStorage("dailyAnchorMinutes") private var dailyAnchorMinutes = 480
     @AppStorage("autoResume") private var autoResume = true
-    @AppStorage("resumeMessage") private var resumeMessage = L10n.text("继续")
+    @AppStorage("resumeMessage") private var savedResumeMessage = L10n.text("继续")
+    @AppStorage(ResumeMessagePreferences.customizedKey) private var resumeMessageCustomized = false
     @AppStorage("resumeWorkspaceReminder") private var resumeWorkspaceReminder = true
     @State private var loginEnabled = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
@@ -22,6 +23,15 @@ struct SettingsView: View {
         Binding(get: { Calendar.current.date(from: DateComponents(hour: dailyAnchorMinutes / 60, minute: dailyAnchorMinutes % 60)) ?? Date() }, set: {
             let c = Calendar.current.dateComponents([.hour, .minute], from: $0)
             dailyAnchorMinutes = (c.hour ?? 8) * 60 + (c.minute ?? 0)
+        })
+    }
+    private var resumeMessage: Binding<String> {
+        Binding(get: {
+            ResumeMessagePreferences.effective(savedResumeMessage, customized: resumeMessageCustomized,
+                localizedDefault: L10n.text("继续"))
+        }, set: {
+            savedResumeMessage = $0
+            resumeMessageCustomized = true
         })
     }
     var body: some View {
@@ -45,7 +55,7 @@ struct SettingsView: View {
                 Toggle(L10n.text("额度恢复后自动继续"), isOn: $autoResume)
                 VStack(alignment: .leading, spacing: 8) {
                     Text(L10n.text("默认发送给 Codex 的内容")).font(.caption).foregroundStyle(.secondary)
-                    TextEditor(text: $resumeMessage)
+                    TextEditor(text: resumeMessage)
                         .keeperEditorStyle()
                         .scrollContentBackground(.hidden)
                         .font(.body).frame(height: 110)

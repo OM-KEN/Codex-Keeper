@@ -15,6 +15,21 @@ struct NextAction {
 /// Choices refer to a quota-stop episode, so a later stop in the same task defaults to selected.
 enum ResumeMessageMode: String, Codable { case fixed, composerDraft }
 
+enum ResumeMessagePreferences {
+    static let customizedKey = "resumeMessageCustomized"
+
+    static func effective(_ saved: String?, customized: Bool, localizedDefault: String) -> String {
+        guard let saved else { return localizedDefault }
+        if !customized && (saved == "继续" || saved == "Continue") { return localizedDefault }
+        return saved
+    }
+
+    static func current(defaults: UserDefaults = .standard) -> String {
+        effective(defaults.string(forKey: "resumeMessage"), customized: defaults.bool(forKey: customizedKey),
+            localizedDefault: L10n.text("继续"))
+    }
+}
+
 struct ResumeChoices: Codable, Equatable {
     var messageModes: [String: ResumeMessageMode]? = nil
 

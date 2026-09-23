@@ -32,7 +32,7 @@ struct ResumeTasksView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     } else {
                         TextEditor(text: Binding(get: {
-                            state.choices.messages[task.episodeKey] ?? UserDefaults.standard.string(forKey: "resumeMessage") ?? L10n.text("继续")
+                            state.choices.messages[task.episodeKey] ?? ResumeMessagePreferences.current()
                         }, set: { state.setMessage(task, $0) }))
                         .keeperEditorStyle()
                         .scrollContentBackground(.hidden)
