@@ -11,22 +11,23 @@ protocol CodexTransport: AnyObject {
 }
 
 enum CodexConnectionError: LocalizedError {
-    case unavailable, timeout, ended, invalidResponse, server(String), approvalRequired
+    case unavailable, timeout, ended, invalidResponse, server(String), localizedMessage(String), approvalRequired
     var errorDescription: String? {
         switch self {
-        case .unavailable: return "找不到官方 Codex CLI"
-        case .timeout: return "Codex 连接超时，未自动重试"
-        case .ended: return "Codex 连接已结束"
-        case .invalidResponse: return "Codex 返回了无法识别的数据"
+        case .unavailable: return L10n.text("找不到官方 Codex CLI")
+        case .timeout: return L10n.text("Codex 连接超时，未自动重试")
+        case .ended: return L10n.text("Codex 连接已结束")
+        case .invalidResponse: return L10n.text("Codex 返回了无法识别的数据")
         case .server(let message):
             switch Self.serverFailureReason(message) {
-            case "workspace_routing_timeout", "request_timeout": return "Codex 服务连接超时，请检查网络或代理后重新同步。"
-            case "connection_failed": return "无法连接 Codex 服务，请检查网络或代理后重新同步。"
-            case "service_unavailable": return "Codex 服务暂时不可用，请稍后重新同步。"
+            case "workspace_routing_timeout", "request_timeout": return L10n.text("Codex 服务连接超时，请检查网络或代理后重新同步。")
+            case "connection_failed": return L10n.text("无法连接 Codex 服务，请检查网络或代理后重新同步。")
+            case "service_unavailable": return L10n.text("Codex 服务暂时不可用，请稍后重新同步。")
             default:
-                return message.range(of: #"[\p{Han}]"#, options: .regularExpression) != nil ? message : "Codex 请求失败，请检查网络和登录状态后重试。"
+                return message.range(of: #"[\p{Han}]"#, options: .regularExpression) != nil ? L10n.text(message) : L10n.text("Codex 请求失败，请检查网络和登录状态后重试。")
             }
-        case .approvalRequired: return "需要用户授权；请在 Codex 中检查原任务后继续"
+        case .localizedMessage(let message): return message
+        case .approvalRequired: return L10n.text("需要用户授权；请在 Codex 中检查原任务后继续")
         }
     }
 
@@ -191,7 +192,7 @@ extension UsageProvider {
 
 private struct CodexCapabilityError: LocalizedError {
     let message: String
-    var errorDescription: String? { message }
+    var errorDescription: String? { L10n.text(message) }
 }
 
 final class AppServerUsageProvider: UsageProvider {
@@ -296,7 +297,7 @@ final class AppServerUsageProvider: UsageProvider {
                 }
                 throw CodexCapabilityError(message: "当前账户未提供 gpt-5.6-luna；请确认 Codex 登录和模型权限后重试，Keeper 不会自动改用其他模型")
             } catch {
-                let failure = CodexCapabilityError(message: "保活模型确认失败：\(error.localizedDescription)；5 分钟后可重试")
+                let failure = CodexCapabilityError(message: L10n.format("保活模型确认失败：%@；5 分钟后可重试", error.localizedDescription))
                 modelFailure = failure
                 modelRetryAfter = uptime() + 300
                 // Capability errors leave the healthy quota connection reusable.

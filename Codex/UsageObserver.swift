@@ -90,7 +90,7 @@ final class UsageObserver: ObservableObject {
         guard !refreshing else {
             if manual {
                 pendingManualSource = source
-                refreshMessage = "正在同步，完成后重新读取…"
+                refreshMessage = L10n.text("正在同步，完成后重新读取…")
                 appendLogEntry(["event": "usage_refresh_queued", "trigger": trigger,
                     "request_id": requestID ?? "", "logged_at": ISO8601DateFormatter().string(from: Date())])
             }
@@ -100,7 +100,7 @@ final class UsageObserver: ObservableObject {
         requestID = id
         let started = ProcessInfo.processInfo.systemUptime
         if manual {
-            refreshMessage = "正在刷新额度…"
+            refreshMessage = L10n.text("正在刷新额度…")
             appendLogEntry(["event": "usage_refresh_started", "trigger": trigger,
                 "request_id": id, "logged_at": ISO8601DateFormatter().string(from: Date())])
         }
@@ -139,7 +139,7 @@ final class UsageObserver: ObservableObject {
             lastErrorReason = result.2
             if manual || !refreshMessage.isEmpty {
                 let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
-                refreshMessage = result.1 == nil ? "已更新 · " + clock.string(from: Date()) : "刷新失败，请点击刷新按钮重试。"
+                refreshMessage = result.1 == nil ? L10n.format("已更新 · %@", clock.string(from: Date())) : L10n.text("刷新失败，请点击刷新按钮重试。")
             }
             if manual {
                 appendLogEntry(["event": "usage_refresh_finished", "trigger": trigger,

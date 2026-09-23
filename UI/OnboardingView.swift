@@ -19,7 +19,7 @@ struct OnboardingView: View {
         let clock = DateFormatter()
         clock.dateFormat = "HH:mm"
         return ScheduleEngine(anchorMinutes: anchorMinutes).nodes(on: today, calendar: calendar).dropFirst().map {
-            (calendar.isDate($0, inSameDayAs: today) ? "" : "次日 ") + clock.string(from: $0)
+            (calendar.isDate($0, inSameDayAs: today) ? "" : L10n.text("次日 ")) + clock.string(from: $0)
         }
     }
 
@@ -35,7 +35,7 @@ struct OnboardingView: View {
             HStack {
                 if step > 0 {
                     Button { navigate(to: step - 1) } label: {
-                        Text("开始使用").hidden().overlay(Text("返回"))
+                        Text(L10n.text("开始使用")).hidden().overlay(Text(L10n.text("返回")))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
@@ -45,8 +45,8 @@ struct OnboardingView: View {
                     if step < 2 { navigate(to: step + 1) }
                     else { onStart(anchorMinutes) }
                 } label: {
-                    Text("开始使用").hidden()
-                        .overlay(Text(step == 0 ? "开始设置" : step == 1 ? "下一步" : "开始使用"))
+                    Text(L10n.text("开始使用")).hidden()
+                        .overlay(Text(L10n.text(step == 0 ? "开始设置" : step == 1 ? "下一步" : "开始使用")))
                         .frame(maxWidth: step == 0 ? .infinity : nil)
                 }
                 .buttonStyle(.borderedProminent)
@@ -76,17 +76,17 @@ struct OnboardingView: View {
             }
         case 1:
             VStack(alignment: .leading, spacing: 14) {
-                Text("1. 按计划保持活动").font(.title2.weight(.semibold))
-                Text("每 5 小时让 Codex 自动保持活动，帮你更充分地利用每天的额度。")
+                Text(L10n.text("1. 按计划保持活动")).font(.title2.weight(.semibold))
+                Text(L10n.text("每 5 小时让 Codex 自动保持活动，帮你更充分地利用每天的额度。"))
                     .font(.system(size: NSFont.systemFontSize + 1))
                     .foregroundStyle(.primary.opacity(0.8))
                     .lineSpacing(3)
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("设置你的每日计划").fontWeight(.medium)
+                    Text(L10n.text("设置你的每日计划")).fontWeight(.medium)
                     OnboardingTimesLayout {
-                        DatePicker("设置你的每日计划", selection: $startTime, displayedComponents: .hourAndMinute)
+                        DatePicker(L10n.text("设置你的每日计划"), selection: $startTime, displayedComponents: .hourAndMinute)
                             .labelsHidden()
                             .fixedSize()
                         ForEach(Array(followingTimes.enumerated()), id: \.offset) { _, time in
@@ -105,8 +105,8 @@ struct OnboardingView: View {
             }
         default:
             VStack(alignment: .leading, spacing: 14) {
-                Text("2. 自动继续任务").font(.title2.weight(.semibold))
-                Text("任务因额度用完而暂停后，会在额度恢复后自动发送“继续”。")
+                Text(L10n.text("2. 自动继续任务")).font(.title2.weight(.semibold))
+                Text(L10n.text("任务因额度用完而暂停后，会在额度恢复后自动发送“继续”。"))
                     .font(.system(size: NSFont.systemFontSize + 1))
                     .foregroundStyle(.primary.opacity(0.8))
                     .lineSpacing(3)

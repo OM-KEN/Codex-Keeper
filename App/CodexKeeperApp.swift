@@ -27,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         UserDefaults.standard.register(defaults: [
             "enabled": true,
             "autoResume": true,
-            "resumeMessage": "继续",
+            "resumeMessage": L10n.text("继续"),
             "resumeWorkspaceReminder": true,
         ])
         if needsSetup { showOnboarding() }

@@ -8,7 +8,7 @@ import Darwin
     @Published private(set) var lastFailure: String?
     @Published private(set) var warning: String?
     @Published private(set) var activeMode: NextActionMode?
-    @Published private(set) var status = "等待计划"
+    @Published private(set) var status = L10n.text("等待计划")
     private var attempts: Set<String>
     private let ledgerURL: URL
     private let events: ExecutionEventLog
@@ -32,13 +32,13 @@ import Darwin
         self.events = ExecutionEventLog(url: self.ledgerURL.deletingLastPathComponent().appendingPathComponent("execution-events.jsonl"))
         if FileManager.default.fileExists(atPath: self.ledgerURL.path) {
             if let data = try? Data(contentsOf: self.ledgerURL), let saved = try? JSONDecoder().decode([String].self, from: data) { attempts = Set(saved) }
-            else { attempts = []; ledgerHealthy = false; status = "执行记录无法读取，已暂停自动操作" }
+            else { attempts = []; ledgerHealthy = false; status = L10n.text("执行记录无法读取，已暂停自动操作") }
         } else { attempts = [] }
         try? FileManager.default.createDirectory(at: self.ledgerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         executionLock = Darwin.open(self.ledgerURL.deletingLastPathComponent().appendingPathComponent("execution.lock").path, O_CREAT | O_RDWR, 0o600)
         if executionLock < 0 || flock(executionLock, LOCK_EX | LOCK_NB) != 0 {
             ledgerHealthy = false
-            status = "另一个 Keeper 实例正在管理执行"
+            status = L10n.text("另一个 Keeper 实例正在管理执行")
         }
         if !ledgerHealthy { lastFailure = status }
     }
@@ -51,7 +51,7 @@ import Darwin
         generation += 1
         for transport in activeTransports.values { transport.cancel() }
         pingTransport.cancel()
-        status = "执行已停止，请在 Codex 检查原任务"
+        status = L10n.text("执行已停止，请在 Codex 检查原任务")
     }
 
 
@@ -65,7 +65,7 @@ import Darwin
         lastFailure = nil
         activeMode = .keepAlive
         running = true
-        status = "正在确认保活条件…"
+        status = L10n.text("正在确认保活条件…")
         let provider = provider
         let pingTransport = pingTransport
         Task {
@@ -85,7 +85,7 @@ import Darwin
                 attempts.insert(key)
                 try FileManager.default.createDirectory(at: ledgerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try JSONEncoder().encode(Array(attempts)).write(to: ledgerURL, options: .atomic)
-                status = "正在建立 5 小时窗口…"
+                status = L10n.text("正在建立 5 小时窗口…")
                 try events.record("started", kind: "ping", node: node, before: before)
                 let events = events
                 let after = try await Task.detached {
@@ -98,7 +98,7 @@ import Darwin
                     }
                 }.value
                 try events.record("confirmed", kind: "ping", node: node, before: before, after: after)
-                status = "已确认新的 5 小时窗口"
+                status = L10n.text("已确认新的 5 小时窗口")
             } catch {
                 status = error.localizedDescription; lastFailure = status
                 try? events.record("failed", kind: "ping", node: node, error: status)
@@ -125,7 +125,7 @@ import Darwin
         lastFailure = nil
         activeMode = .resume
         running = true
-        status = "正在继续 \(requests.count) 个任务"
+        status = L10n.format("正在继续 %d 个任务", requests.count)
         Task {
             do {
                 let provider = provider
@@ -134,7 +134,7 @@ import Darwin
                     autoResume: manual || defaults.bool(forKey: "autoResume"),
                     earlyRecoveryPolicy: manual ? "immediately" : keepPlan ? "keepPlan" : defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask",
                     usage: quota, blocked: requests.map(\.target), observedRecovery: observedRecovery, heldForPlan: !manual && keepPlan).decision
-                guard case .resume = decision else { throw CodexConnectionError.server(decision.text) }
+                guard case .resume = decision else { throw CodexConnectionError.localizedMessage(decision.text) }
                 let failures = await withTaskGroup(of: String?.self, returning: [String].self) { group in
                     for request in requests {
                         group.addTask { await self.resumeOne(request, schedule: schedule, operation: operation, manual: manual, isSelected: isSelected) }
@@ -143,7 +143,7 @@ import Darwin
                     for await error in group { if let error { failures.append(error) } }
                     return failures
                 }
-                status = failures.isEmpty ? "所选任务已继续完成" : failures.joined(separator: "；")
+                status = failures.isEmpty ? L10n.text("所选任务已继续完成") : failures.joined(separator: L10n.text("；"))
                 lastFailure = failures.isEmpty ? nil : status
             } catch { status = error.localizedDescription; lastFailure = status }
             running = false
@@ -191,7 +191,7 @@ import Darwin
             return nil
         } catch {
             try? events.record("failed", kind: "resume", node: nil, error: error.localizedDescription, threadID: target.id)
-            return target.project + "：" + error.localizedDescription
+            return L10n.format("%@：%@", target.project, error.localizedDescription)
         }
     }
 }
@@ -204,6 +204,6 @@ struct ResumeRequest {
     var messageMode: ResumeMessageMode = .fixed
 
     func resolvedPrompt(reader: ComposerDraftReader = ComposerDraftReader()) throws -> String {
-        messageMode == .composerDraft ? try reader.read(threadID: target.id) ?? "继续" : prompt
+        messageMode == .composerDraft ? try reader.read(threadID: target.id) ?? L10n.text("继续") : prompt
     }
 }

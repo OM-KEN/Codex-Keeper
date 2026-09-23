@@ -9,10 +9,10 @@ enum KeeperDecision: Equatable {
 
     var text: String {
         switch self {
-        case .ping(reason: let r): return "保活 · \(r)"
-        case .resume(let p, let r): return "续跑 \(p) · \(r)"
-        case .skip(reason: let r): return "跳过 · \(r)"
-        case .wait(reason: let r): return "等待 · \(r)"
+        case .ping(reason: let r): return L10n.format("保活 · %@", L10n.text(r))
+        case .resume(let p, let r): return L10n.format("续跑 %@ · %@", p, L10n.text(r))
+        case .skip(reason: let r): return L10n.format("跳过 · %@", L10n.text(r))
+        case .wait(reason: let r): return L10n.format("等待 · %@", L10n.text(r))
         }
     }
 }

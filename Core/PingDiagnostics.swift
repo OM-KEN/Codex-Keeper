@@ -50,31 +50,31 @@ struct PingDiagnostic: Codable {
 
     var warning: String {
         let prefix: String
-        if okReceived { prefix = taskCompleted ? "已收到 OK，仍在确认 5 小时窗口" : "已收到 OK，仍在等待任务完成" }
+        if okReceived { prefix = taskCompleted ? L10n.text("已收到 OK，仍在确认 5 小时窗口") : L10n.text("已收到 OK，仍在等待任务完成") }
         else {
             switch reason {
-            case .requestTimeout: prefix = "保活请求超时，Codex 正在重试"
-            case .proxy: prefix = "保活代理连接异常，Codex 正在重试"
-            case .server: prefix = "保活服务返回错误，Codex 正在重试"
-            case .connection: prefix = "保活连接异常，Codex 正在重试"
-            default: prefix = "保活尚未收到回复，原因暂未确认"
+            case .requestTimeout: prefix = L10n.text("保活请求超时，Codex 正在重试")
+            case .proxy: prefix = L10n.text("保活代理连接异常，Codex 正在重试")
+            case .server: prefix = L10n.text("保活服务返回错误，Codex 正在重试")
+            case .connection: prefix = L10n.text("保活连接异常，Codex 正在重试")
+            default: prefix = L10n.text("保活尚未收到回复，原因暂未确认")
             }
         }
-        return prefix + "；继续等待至 \(Int(timeoutSeconds)) 秒"
+        return prefix + L10n.format("；继续等待至 %d 秒", Int(timeoutSeconds))
     }
     var failureMessage: String {
         switch reason {
-        case .configuration: return "保活未发送：Codex 无法读取保活配置"
-        case .processExit: return "保活进程提前退出，未确认新窗口；本轮不再重试"
-        case .quotaRead: return "保活额度读取失败，无法核实新窗口；本轮不再重试"
-        case .cancelled: return "保活已停止，未确认新窗口；本轮不再重试"
+        case .configuration: return L10n.text("保活未发送：Codex 无法读取保活配置")
+        case .processExit: return L10n.text("保活进程提前退出，未确认新窗口；本轮不再重试")
+        case .quotaRead: return L10n.text("保活额度读取失败，无法核实新窗口；本轮不再重试")
+        case .cancelled: return L10n.text("保活已停止，未确认新窗口；本轮不再重试")
         default:
-            let detail = okReceived ? (taskCompleted ? "已收到 OK，但未确认新窗口" : "已收到 OK，但任务尚未确认完成") :
-                reason == .requestTimeout ? "请求超时，未收到模型回复" :
-                reason == .proxy ? "日志显示代理连接异常" :
-                reason == .server ? "日志显示服务端错误" :
-                reason == .connection ? "日志显示连接异常" : "未收到模型回复，原因尚未确认"
-            return "保活未确认（\(Int(elapsedSeconds)) 秒）：\(detail)；本轮不再重试"
+            let detail = okReceived ? (taskCompleted ? L10n.text("已收到 OK，但未确认新窗口") : L10n.text("已收到 OK，但任务尚未确认完成")) :
+                reason == .requestTimeout ? L10n.text("请求超时，未收到模型回复") :
+                reason == .proxy ? L10n.text("日志显示代理连接异常") :
+                reason == .server ? L10n.text("日志显示服务端错误") :
+                reason == .connection ? L10n.text("日志显示连接异常") : L10n.text("未收到模型回复，原因尚未确认")
+            return L10n.format("保活未确认（%d 秒）：%@；本轮不再重试", Int(elapsedSeconds), detail)
         }
     }
 }
