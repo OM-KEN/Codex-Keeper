@@ -58,31 +58,33 @@
 
 /* Settings and task selection */
 "启用 Codex Keeper" = "Enable Codex Keeper";
-"按计划保持 Codex 活动，并支持在额度恢复后自动继续任务。" = "Keep Codex active on a schedule and resume tasks after your quota resets.";
 "每日开始时间" = "Daily Start Time";
-"从每天的开始时间起，每隔 5 小时安排一次保活，共 4 次。" = "Starting at this time, schedule four keep-alives each day, 5 hours apart.";
-"计划保活点：%@" = "Scheduled keep-alive times: %@";
+"计划预览：%@" = "Schedule Preview: %@";
 "额度恢复后自动继续" = "Resume After Quota Resets";
+"自动续跑说明" = "Auto-resume information";
+"额度用尽而暂停的 Codex 任务，会在额度恢复后默认继续。" = "Resumes Codex tasks paused by quota limits after the quota resets.";
+"因额度用尽暂停的 Codex 任务，额度恢复后默认继续。继续之前，可在 Codex Keeper 进一步调整具体任务。" = "Codex tasks paused when quota runs out resume by default after the quota resets. Before they resume, you can adjust which tasks to resume in Codex Keeper.";
 "发送给 Codex 的内容" = "Message to Codex";
 "默认发送“%@”" = "Default: %@";
 "自定义内容" = "Custom Message";
 "编辑自定义内容" = "Edit Custom Message";
 "尚未填写自定义内容" = "No custom message yet";
-"输入发送给 Codex 的内容。" = "Enter the message to send to Codex.";
 "取消" = "Cancel";
 "保存" = "Save";
-"任务因额度用尽而暂停后，会在额度恢复后自动继续。默认继续所有待续任务，你可以在菜单中选择要继续的任务，并为每个任务修改发送内容。" = "When a task pauses because your quota runs out, Keeper tries to resume it after the quota resets. All eligible tasks are selected by default. You can choose tasks and edit each message from the menu.";
-"继续前提醒 Codex 检查项目" = "Remind Codex to Check the Project Before Resuming";
-"项目文件有变化，或无法确认是否变化时，会在发送内容中提醒 Codex 先检查项目和任务进度。关闭后只发送你选定的内容。" = "If project files changed, or Keeper cannot tell, it asks Codex to check the project and task progress first. Turn this off to send only your chosen message.";
+"项目可能变化时附加检查提醒" = "Add a Project Check Reminder";
+"项目检查说明" = "Project check information";
+"文件有变化或无法核对时，在所选内容前单独附加提醒。" = "Adds a separate reminder before your message if files may have changed.";
+"项目文件有变化或无法核对时，Keeper 会在所选续跑内容前单独加上：\n\n“%@”" = "If project files changed or cannot be checked, Keeper adds this as a separate paragraph before your selected resume message:\n\n“%@”";
 "开机自启" = "Open at Login";
 "请在“系统设置 → 通用 → 登录项”中允许 Codex Keeper 登录时打开" = "Allow Codex Keeper to open at login in System Settings → General → Login Items.";
 "已选择 %d 个任务" = "Selected tasks: %d";
-"选择额度恢复后要继续的任务，并为每个任务设置发送给 Codex 的内容。" = "Choose which tasks to resume after your quota resets, and set the message sent to Codex for each task.";
 "%@ · %@ · %@ 暂停" = "Paused · %@ · %@ · %@";
 "发送内容" = "Message to Send";
 "使用下方内容" = "Use Text Below";
 "使用 Codex 输入框草稿" = "Use Codex Draft";
-"自动继续时，发送这个任务在 Codex 输入框中保存的文字；没有文字则发送“继续”。原草稿会保留，附件不会发送。" = "When resuming, send the text saved in this task’s Codex composer. If it is empty, send ‘Continue’. The draft stays in place; attachments are not sent.";
+"只发送草稿文字，不含附件；空草稿发送“继续”。" = "Sends draft text only, without attachments; empty drafts send “Continue”.";
+"草稿保留说明" = "Draft retention information";
+"Codex 输入框中的原草稿会保留。" = "Keeps the original draft in the Codex composer.";
 "当前没有等待自动继续的任务。" = "No tasks are waiting to resume.";
 "取消下一次自动继续" = "Cancel Next Auto-resume";
 "取消下一次自动继续？" = "Cancel the Next Auto-resume?";
@@ -135,7 +137,7 @@
 "保活模型未经确认" = "Keep-alive model was not confirmed";
 "无法建立保活终端" = "Could not start the keep-alive terminal";
 "未知项目" = "Unknown Project";
-"Keeper 自动续跑提醒：请先检查项目当前文件和任务进度，再继续。" = "Keeper auto-resume reminder: Check the current project files and task progress before continuing.";
+"Codex 额度已恢复，期间项目文件可能发生了变化。请先核对当前任务涉及的项目文件和进度，再继续该任务。" = "Codex quota has been restored, and project files may have changed in the meantime. Check the project files and progress relevant to this task before continuing it.";
 
 /* Keep-alive diagnostics */
 "已收到 OK，仍在确认 5 小时窗口" = "Received OK; still confirming the 5-hour window";
@@ -203,3 +205,4 @@
 "正在刷新额度…" = "Refreshing quota…";
 "已更新 · %@" = "Updated · %@";
 "刷新失败，请点击刷新按钮重试。" = "Refresh failed. Click Refresh to try again.";
+"上次%@失败：%@" = "Previous %@ failed: %@";

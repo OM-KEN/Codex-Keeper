@@ -17,7 +17,7 @@ This is a beta for local Codex tasks. Keep-alive requires access to `gpt-5.6-lun
 ## Getting started
 
 1. Open the disk image, drag **CodexKeeper** to **Applications**, and launch it.
-2. In the first-run guide, choose a daily start time and select **Get Started**. For example, `08:00` schedules keep-alive attempts at `08:00 · 13:00 · 18:00 · 23:00`.
+2. In the first-run guide, choose a daily start time and select **Get Started**. For example, the schedule preview for `08:00` shows `08:00 · 13:00 · 18:00 · 23:00`.
 3. Keep-alive and auto-resume are enabled by default. Adjust or disable them in the menu bar settings.
 4. When tasks are waiting to resume, click a task name in the menu to choose tasks and edit the message to send.
 
@@ -25,6 +25,7 @@ The Codex desktop app may be closed, but Keeper must keep running and your Mac m
 
 The interface supports Simplified Chinese and English and follows the macOS language setting for the app. Changing languages does not overwrite a message you customized for auto-resume.
 In Settings, choose the language-aware default “Continue” or edit a custom message in a dialog.
+If project files changed or cannot be checked, Keeper adds a separate check reminder before the resume message by default; you can turn it off in Settings.
 
 The disk image is not notarized. If macOS blocks the first launch, verify the download source and follow [Apple's instructions for opening the app](https://support.apple.com/en-us/102445).
 

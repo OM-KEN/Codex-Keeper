@@ -8,8 +8,6 @@ struct ResumeTasksView: View {
             Section {
                 Text(L10n.format("已选择 %d 个任务", state.selectedTasks.count))
                     .font(.headline)
-                Text(L10n.text("选择额度恢复后要继续的任务，并为每个任务设置发送给 Codex 的内容。"))
-                    .font(.caption).foregroundStyle(.secondary)
             }
             ForEach(state.availableTasks, id: \.episodeKey) { task in
                 Section {
@@ -28,8 +26,13 @@ struct ResumeTasksView: View {
                     }
                     .disabled(state.choices.deselectedEpisodes.contains(task.episodeKey))
                     if state.choices.mode(for: task) == .composerDraft {
-                        Text(L10n.text("自动继续时，发送这个任务在 Codex 输入框中保存的文字；没有文字则发送“继续”。原草稿会保留，附件不会发送。"))
-                            .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Text(L10n.text("只发送草稿文字，不含附件；空草稿发送“继续”。"))
+                                .font(.callout).foregroundStyle(.secondary)
+                            InfoHintButton(label: L10n.text("草稿保留说明"),
+                                hint: L10n.text("Codex 输入框中的原草稿会保留。"),
+                                detail: L10n.text("Codex 输入框中的原草稿会保留。"))
+                        }
                     } else {
                         TextEditor(text: Binding(get: {
                             state.choices.messages[task.episodeKey] ?? ResumeMessagePreferences.current()

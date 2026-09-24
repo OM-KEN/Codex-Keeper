@@ -139,12 +139,12 @@ final class AppServerResumeTransport: ResumeTransport {
 }
 
 enum WorkspaceGuard {
-    static var reminder: String { L10n.text("Keeper 自动续跑提醒：请先检查项目当前文件和任务进度，再继续。") }
+    static var reminder: String { L10n.text("Codex 额度已恢复，期间项目文件可能发生了变化。请先核对当前任务涉及的项目文件和进度，再继续该任务。") }
 
     static func resumePrompt(_ body: String, before: String?, after: String?, reminderEnabled: Bool) -> String {
         guard reminderEnabled else { return body }
         if let before, before == after { return body }
-        return reminder + "\n" + body
+        return reminder + "\n\n" + body
     }
 
     static func fingerprint(cwd: String) -> String? {

@@ -121,7 +121,9 @@ import UserNotifications
             summary.tasks = Array(appState.availableTasks.sorted { $0.blockedAt > $1.blockedAt }.prefix(1).map(\.displayName))
             summary.taskCount = appState.availableTasks.count
         }
-        summary.error = appState.execution.lastFailure ?? appState.usage.lastError ?? appState.sessions.detectionError ?? ""
+        summary.applyIssues(usageError: appState.usage.lastError, sessionError: appState.sessions.detectionError,
+            executionFailure: appState.execution.lastFailure,
+            executionAction: appState.execution.activeMode == .resume ? "自动继续" : "保活")
         if !appState.execution.running {
             summary.applyUsageRefreshState(refreshing: appState.usage.refreshing, error: appState.usage.lastError)
             if appState.usage.snapshot?.isFresh(at: Date()) != true, let error = appState.usage.lastError {

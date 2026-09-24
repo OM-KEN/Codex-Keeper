@@ -51,23 +51,24 @@ struct SettingsView: View {
         Form {
             Section {
                 Toggle(L10n.text("启用 Codex Keeper"), isOn: $enabled)
-                Text(L10n.text("按计划保持 Codex 活动，并支持在额度恢复后自动继续任务。"))
-                    .font(.caption).foregroundStyle(.secondary)
             }
             Section(L10n.text("保持活动")) {
                 DatePicker(L10n.text("每日开始时间"), selection: anchor, displayedComponents: .hourAndMinute)
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(L10n.text("从每天的开始时间起，每隔 5 小时安排一次保活，共 4 次。"))
-                        .font(.caption).foregroundStyle(.secondary)
-                    Text(L10n.format("计划保活点：%@", dailySchedule))
-                        .font(.caption).monospacedDigit()
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text(L10n.format("计划预览：%@", dailySchedule))
+                    .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Section(L10n.text("自动继续任务")) {
-                Toggle(L10n.text("额度恢复后自动继续"), isOn: $autoResume)
+                Toggle(isOn: $autoResume) {
+                    HStack(spacing: 0) {
+                        Text(L10n.text("额度恢复后自动继续"))
+                        InfoHintButton(label: L10n.text("自动续跑说明"),
+                            hint: L10n.text("额度用尽而暂停的 Codex 任务，会在额度恢复后默认继续。"),
+                            detail: L10n.text("因额度用尽暂停的 Codex 任务，额度恢复后默认继续。继续之前，可在 Codex Keeper 进一步调整具体任务。"))
+                    }
+                }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(L10n.text("发送给 Codex 的内容")).font(.caption).foregroundStyle(.secondary)
+                    Text(L10n.text("发送给 Codex 的内容")).font(.callout.weight(.medium))
                     Picker("", selection: resumeMessageSelection) {
                         Text(L10n.format("默认发送“%@”", L10n.text("继续"))).tag(ResumeMessagePreferences.Mode.localizedDefault)
                         Text(L10n.text("自定义内容")).tag(ResumeMessagePreferences.Mode.custom)
@@ -85,11 +86,14 @@ struct SettingsView: View {
                         .buttonStyle(.bordered).help(L10n.text("编辑自定义内容"))
                     }
                 }
-                Text(L10n.text("任务因额度用尽而暂停后，会在额度恢复后自动继续。默认继续所有待续任务，你可以在菜单中选择要继续的任务，并为每个任务修改发送内容。"))
-                    .font(.caption).foregroundStyle(.secondary)
-                Toggle(L10n.text("继续前提醒 Codex 检查项目"), isOn: $resumeWorkspaceReminder)
-                Text(L10n.text("项目文件有变化，或无法确认是否变化时，会在发送内容中提醒 Codex 先检查项目和任务进度。关闭后只发送你选定的内容。"))
-                    .font(.caption).foregroundStyle(.secondary)
+                Toggle(isOn: $resumeWorkspaceReminder) {
+                    HStack(spacing: 0) {
+                        Text(L10n.text("项目可能变化时附加检查提醒"))
+                        InfoHintButton(label: L10n.text("项目检查说明"),
+                            hint: L10n.text("文件有变化或无法核对时，在所选内容前单独附加提醒。"),
+                            detail: L10n.format("项目文件有变化或无法核对时，Keeper 会在所选续跑内容前单独加上：\n\n“%@”", WorkspaceGuard.reminder))
+                    }
+                }
             }
             Section {
                 Toggle(L10n.text("开机自启"), isOn: Binding(get: { loginEnabled }, set: { value in
@@ -108,8 +112,6 @@ struct SettingsView: View {
         .sheet(isPresented: $showingCustomMessageEditor) {
             VStack(alignment: .leading, spacing: 12) {
                 Text(L10n.text("编辑自定义内容")).font(.headline)
-                Text(L10n.text("输入发送给 Codex 的内容。"))
-                    .font(.caption).foregroundStyle(.secondary)
                 TextEditor(text: $customMessageDraft)
                     .keeperEditorStyle()
                     .font(.body).frame(height: 150)
@@ -130,6 +132,31 @@ struct SettingsView: View {
                 }
             }
             .padding(20).frame(width: 440)
+        }
+    }
+}
+
+struct InfoHintButton: View {
+    let label: String
+    let hint: String
+    let detail: String
+    @State private var showingInfo = false
+
+    var body: some View {
+        Button { showingInfo.toggle() } label: {
+            Image(systemName: "info.circle")
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel(label)
+        .help(hint)
+        .popover(isPresented: $showingInfo) {
+            Text(detail)
+                .font(.body)
+                .frame(width: 280, alignment: .leading)
+                .padding(12)
         }
     }
 }

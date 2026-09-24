@@ -271,6 +271,15 @@ import Darwin
         var retryingSync = MenuSummary(headline: "正在同步", isSyncing: true)
         retryingSync.applyUsageRefreshState(refreshing: true, error: "连接超时")
         check(retryingSync.isSyncing && retryingSync.note.contains("重新同步"), "active manual retry remains visibly distinct from failed idle read")
+        var recoveredSync = MenuSummary(headline: "14:20")
+        recoveredSync.applyIssues(usageError: nil, sessionError: nil, executionFailure: "连接失败", executionAction: "保活")
+        check(recoveredSync.error.isEmpty && recoveredSync.note.contains("上次保活失败") && !recoveredSync.warning.isEmpty,
+            "previous keepalive failure is labeled as history after quota recovers")
+        var currentSyncFailure = MenuSummary(headline: "正在同步", isSyncing: true)
+        currentSyncFailure.applyIssues(usageError: "当前额度读取失败", sessionError: nil,
+            executionFailure: "旧保活失败", executionAction: "保活")
+        check(currentSyncFailure.error == "当前额度读取失败" && !currentSyncFailure.note.contains("旧保活失败"),
+            "current quota failure takes priority over previous execution failure")
 
         var authIdentity: Data? = Data("account-a".utf8)
         var authConnections: [CountingUsageTransport] = []
@@ -554,9 +563,9 @@ import Darwin
         try "changed".write(to: temp.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
         check(before != WorkspaceGuard.fingerprint(cwd: temp.path), "workspace guard includes hidden files")
         check(WorkspaceGuard.resumePrompt("继续", before: "same", after: "same", reminderEnabled: true) == "继续", "unchanged project sends only selected content")
-        check(WorkspaceGuard.resumePrompt("继续", before: "old", after: "new", reminderEnabled: true) == WorkspaceGuard.reminder + "\n继续", "changed project receives a clear Keeper reminder")
-        check(WorkspaceGuard.resumePrompt("继续", before: nil, after: "new", reminderEnabled: true) == WorkspaceGuard.reminder + "\n继续", "missing baseline prompts a check without claiming a detected change")
-        check(WorkspaceGuard.resumePrompt("继续", before: "old", after: nil, reminderEnabled: true) == WorkspaceGuard.reminder + "\n继续", "unreadable current state receives the same neutral reminder")
+        check(WorkspaceGuard.resumePrompt("继续", before: "old", after: "new", reminderEnabled: true) == WorkspaceGuard.reminder + "\n\n继续", "changed project separates the reminder from selected content")
+        check(WorkspaceGuard.resumePrompt("继续", before: nil, after: "new", reminderEnabled: true) == WorkspaceGuard.reminder + "\n\n继续", "missing baseline prompts a check without claiming a detected change")
+        check(WorkspaceGuard.resumePrompt("继续", before: "old", after: nil, reminderEnabled: true) == WorkspaceGuard.reminder + "\n\n继续", "unreadable current state receives the same neutral reminder")
         check(WorkspaceGuard.resumePrompt("第一行\n第二行", before: nil, after: nil, reminderEnabled: false) == "第一行\n第二行", "disabled reminder preserves multiline content exactly")
         // Full scan: copied parent history in a child must never resurrect a continued parent.
         let scanHome = temp.appendingPathComponent("scan-home")
