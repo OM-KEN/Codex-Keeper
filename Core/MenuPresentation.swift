@@ -20,6 +20,14 @@ struct MenuSummary {
     var statusDatePrefix = ""
 
     var statusText: String { isTime ? [statusDatePrefix, headline].filter { !$0.isEmpty }.joined(separator: " ") : "–" }
+    mutating func applyIssues(usageError: String?, sessionError: String?, executionFailure: String?, executionAction: String) {
+        error = usageError ?? sessionError ?? ""
+        if error.isEmpty, let executionFailure {
+            let previous = L10n.format("上次%@失败：%@", L10n.text(executionAction), executionFailure)
+            note = [note, previous].filter { !$0.isEmpty }.joined(separator: "\n")
+            warning = previous
+        }
+    }
     mutating func applyUsageRefreshState(refreshing: Bool, error: String?) {
         guard isSyncing, error != nil else { return }
         if refreshing {
