@@ -23,7 +23,7 @@
 "退出 Codex Keeper" = "Quit Codex Keeper";
 "设置你的每日计划" = "Set Your Daily Schedule";
 "每 5 小时让 Codex 自动保持活动，帮你更充分地利用每天的额度。" = "Keep Codex active every 5 hours to make better use of your daily quota.";
-"任务因额度用完而暂停后，确认额度正常恢复时会自动继续；其他恢复情况会先提醒你选择。" = "Tasks paused by quota limits resume after normal recovery is confirmed. For other recovery cases, Keeper asks you to choose first.";
+"因额度用尽而暂停的任务，将在额度恢复后自动继续" = "Tasks paused because quota was exhausted will resume automatically when quota is restored.";
 "保持活动" = "Keep Active";
 "自动继续" = "Resume";
 "自动继续任务" = "Auto-resume Tasks";
@@ -63,7 +63,7 @@
 "额度恢复后自动继续" = "Resume After Quota Resets";
 "自动续跑说明" = "Auto-resume information";
 "确认额度正常恢复后继续；其他恢复情况先提醒你选择。" = "Resume after normal quota recovery is confirmed; ask you to choose in other cases.";
-"因额度用尽暂停的任务，在确认额度正常恢复后自动继续。提前恢复或恢复情况不明时，会先提醒你选择。等待选择期间，Keeper 仍会按计划保活。" = "Tasks paused by quota limits resume after normal recovery is confirmed. If quota recovers early or recovery is uncertain, Keeper asks you to choose first. Scheduled keep-alives continue while it waits for your decision.";
+"因额度用尽而暂停的任务，将在额度恢复后自动继续。提前恢复或恢复情况不明时，会先提醒你选择。等待选择期间，Keeper 仍会按计划保活。" = "Tasks paused because quota was exhausted will resume automatically when quota is restored. If quota recovers early or recovery is uncertain, Keeper asks you to choose first. Scheduled keep-alives continue while it waits for your decision.";
 "发送给 Codex 的内容" = "Message to Codex";
 "默认发送“%@”" = "Default: %@";
 "自定义内容" = "Custom Message";
