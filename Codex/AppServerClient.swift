@@ -49,21 +49,22 @@ final class AppServerClient: CodexTransport {
         registryLock.lock(); let own = Array(processes.values); registryLock.unlock()
         for process in own where process.isRunning {
             process.terminate()
-            let deadline = Date().addingTimeInterval(1)
-            while process.isRunning && Date() < deadline { usleep(10000) }
+            let deadline = ProcessInfo.processInfo.systemUptime + 1
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline { usleep(10000) }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
     }
     private let stateLock = NSLock()
     private var closed = false
-    private let process = Process()
+    private let process: Process
     private let input = Pipe()
     private let output = Pipe()
     private var buffer = Data()
     private var identifier = 0
     private var pending: [[String: Any]] = []
 
-    init(binary: URL? = nil, usageOnly: Bool = false) throws {
+    init(binary: URL? = nil, usageOnly: Bool = false, process: Process = Process()) throws {
+        self.process = process
         let executable = try binary ?? CodexLocator.binary()
         process.executableURL = executable
         process.arguments = ["app-server"]
@@ -164,10 +165,10 @@ final class AppServerClient: CodexTransport {
         try? output.fileHandleForReading.close()
         if process.isRunning {
             process.terminate()
-            let deadline = Date().addingTimeInterval(1)
-            while process.isRunning && Date() < deadline { usleep(10000) }
+            let deadline = ProcessInfo.processInfo.systemUptime + 1
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline { usleep(10000) }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            process.waitUntilExit()
+            // Foundation can miss the exit notification; never wait for it without a deadline.
         }
     }
 }
@@ -345,13 +346,24 @@ final class AppServerUsageProvider: UsageProvider {
         }
     }
 
+    private func readRateLimits(from client: CodexTransport) throws -> UsageSnapshot {
+        let response: [String: Any]
+        do {
+            response = try client.request("account/rateLimits/read", params: [:])
+        } catch CodexConnectionError.server(let message) where CodexConnectionError.serverFailureReason(message) == "connection_failed" {
+            // A transient network error can leave the retained app-server healthy.
+            response = try client.request("account/rateLimits/read", params: [:])
+        }
+        return try UsageDecoder.account(response, at: Date())
+    }
+
     private func read(from client: CodexTransport) throws -> UsageSnapshot {
-        let first = try UsageDecoder.account(try client.request("account/rateLimits/read", params: [:]), at: Date())
+        let first = try readRateLimits(from: client)
         guard let five = first.fiveHour, five.usedPercent == 0, five.resetsAt > first.capturedAt else { return first }
         // With no active window the service returns a rolling now+5h reset. A fixed
         // reset at 0% instead represents a real window whose usage rounds to zero.
         Thread.sleep(forTimeInterval: 2.2)
-        var second = try UsageDecoder.account(try client.request("account/rateLimits/read", params: [:]), at: Date())
+        var second = try readRateLimits(from: client)
         guard first.accountID == second.accountID else { throw CodexConnectionError.server("账户在刷新期间改变") }
         if let current = second.fiveHour, current.usedPercent == 0 {
             second.zeroUseWindowActive = abs(current.resetsAt.timeIntervalSince(five.resetsAt)) <= 1

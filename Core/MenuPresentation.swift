@@ -18,8 +18,20 @@ struct MenuSummary {
     var taskCount = 0
     var timeline: [MenuTimelinePoint] = []
     var statusDatePrefix = ""
+    var reminderTitle = ""
+    var reminderBody = ""
 
-    var statusText: String { isTime ? [statusDatePrefix, headline].filter { !$0.isEmpty }.joined(separator: " ") : "–" }
+    mutating func applyRecoveryReminder(tasks: [BlockedSession], choices: ResumeChoices, keepAliveEnabled: Bool = true) {
+        let pending = tasks.compactMap { task -> (BlockedSession, RecoveryDecision)? in
+            choices.recoveryDecisions?[task.episodeKey].map { (task, $0) }
+        }.sorted { ($0.1.deadline ?? .distantFuture) < ($1.1.deadline ?? .distantFuture) }
+        guard let first = pending.first else { return }
+        reminderTitle = pending.count == 1 ? L10n.text("有暂停的任务等你处理") : L10n.format("有%d个暂停的任务等你处理", pending.count)
+        reminderBody = first.0.displayName + "\n" + first.1.message
+        if keepAliveEnabled { reminderBody += "\n" + L10n.text("Keeper 会继续按计划保活。") }
+    }
+
+    var statusText: String { isTime ? [statusDatePrefix, headline].filter { !$0.isEmpty }.joined(separator: " ") : headline == "等待续跑决定" ? L10n.text("待决定") : "–" }
     mutating func applyIssues(usageError: String?, sessionError: String?, executionFailure: String?, executionAction: String) {
         error = usageError ?? sessionError ?? ""
         if error.isEmpty, let executionFailure {
@@ -98,6 +110,20 @@ extension MenuSummary {
             else if name == "5小时", usage.activeFiveHourWindow == nil { detail = "—" }
             else { detail = dayText(window.resetsAt) + " " + clock.string(from: window.resetsAt) }
             return MenuQuota(name: name, remaining: 100 - window.usedPercent, detail: detail)
+        }
+        if plan.needsRecoveryDecision {
+            result.headline = "等待续跑决定"; result.action = ""
+            result.tasks = tasks.sorted { $0.blockedAt > $1.blockedAt }.prefix(1).map(\.displayName)
+            result.taskCount = tasks.count
+            if let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now {
+                result.headline = clock.string(from: five.resetsAt)
+                result.statusDatePrefix = Calendar.current.isDate(five.resetsAt, inSameDayAs: now) ? "" : dayText(five.resetsAt)
+                result.eyebrow = L10n.format("当前额度 · %@", dayText(five.resetsAt))
+                result.action = "额度重置"; result.isTime = true
+                let start = five.resetsAt.addingTimeInterval(-Double(five.windowMinutes) * 60)
+                result.badge = schedule.currentNode(at: start) != nil ? "计划内" : "计划外"
+            }
+            return result
         }
         if usage.fiveHour != nil && usage.activeFiveHourWindow == nil {
             result.headline = "正在同步"; result.action = ""; result.isSyncing = true

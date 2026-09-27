@@ -1,6 +1,18 @@
 import Foundation
 import Combine
 
+struct UserUsageEvidence: Equatable {
+    let promptAt: Date
+    let usageAt: Date
+    let fiveHourResetAt: Date?
+    let weeklyResetAt: Date?
+
+    func matches(_ usage: UsageSnapshot) -> Bool {
+        (fiveHourResetAt != nil || weeklyResetAt != nil) &&
+        fiveHourResetAt == usage.fiveHour?.resetsAt && weeklyResetAt == usage.weekly?.resetsAt
+    }
+}
+
 /// 单个 Codex session 的活动概况
 struct SessionActivity: Equatable {
     let id: String
@@ -23,6 +35,8 @@ struct SessionActivity: Equatable {
     var title: String? = nil
     var isSubagent = false
     var createdAt: Date? = nil
+    // Time of a real desktop user request whose subsequent token usage demonstrably increased.
+    var userUsage: UserUsageEvidence? = nil
 }
 
 /// 监听 ~/.codex/sessions 的 rollout 变化（方案 §27）。
@@ -110,6 +124,10 @@ final class SessionWatcher: ObservableObject {
         var isSubagent = false
         var createdAt: Date?
         var inheritedThrough: Date?
+        var userUsage: UserUsageEvidence?
+        var usagePromptAt: Date?
+        var tokenTotal: Int?
+        var promptTokenBaseline: Int?
         var blockedAt: Date?
         var completedAt: Date?
         var blockedFive: Date?
@@ -126,6 +144,7 @@ final class SessionWatcher: ObservableObject {
                 cwd = payload["cwd"] as? String ?? ""
                 isSubagent = (payload["source"] as? [String: Any])?["subagent"] != nil
                 createdAt = UsageDecoder.timestamp(payload["timestamp"] as? String) ?? UsageDecoder.timestamp(entry["timestamp"] as? String)
+                if payload["forked_from_id"] == nil && !isSubagent { tokenTotal = 0 }
                 if payload["forked_from_id"] != nil || isSubagent {
                     // Copied history may be re-stamped at the fork's first-record time.
                     // Only subsequent events belong to the new session's execution.
@@ -146,11 +165,42 @@ final class SessionWatcher: ObservableObject {
                     blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
                 }
             }
+            let validTimestamp = UsageDecoder.timestamp(entry["timestamp"] as? String)
+            if type == "token_count", let promptAt = usagePromptAt, let at = validTimestamp, at >= promptAt,
+               let info = payload["info"] as? [String: Any],
+               let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
+                if let baseline = promptTokenBaseline, total > baseline,
+                   ((info["last_token_usage"] as? [String: Any])?["total_tokens"] as? Int ?? 0) > 0,
+                   let limits = payload["rate_limits"] as? [String: Any],
+                   (limits["limit_id"] as? String ?? limits["limitId"] as? String ?? "codex") == "codex",
+                   (limits["rate_limit_reached_type"] as? String ?? limits["rateLimitReachedType"] as? String ?? "").isEmpty {
+                    let windows = UsageDecoder.windows(limits)
+                    if windows.0 != nil || windows.1 != nil,
+                       (windows.0?.usedPercent ?? 0) < 100, (windows.1?.usedPercent ?? 0) < 100 {
+                        userUsage = UserUsageEvidence(promptAt: promptAt, usageAt: at,
+                            fiveHourResetAt: windows.0?.resetsAt, weeklyResetAt: windows.1?.resetsAt)
+                    }
+                }
+                // An initial token snapshot establishes a baseline; replayed usage is not new activity.
+                promptTokenBaseline = total
+            }
+            if type == "token_count", let info = payload["info"] as? [String: Any],
+               let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
+                tokenTotal = total
+            }
             if type == "task_started" { running = true; startedAt = timestamp; blockedAt = nil }
             if type == "task_complete" || type == "turn_aborted" {
                 running = false; completedAt = timestamp
+                usagePromptAt = nil
             }
             let texts = (payload["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined(separator: "\n") ?? ""
+            if payload["role"] as? String == "user", !isSubagent, let at = validTimestamp,
+               let metadata = payload["internal_chat_message_metadata_passthrough"] as? [String: Any],
+               (metadata["content_item_kinds"] as? [String])?.contains("user.text") == true,
+               !texts.isEmpty, !texts.hasPrefix("<environment_context>"), !texts.hasPrefix("# AGENTS.md") {
+                usagePromptAt = at
+                promptTokenBaseline = tokenTotal
+            }
             if type == "user_message" || (payload["role"] as? String == "user" && !texts.hasPrefix("<environment_context>") && !texts.hasPrefix("# AGENTS.md")) {
                 userAt = timestamp; blockedAt = nil; sawError = false
             }
@@ -161,6 +211,7 @@ final class SessionWatcher: ObservableObject {
             if type == "error" || type == "turn_failed" {
                 sawError = true
                 running = false
+                usagePromptAt = nil
                 let text = String(data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), encoding: .utf8)?.lowercased() ?? ""
                 let quota = ["usage_limit_reached", "usage_limit_exceeded", "quota_exhausted", "insufficient_quota", "you’ve hit your usage limit", "you've hit your usage limit"].contains { text.contains($0) }
                 if quota {
@@ -178,7 +229,7 @@ final class SessionWatcher: ObservableObject {
         return SessionActivity(id: id, project: cwd.isEmpty ? L10n.text("未知项目") : URL(fileURLWithPath: cwd).lastPathComponent,
             cwd: cwd, fileURL: url, lastActivityAt: activity, fiveHour: five, weekly: weekly,
             sawErrorEvent: sawError, taskRunning: running, lastUserMessageAt: userAt, quotaBlockedAt: blockedAt,
-            lastCompletedAt: completedAt, blockingFiveReset: blockedFive, blockingWeeklyReset: blockedWeekly, lastAssistantMessageAt: assistantAt, lastTaskStartedAt: startedAt, lastAbortedAt: abortedAt, isSubagent: isSubagent, createdAt: createdAt)
+            lastCompletedAt: completedAt, blockingFiveReset: blockedFive, blockingWeeklyReset: blockedWeekly, lastAssistantMessageAt: assistantAt, lastTaskStartedAt: startedAt, lastAbortedAt: abortedAt, isSubagent: isSubagent, createdAt: createdAt, userUsage: userUsage)
     }
 }
 

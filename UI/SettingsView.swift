@@ -63,8 +63,8 @@ struct SettingsView: View {
                     HStack(spacing: 0) {
                         Text(L10n.text("额度恢复后自动继续"))
                         InfoHintButton(label: L10n.text("自动续跑说明"),
-                            hint: L10n.text("额度用尽而暂停的 Codex 任务，会在额度恢复后默认继续。"),
-                            detail: L10n.text("因额度用尽暂停的 Codex 任务，额度恢复后默认继续。继续之前，可在 Codex Keeper 进一步调整具体任务。"))
+                            hint: L10n.text("确认额度正常恢复后继续；其他恢复情况先提醒你选择。"),
+                            detail: L10n.text("因额度用尽暂停的任务，在确认额度正常恢复后自动继续。提前恢复或恢复情况不明时，会先提醒你选择。等待选择期间，Keeper 仍会按计划保活。"))
                     }
                 }
                 VStack(alignment: .leading, spacing: 8) {

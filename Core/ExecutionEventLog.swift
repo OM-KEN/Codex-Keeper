@@ -2,6 +2,22 @@ import Foundation
 
 struct ExecutionEventLog {
     let url: URL
+    /// A missing log is empty; unreadable or malformed evidence must not start an inactivity deadline.
+    func resumeStarts() -> [String: Date]? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return nil }
+        var starts: [String: Date] = [:]
+        for line in text.split(separator: "\n") {
+            guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let at = UsageDecoder.timestamp(row["at"] as? String) else { return nil }
+            if row["kind"] as? String == "resume", row["event"] as? String == "started" {
+                guard let id = row["thread_id"] as? String else { return nil }
+                starts[id] = max(starts[id] ?? .distantPast, at)
+            }
+        }
+        return starts
+    }
+
     func confirmations() -> [ExecutionConfirmation] {
         guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return [] }
         let iso = ISO8601DateFormatter()

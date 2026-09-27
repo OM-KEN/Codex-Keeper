@@ -20,6 +20,20 @@ struct ResumeTasksView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    if let decision = state.choices.recoveryDecisions?[task.episodeKey] {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(L10n.text("任务还在暂停")).font(.headline)
+                            Text(decision.message).font(.callout).foregroundStyle(.secondary)
+                            Text(L10n.text("Keeper 会继续按计划保活。"))
+                                .font(.callout).foregroundStyle(.secondary)
+                            HStack {
+                                Button(L10n.text("现在继续")) { state.resolveRecoveryDecision(.now, for: [task]) }
+                                Button(L10n.text("按计划继续")) { state.resolveRecoveryDecision(.plan, for: [task]) }
+                                Button(L10n.text("取消本次")) { state.resolveRecoveryDecision(.cancel, for: [task]) }
+                            }
+                            .disabled(state.choices.deselectedEpisodes.contains(task.episodeKey))
+                        }
+                    }
                     Picker(L10n.text("发送内容"), selection: Binding(get: { state.choices.mode(for: task) }, set: { state.setMessageMode(task, $0) })) {
                         Text(L10n.text("使用下方内容")).tag(ResumeMessageMode.fixed)
                         Text(L10n.text("使用 Codex 输入框草稿")).tag(ResumeMessageMode.composerDraft)

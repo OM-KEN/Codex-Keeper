@@ -9,6 +9,23 @@ struct MenuSummaryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            if !summary.reminderTitle.isEmpty {
+                Button(action: openTasks) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "bell.badge.fill").foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(summary.reminderTitle).font(.system(size: 12, weight: .semibold))
+                            Text(summary.reminderBody).font(.system(size: 11))
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(L10n.text("处理任务")).font(.system(size: 11, weight: .semibold)).foregroundStyle(.orange)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.orange)
+                    }
+                    .padding(10).background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.orange.opacity(0.25)))
+                    .contentShape(Rectangle())
+                }.buttonStyle(.plain).help(L10n.text("处理任务"))
+            }
             if !summary.error.isEmpty {
                 Button(action: showError) {
                     HStack(alignment: .top, spacing: 6) {

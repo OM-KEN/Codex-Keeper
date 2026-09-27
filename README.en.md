@@ -5,7 +5,7 @@
 A quiet Codex companion in your Mac menu bar.
 
 - **Keep active:** Try to start a new 5-hour quota window at scheduled times.
-- **Auto-resume:** When a task stops because its quota is exhausted, try to resume it after the quota resets if it is still paused.
+- **Auto-resume:** Try to continue paused tasks after normal quota recovery is confirmed. If quota recovers early or the recovery is uncertain, ask you to choose first.
 - **View quota:** See the remaining 5-hour and weekly quota and the next scheduled action.
 
 ## Requirements
@@ -16,10 +16,12 @@ This is a beta for local Codex tasks. Keep-alive requires access to `gpt-5.6-lun
 
 ## Getting started
 
-1. Open the disk image, drag **CodexKeeper** to **Applications**, and launch it.
+1. Download the DMG from [GitHub Releases](https://github.com/OM-KEN/Codex-Keeper/releases/latest), open it, drag **CodexKeeper** to **Applications**, and launch it.
 2. In the first-run guide, choose a daily start time and select **Get Started**. For example, the schedule preview for `08:00` shows `08:00 · 13:00 · 18:00 · 23:00`.
 3. Keep-alive and auto-resume are enabled by default. Adjust or disable them in the menu bar settings.
-4. When tasks are waiting to resume, click a task name in the menu to choose tasks and edit the message to send.
+4. When tasks are waiting to resume, click a task name in the menu to choose tasks and edit the message to send. If a task needs your decision, select **Review task** in the reminder at the top of the menu.
+
+Keeper also sends a system notification. Choose **Continue now**, **Continue as scheduled**, or **Cancel this time**. The reminder stays until you use Codex again. After confirmed usage, leaving it unanswered for 10 minutes cancels this continuation while preserving the task and its history. Waiting for your decision does not stop scheduled keep-alives.
 
 The Codex desktop app may be closed, but Keeper must keep running and your Mac must be awake and online. Keeper skips keep-alive when a valid quota window is already active. Disabling Keeper pauses automatic actions.
 
@@ -33,4 +35,4 @@ If quota sync fails, click the refresh button beside the main time. If it keeps 
 
 ---
 
-This is an independent project and is not affiliated with OpenAI. No public download is available yet. Developers can build it using the [development guide](docs/DEVELOPMENT.md), which is currently in Chinese.
+This is an independent project and is not affiliated with OpenAI. Developers can build it using the [development guide](docs/DEVELOPMENT.md), which is currently in Chinese.

@@ -158,6 +158,32 @@ import Darwin
         let localNode = schedule.nodes(on: now)[1]
         let future = localNode.addingTimeInterval(3600)
         let engine = DecisionEngine(schedule: schedule)
+        // A weekly stop that recovered early must never silently become a 23:00 promise.
+        do {
+            let at = date("2026-09-27T10:30:00Z")
+            let windowReset = date("2026-09-27T15:06:00Z")
+            let task = BlockedSession(id: "early-weekly", project: "Lithe", cwd: "/tmp", blockedAt: date("2026-09-25T15:03:00Z"),
+                fiveHourResetAt: nil, weeklyResetAt: date("2026-09-29T06:47:00Z"), fileURL: URL(fileURLWithPath: "/tmp/early-weekly"))
+            var live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 5, windowMinutes: 300, resetsAt: windowReset),
+                weekly: QuotaWindow(usedPercent: 10, windowMinutes: 10080, resetsAt: date("2026-10-04T06:47:00Z")),
+                capturedAt: at, accountID: "same-account", sourceFile: "app-server")
+            var shanghai = cal; shanghai.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+            let waiting = engine.plan(now: at, calendar: shanghai, enabled: true, autoResume: true,
+                earlyRecoveryPolicy: "ask", usage: live, blocked: [task])
+            check(waiting.date == nil && waiting.decision == .wait(reason: "额度已恢复，等待决定"),
+                "early weekly recovery asks instead of promising the next plan node")
+            let node = date("2026-09-27T15:00:00Z")
+            live.capturedAt = node
+            let atNode = engine.plan(now: node, calendar: shanghai, enabled: true, autoResume: true,
+                earlyRecoveryPolicy: "ask", usage: live, blocked: [task])
+            check(atNode.decision == .wait(reason: "额度已恢复，等待决定"),
+                "an unconfirmed recovery cannot bypass the ask policy at 23:00")
+            live.capturedAt = at
+            let summary = MenuSummary.build(plan: waiting, usage: live, schedule: schedule, tasks: [task], now: at)
+            let clock = DateFormatter(); clock.dateFormat = "HH:mm"
+            check(summary.headline == clock.string(from: windowReset) && summary.action == "额度重置" && summary.statusSymbol == "arrow.clockwise.circle.fill",
+                "waiting for a recovery decision shows the actual 23:06 reset with the reset icon")
+        }
         let full = QuotaWindow(usedPercent: 100, windowMinutes: 300, resetsAt: localNode.addingTimeInterval(-1))
         let weekly = QuotaWindow(usedPercent: 100, windowMinutes: 10080, resetsAt: future)
         func decide(_ five: QuotaWindow?, _ week: QuotaWindow?) -> KeeperDecision {
@@ -217,6 +243,25 @@ import Darwin
         check(releaseTransport.closes == 1, "provider deinit closes its retained connection")
 
         var testUptime: TimeInterval = 100
+        var transientConnections = 0
+        let transientTransport = CountingUsageTransport()
+        transientTransport.onRequest = { call in
+            if call == 1 { throw CodexConnectionError.server("error sending request") }
+        }
+        let transientProvider = AppServerUsageProvider(makeTransport: {
+            transientConnections += 1
+            return transientTransport
+        }, contextIdentity: { nil }, uptime: { testUptime })
+        check((try? transientProvider.read().fiveHour?.usedPercent) == 2,
+            "one transient rate-limit connection error retries the read")
+        check(transientTransport.calls == 2 && transientConnections == 1 && transientTransport.closes == 0,
+            "transient retry reuses the app-server process")
+        let repeatedNetworkTransport = CountingUsageTransport()
+        repeatedNetworkTransport.onRequest = { _ in throw CodexConnectionError.server("error sending request") }
+        let repeatedNetworkProvider = AppServerUsageProvider(makeTransport: { repeatedNetworkTransport },
+            contextIdentity: { nil }, uptime: { testUptime })
+        check((try? repeatedNetworkProvider.read()) == nil && repeatedNetworkTransport.calls == 2 && repeatedNetworkTransport.closes == 1,
+            "persistent rate-limit connection error retries only once before cooldown")
         var failureConnections = 0
         let failedTransport = CountingUsageTransport()
         failedTransport.onRequest = { _ in throw CodexConnectionError.ended }
@@ -499,7 +544,7 @@ import Darwin
         check(!rollout.isFresh(at: now), "recent rollout remains fallback evidence")
         let pending = BlockedSession(id: session.id, project: session.project, cwd: temp.path, blockedAt: localNode.addingTimeInterval(-60), fiveHourResetAt: localNode.addingTimeInterval(-5), weeklyResetAt: nil, fileURL: file)
         let onlyWeek = UsageSnapshot(fiveHour: nil, weekly: QuotaWindow(usedPercent: 5, windowMinutes: 10080, resetsAt: future), capturedAt: localNode, sourceFile: "app-server")
-        let weeklyResume = engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask", usage: onlyWeek, blocked: [pending])
+        let weeklyResume = engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "immediately", usage: onlyWeek, blocked: [pending])
         if case .resume = weeklyResume { check(true, "weekly-only supports resume") } else { check(false, "weekly-only supports resume") }
         var stale = onlyWeek; stale.capturedAt = localNode.addingTimeInterval(-61)
         if case .resume = engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "immediately", usage: stale, blocked: [pending]) { check(false, "stale snapshot prevents resume") } else { check(true, "stale snapshot prevents resume") }
@@ -799,7 +844,7 @@ import Darwin
         let offNode = localNode.addingTimeInterval(600)
         let recovered = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: future), weekly: nil, capturedAt: offNode, sourceFile: "app-server")
         let naturalTarget = BlockedSession(id: pending.id, project: pending.project, cwd: pending.cwd, blockedAt: localNode, fiveHourResetAt: offNode.addingTimeInterval(-5), weeklyResetAt: nil, fileURL: pending.fileURL)
-        if case .wait = engine.decide(now: offNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask", usage: recovered, blocked: [naturalTarget]) { check(true, "early or unobserved recovery automatically waits for plan") } else { check(false, "early or unobserved recovery automatically waits for plan") }
+        if case .wait = engine.decide(now: offNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask", usage: recovered, blocked: [naturalTarget]) { check(true, "early or unobserved recovery waits for an explicit choice") } else { check(false, "early or unobserved recovery waits for an explicit choice") }
         if case .resume = engine.decide(now: offNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask", usage: recovered, blocked: [naturalTarget], observedRecovery: true) { check(true, "continuously observed natural recovery resumes") } else { check(false, "continuously observed natural recovery resumes") }
         try (quotaTrace + event("turn_aborted", now.addingTimeInterval(2))).write(to: file, atomically: true, encoding: .utf8)
         let aborted = SessionWatcher.parse(url: file, mtime: now)!
@@ -897,6 +942,88 @@ import Darwin
         }
         check(!failureObserver.refreshing && failureObserver.refreshMessage.contains("刷新失败") && failureObserver.lastError != nil,
             "failed manual read clears busy state and offers an explicit retry")
+        let shutdownRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/tests/shutdown-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: shutdownRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: shutdownRoot) }
+        let shutdownExecutable = shutdownRoot.appendingPathComponent("fake-codex")
+        let shutdownScript = """
+        #!/usr/bin/python3
+        import json,signal,sys,time
+        failing=False
+        for line in sys.stdin:
+            request=json.loads(line)
+            method=request['method']
+            if method=='initialized': continue
+            if method=='fail-rate-limits':
+                signal.signal(signal.SIGTERM,signal.SIG_IGN)
+                failing=True
+            if method=='account/rateLimits/read' and failing:
+                response={'error':{'message':'error sending request'}}
+            elif method=='account/read': response={'result':{'account':{'type':'chatgpt'}}}
+            elif method=='account/rateLimits/read':
+                response={'result':{'accountId':'shutdown-test','rateLimits':{'primary':{'usedPercent':7,'windowDurationMins':300,'resetsAt':2000000000}}}}
+            else: response={'result':{}}
+            print(json.dumps(dict(response,id=request['id'])),flush=True)
+        while failing: time.sleep(1)
+        """
+        try shutdownScript.write(to: shutdownExecutable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: shutdownExecutable.path)
+        let unnotifiedProcess = UnnotifiedExitProcess()
+        let shutdownClient = try AppServerClient(binary: shutdownExecutable, usageOnly: true, process: unnotifiedProcess)
+        _ = try shutdownClient.request("fail-rate-limits", params: [:])
+        unnotifiedProcess.holdExitNotification = true
+        var shutdownUptime: TimeInterval = 100
+        var shutdownConnections = 0
+        let shutdownProvider = AppServerUsageProvider(makeTransport: {
+            shutdownConnections += 1
+            return shutdownConnections == 1 ? shutdownClient : try AppServerClient(binary: shutdownExecutable, usageOnly: true)
+        }, contextIdentity: { nil }, uptime: { shutdownUptime })
+        let shutdownLog = shutdownRoot.appendingPathComponent("usage-transitions.jsonl")
+        let shutdownObserver = UsageObserver(codexHome: shutdownRoot, provider: shutdownProvider, logURL: shutdownLog)
+        shutdownObserver.refresh()
+        for _ in 0..<300 {
+            if !shutdownObserver.refreshing { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        check(!shutdownObserver.refreshing && shutdownObserver.lastError != nil,
+            "automatic quota failure clears refreshing within three seconds despite a lost child-exit notification")
+        check(kill(unnotifiedProcess.processIdentifier, 0) == -1 && errno == ESRCH && unnotifiedProcess.isRunning,
+            "shutdown kills the unresponsive child even while Foundation reports stale running state")
+        // Let the old implementation finish after the bounded assertion, so a regression never hangs this suite.
+        unnotifiedProcess.releaseExitWait()
+        for _ in 0..<300 {
+            if !shutdownObserver.refreshing { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        shutdownClient.close()
+        shutdownObserver.refresh()
+        for _ in 0..<300 {
+            if !shutdownObserver.refreshing { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        check(!shutdownObserver.refreshing && shutdownConnections == 1 && shutdownObserver.lastError != nil,
+            "automatic polling after shutdown preserves connection failure cooldown")
+        shutdownUptime += 20
+        shutdownObserver.refresh()
+        for _ in 0..<300 {
+            if !shutdownObserver.refreshing { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        check(!shutdownObserver.refreshing && shutdownObserver.lastError == nil && shutdownConnections == 2 &&
+            shutdownObserver.snapshot?.fiveHour?.usedPercent == 7 && shutdownObserver.snapshot?.accountID == "shutdown-test",
+            "automatic polling rebuilds and reads live quota after cooldown without a menu or button retry")
+        shutdownObserver.refresh()
+        for _ in 0..<300 {
+            if !shutdownObserver.refreshing { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        check(!shutdownObserver.refreshing && shutdownObserver.lastError == nil && shutdownConnections == 2,
+            "automatic polling reuses the recovered app-server connection")
+        let shutdownEvents = try String(contentsOf: shutdownLog, encoding: .utf8)
+        check(shutdownEvents.contains("usage_read_failed") && shutdownEvents.contains("automatic") &&
+            shutdownEvents.contains("connection_failed") && !shutdownEvents.contains("usage_refresh_started"),
+            "shutdown recovery records the automatic failure without a manual refresh")
         let retryEvidence = PingLogEvidence.classify("stream disconnected - retrying sampling request (4/5 in 1.648s)... retries=4 max_retries=5 sampling_error=request timed out")
         check(retryEvidence?.reason == .requestTimeout && retryEvidence?.retryCount == 4, "request timeout preserves observed retry count without blaming proxy or server")
         check(PingLogEvidence.classify("request payload: proxy authentication required") == nil, "quoted request content is not connection evidence")
@@ -1050,6 +1177,110 @@ import Darwin
             blockedAt: pending.blockedAt.addingTimeInterval(100), fiveHourResetAt: future, weeklyResetAt: nil, fileURL: file)
         check(choices.selected([laterStop]).count == 1, "a new quota stop defaults to resume again")
 
+        do {
+            var decisions = ResumeChoices()
+            decisions.requestRecoveryDecision(for: pending, now: now)
+            decisions.expireRecoveryDecisions(at: now.addingTimeInterval(86400))
+            check(decisions.recoveryDecisions?[pending.episodeKey]?.phase == .waitingForActivity && decisions.keepAliveEpisodes.isEmpty,
+                "no confirmed human usage keeps the decision indefinitely without a cancellation deadline")
+            decisions.recoveryDecisions?[pending.episodeKey]?.notification = .delivered
+            decisions.observeUserActivity(for: pending, now: now)
+            let deadline = now.addingTimeInterval(600)
+            check(decisions.recoveryDecisions?[pending.episodeKey]?.deadline == deadline && decisions.recoveryDecisions?[pending.episodeKey]?.notification == .pending,
+                "first verified user activity starts a full ten minutes and refreshes the stage notification")
+            decisions.observeUserActivity(for: pending, now: now.addingTimeInterval(50))
+            decisions.requestRecoveryDecision(for: pending, now: now.addingTimeInterval(100))
+            let saved = try JSONDecoder().decode(ResumeChoices.self, from: JSONEncoder().encode(decisions))
+            check(saved == decisions && saved.recoveryDecisions?[pending.episodeKey]?.deadline == deadline,
+                "polls, repeated activity and restart preserve the original deadline")
+            var beforeDeadline = saved
+            check(beforeDeadline.resolveRecoveryDecision(.now, for: pending, now: deadline.addingTimeInterval(-1)),
+                "explicit continue is accepted immediately before the deadline")
+            beforeDeadline.expireRecoveryDecisions(at: deadline.addingTimeInterval(3600))
+            check(beforeDeadline.recoveryDecisions?[pending.episodeKey]?.phase == .responded && beforeDeadline.recoveryDecisions?[pending.episodeKey]?.deadline == nil && beforeDeadline.keepAliveEpisodes.isEmpty,
+                "a chosen manual continuation cannot be cancelled while asynchronous preflight runs")
+            var expired = saved
+            check(!expired.resolveRecoveryDecision(.now, for: pending, now: deadline) && expired.keepAliveEpisodes.contains(pending.episodeKey),
+                "the exact deadline wins over an unsubmitted choice and cancels only that episode")
+            expired.requestRecoveryDecision(for: pending, now: deadline)
+            expired.requestRecoveryDecision(for: laterStop, now: deadline)
+            check(expired.recoveryDecisions?[pending.episodeKey] == nil && expired.recoveryDecisions?[laterStop.episodeKey]?.phase == .waitingForActivity,
+                "a cancelled episode stays cancelled while a new stop has its own decision")
+            var scheduled = saved
+            check(scheduled.resolveRecoveryDecision(.plan, for: pending, now: now) && scheduled.recoveryDecisions?[pending.episodeKey] == nil,
+                "explicit plan choice removes its inactivity deadline")
+            var deselected = saved
+            deselected.deselectedEpisodes.insert(pending.episodeKey)
+            check(!deselected.resolveRecoveryDecision(.now, for: pending, now: now) && deselected.recoveryDecisions?[pending.episodeKey]?.deadline == deadline,
+                "deselecting cannot erase a pending decision or act on a different selection")
+            let persistedWait = engine.plan(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask",
+                usage: UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 1, windowMinutes: 300, resetsAt: future), weekly: nil, capturedAt: localNode, sourceFile: "app-server"),
+                blocked: [pending], observedRecovery: true, needsRecoveryDecision: true)
+            check(persistedWait.needsRecoveryDecision && persistedWait.date == nil && persistedWait.decision == .wait(reason: "等待续跑决定"),
+                "a persisted decision blocks both later natural recovery and a scheduled node")
+            var inactive = recovered; inactive.fiveHour?.usedPercent = 0; inactive.zeroUseWindowActive = false
+            let noWindow = MenuSummary.build(plan: persistedWait, usage: inactive, schedule: schedule, tasks: [pending], now: inactive.capturedAt)
+            check(!noWindow.isTime && noWindow.action.isEmpty && noWindow.taskCount == 1 && noWindow.statusText == L10n.text("待决定"),
+                "a waiting decision without an active window never fabricates a reset time")
+            var available = recovered; available.accountID = "test-account"
+            check(!UsageRecovery.hasAvailableQuota(for: pending, usage: available, boundAccount: "other", now: available.capturedAt),
+                "a different account cannot generate a recovery reminder")
+            available.fiveHour = nil
+            check(!UsageRecovery.hasAvailableQuota(for: pending, usage: available, boundAccount: "test-account", now: available.capturedAt),
+                "the required quota window cannot be omitted from reminder eligibility")
+        }
+
+        // Token growth after a real desktop user request, never snapshots or inherited text.
+        func desktopUser(_ at: Date, kind: String = "user.text") -> String {
+            let value: [String: Any] = ["type": "response_item", "timestamp": iso.string(from: at), "payload": [
+                "type": "message", "role": "user", "content": [["type": "input_text", "text": "Continue working"]],
+                "internal_chat_message_metadata_passthrough": ["content_item_kinds": [kind]]]]
+            return String(data: try! JSONSerialization.data(withJSONObject: value), encoding: .utf8)! + "\n"
+        }
+        func tokenUsage(_ at: Date, total: Int, used: Int = 1, limit: String = "codex") -> String {
+            event("token_count", at, ["info": ["total_token_usage": ["total_tokens": total], "last_token_usage": ["total_tokens": 10, "output_tokens": 4]],
+                "rate_limits": ["limit_id": limit, "primary": ["used_percent": used, "window_minutes": 300, "resets_at": at.addingTimeInterval(18000).timeIntervalSince1970]]])
+        }
+        do {
+            let trace = temp.appendingPathComponent("user-usage.jsonl")
+            let promptAt = now.addingTimeInterval(-10)
+            let header = try metadata(parentID, at: promptAt.addingTimeInterval(-10))
+            func parse(_ content: String) throws -> SessionActivity { try content.write(to: trace, atomically: true, encoding: .utf8); return SessionWatcher.parse(url: trace, mtime: now)! }
+            check(try parse(header + desktopUser(promptAt) + tokenUsage(now, total: 10)).userUsage?.promptAt == promptAt,
+                "a new main session counts its first real positive token usage after the user request")
+            check(try parse(header + tokenUsage(promptAt.addingTimeInterval(-1), total: 10) + desktopUser(promptAt) + tokenUsage(now, total: 10)).userUsage?.promptAt == nil,
+                "a repeated last-token-usage snapshot after the request is not new usage")
+            check(try parse(header + tokenUsage(promptAt.addingTimeInterval(-1), total: 10) + desktopUser(promptAt) + tokenUsage(now, total: 20, used: 0)).userUsage?.promptAt == promptAt,
+                "cumulative token growth verifies usage even when usage percent rounds to zero")
+            check(try parse(header + desktopUser(promptAt, kind: "agents_md.instructions") + tokenUsage(now, total: 20)).userUsage?.promptAt == nil,
+                "AGENTS metadata cannot count as user activity")
+            check(try parse(header + desktopUser(promptAt, kind: "environments.environment_context") + tokenUsage(now, total: 20)).userUsage?.promptAt == nil,
+                "environment metadata cannot count as user activity")
+            check(try parse(header + event("user_message", promptAt) + tokenUsage(now, total: 20)).userUsage?.promptAt == nil,
+                "legacy CLI messages without verifiable user metadata do not start cancellation")
+            check(try parse(header + desktopUser(promptAt) + tokenUsage(now, total: 20, used: 100)).userUsage?.promptAt == nil,
+                "exhausted quota cannot prove successful recovered usage")
+            check(try parse(header + desktopUser(promptAt) + tokenUsage(now, total: 20, limit: "premium")).userUsage?.promptAt == nil,
+                "another quota category cannot start the recovery deadline")
+            let realUse = header + desktopUser(promptAt) + tokenUsage(promptAt.addingTimeInterval(1), total: 10)
+            let replay = try parse(realUse + tokenUsage(now, total: 10))
+            check(replay.userUsage?.fiveHourResetAt == promptAt.addingTimeInterval(18001),
+                "a later unchanged token snapshot cannot attach a new quota window to old usage")
+            let reached = event("token_count", now, ["info": ["total_token_usage": ["total_tokens": 20], "last_token_usage": ["total_tokens": 10]],
+                "rate_limits": ["limit_id": "codex", "rate_limit_reached_type": "primary", "primary": ["used_percent": 99, "window_minutes": 300, "resets_at": now.addingTimeInterval(18000).timeIntervalSince1970]]])
+            check(try parse(header + desktopUser(promptAt) + reached).userUsage == nil,
+                "an explicit reached flag rejects seemingly nonexhausted rounded percentages")
+            let childHeader = try metadata(childID, at: now, parent: parentID)
+            check(try parse(childHeader + desktopUser(promptAt) + tokenUsage(promptAt.addingTimeInterval(1), total: 20)).userUsage?.promptAt == nil,
+                "forked inherited user history never counts as a fresh human return")
+            let excludedLog = ExecutionEventLog(url: temp.appendingPathComponent("activity-exclusion/events.jsonl"))
+            check(excludedLog.resumeStarts()?.isEmpty == true, "an absent Keeper event log contains no automated sessions")
+            try excludedLog.record("started", kind: "resume", node: nil, threadID: parentID)
+            check(excludedLog.resumeStarts()?[parentID] != nil, "persisted Keeper starts identify sessions to exclude from human usage")
+            try "malformed".write(to: excludedLog.url, atomically: true, encoding: .utf8)
+            check(excludedLog.resumeStarts() == nil, "unreadable execution evidence conservatively prevents a cancellation deadline")
+        }
+
         // Exercise the real coordinator with fake transports: task two must start before
         // task one completes, each prompt goes to the matching task, and neither repeats.
         let suite = "keeper.tests." + UUID().uuidString
@@ -1133,6 +1364,335 @@ import Darwin
         let ledger = try JSONDecoder().decode([String].self, from: Data(contentsOf: temp.appendingPathComponent("batch/attempts.json")))
         check(requests.allSatisfy { ledger.contains($0.target.episodeKey) }, "each task attempt is durable")
 
+        // Drive the actual AppState, persistence, notification route and manual coordinator with an isolated home.
+        do {
+            let root = temp.appendingPathComponent("recovery-app-state")
+            let home = root.appendingPathComponent("codex")
+            let traces = home.appendingPathComponent("sessions")
+            let runtime = root.appendingPathComponent("support/pending-runtime.json")
+            try FileManager.default.createDirectory(at: traces, withIntermediateDirectories: true)
+            var connection: OpaquePointer?
+            sqlite3_open(home.appendingPathComponent("logs_1.sqlite").path, &connection)
+            sqlite3_exec(connection, "CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil)
+            sqlite3_close(connection)
+            var clockNow = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+            let observedAt = clockNow
+            let stopAt = clockNow.addingTimeInterval(-119.82)
+            let fiveReset = clockNow.addingTimeInterval(15000)
+            let weekReset = clockNow.addingTimeInterval(604800)
+            let live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 2, windowMinutes: 300, resetsAt: fiveReset),
+                weekly: QuotaWindow(usedPercent: 3, windowMinutes: 10080, resetsAt: weekReset), capturedAt: clockNow, accountID: "test-account", sourceFile: "app-server")
+            let provider = RecoveryTestUsage(snapshot: live)
+            func limits(weekly: Int = 3) -> [String: Any] { ["limit_id": "codex",
+                "primary": ["used_percent": 2, "window_minutes": 300, "resets_at": fiveReset.timeIntervalSince1970],
+                "secondary": ["used_percent": weekly, "window_minutes": 10080, "resets_at": weekReset.timeIntervalSince1970]] }
+            func stopped(_ id: String, at: Date) throws -> String {
+                try metadata(id, at: at.addingTimeInterval(-60)) + event("token_count", at.addingTimeInterval(-1), ["rate_limits": limits(weekly: 100)]) + event("error", at, ["message": "usage_limit_reached"])
+            }
+            let firstPath = traces.appendingPathComponent("rollout-\(parentID).jsonl")
+            let secondPath = traces.appendingPathComponent("rollout-\(childID).jsonl")
+            let firstTrace = try stopped(parentID, at: stopAt)
+            try firstTrace.write(to: firstPath, atomically: true, encoding: .utf8)
+            try stopped(childID, at: stopAt).write(to: secondPath, atomically: true, encoding: .utf8)
+            let appSuite = "keeper.recovery.tests." + UUID().uuidString
+            let appDefaults = UserDefaults(suiteName: appSuite)!
+            defer { appDefaults.removePersistentDomain(forName: appSuite) }
+            let parts = Calendar.current.dateComponents([.hour, .minute], from: clockNow)
+            appDefaults.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "ask", "resumeWorkspaceReminder": false,
+                "dailyAnchorMinutes": ((parts.hour! * 60 + parts.minute!) + 20) % 1440])
+            let appRecorder = BatchRecorder(expected: 1)
+            let appExecution = ExecutionCoordinator(provider: provider, makeResumeTransport: { BatchTransport(recorder: appRecorder) },
+                defaults: appDefaults, ledgerURL: runtime.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), codexHome: home)
+            func makeState() -> AppState { AppState(provider: provider, defaults: appDefaults, runtimeURL: runtime,
+                codexHome: home, execution: appExecution, startMonitoring: false, now: { clockNow }) }
+            var state = makeState()
+            func sync(_ state: AppState) async throws {
+                state.refresh()
+                for _ in 0..<40 { try await Task.sleep(nanoseconds: 10_000_000) }
+                state.recompute(allowExecution: false)
+            }
+            try await sync(state)
+            let first = state.availableTasks.first { $0.id == parentID }!
+            let second = state.availableTasks.first { $0.id == childID }!
+            check(state.choices.recoveryDecisions?.count == 2 && state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForActivity && state.nextAction?.needsRecoveryDecision == true,
+                "real AppState persists both recovered episodes and waits indefinitely without human usage")
+            let initialReminder = state.claimRecoveryReminder(for: first.episodeKey)!
+            state.finishRecoveryReminder(for: first.episodeKey, phase: initialReminder.phase, delivered: false)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.notification == .unavailable && state.claimRecoveryReminder(for: first.episodeKey) == nil,
+                "notification denial stays undelivered and persistently deduplicated with the task entry intact")
+            state.setSelected(first, false); state.setSelected(first, true)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForActivity,
+                "deselect and reselect use the same durable recovery decision")
+            var opened = 0
+            state.openRecoveryDecisions { opened += 1 }
+            check(opened == 1 && appRecorder.count == 0 && !appExecution.running,
+                "the actual notification route opens current choices without dispatching a message")
+            state = makeState(); try await sync(state)
+            check(state.claimRecoveryReminder(for: first.episodeKey) == nil && state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForActivity,
+                "AppState restart preserves the notification result and no-activity waiting state")
+
+            let humanPath = traces.appendingPathComponent("rollout-\(forkID).jsonl")
+            let promptAt = observedAt.addingTimeInterval(-30)
+            let humanTrace = try metadata(forkID, at: promptAt.addingTimeInterval(-60)) + desktopUser(promptAt) +
+                event("token_count", promptAt.addingTimeInterval(1), ["info": ["total_token_usage": ["total_tokens": 10], "last_token_usage": ["total_tokens": 10]], "rate_limits": limits()])
+            try humanTrace.write(to: humanPath, atomically: true, encoding: .utf8)
+            // This already-happened use belongs to a different window, so reading current quota alone must not start a timer.
+            var changedWindow = live; changedWindow.fiveHour?.resetsAt = fiveReset.addingTimeInterval(300)
+            provider.set(changedWindow)
+            try await sync(state)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForActivity,
+                "old-window user usage plus a current quota poll cannot start cancellation")
+            provider.set(live)
+            let keeperEvent = runtime.deletingLastPathComponent().appendingPathComponent("execution-events.jsonl")
+            let sameSecondStart: [String: Any] = ["event": "started", "kind": "resume", "thread_id": forkID,
+                "at": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: floor(stopAt.timeIntervalSince1970)))]
+            try JSONSerialization.data(withJSONObject: sameSecondStart).write(to: keeperEvent)
+            try await sync(state)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForActivity,
+                "same-second Keeper start excludes its session despite fractional stop timestamps")
+            try FileManager.default.removeItem(at: keeperEvent)
+            try await sync(state)
+            let deadline = observedAt.addingTimeInterval(600)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.deadline == deadline && state.choices.recoveryDecisions?[second.episodeKey]?.deadline == deadline,
+                "usage before app discovery but after the stop in this window gets ten full minutes from detection")
+            state.finishRecoveryReminder(for: first.episodeKey, phase: .waitingForActivity, delivered: true)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.notification == .pending,
+                "a delayed old-stage notification callback cannot acknowledge the countdown reminder")
+            let timedReminder = state.claimRecoveryReminder(for: first.episodeKey)!
+            state.finishRecoveryReminder(for: first.episodeKey, phase: timedReminder.phase, delivered: true)
+            state = makeState(); try await sync(state)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.deadline == deadline && state.claimRecoveryReminder(for: first.episodeKey) == nil,
+                "a restarted countdown retains its deadline and does not redeliver its notification")
+            let beforeActions = try Data(contentsOf: runtime)
+            state.resolveRecoveryDecision(.plan, for: [second])
+            let chosenPlan = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
+            check((chosenPlan["held"] as? [String])?.contains(second.episodeKey) == true && state.choices.recoveryDecisions?[second.episodeKey] == nil,
+                "the real plan button durably releases only the selected episode into the existing schedule")
+            clockNow = deadline
+            state.openRecoveryDecisions { opened += 1 }
+            state.resolveRecoveryDecision(.now, for: [first])
+            check(state.choices.keepAliveEpisodes.contains(first.episodeKey) && !state.choices.keepAliveEpisodes.contains(second.episodeKey) && appRecorder.count == 0,
+                "opening an expired notification and clicking now cancels only the unanswered episode")
+            let newStop = clockNow.addingTimeInterval(-5)
+            try stopped(parentID, at: newStop).write(to: firstPath, atomically: true, encoding: .utf8)
+            var fresh = live; fresh.capturedAt = clockNow; provider.set(fresh)
+            try await sync(state)
+            let nextEpisode = state.availableTasks.first { $0.id == parentID }!
+            state.resolveRecoveryDecision(.now, for: [first])
+            check(nextEpisode.episodeKey != first.episodeKey && state.choices.recoveryDecisions?[nextEpisode.episodeKey]?.phase == .waitingForActivity && appRecorder.count == 0,
+                "a new quota stop receives a new decision while stale button scope cannot act on it")
+            state.resolveRecoveryDecision(.cancel, for: [nextEpisode])
+            check(state.choices.keepAliveEpisodes.contains(nextEpisode.episodeKey) && !state.choices.keepAliveEpisodes.contains(second.episodeKey),
+                "the actual cancel button affects only its frozen selected episode")
+
+            // Restore this isolated fixture with a near-expiry deadline, then suspend the fake preflight read.
+            clockNow = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+            fresh = live; fresh.capturedAt = clockNow; provider.set(fresh)
+            try firstTrace.write(to: firstPath, atomically: true, encoding: .utf8)
+            var fixture = try JSONSerialization.jsonObject(with: beforeActions) as! [String: Any]
+            var savedChoices = fixture["choices"] as! [String: Any]
+            var savedDecisions = savedChoices["recoveryDecisions"] as! [String: [String: Any]]
+            for key in savedDecisions.keys { savedDecisions[key]?["deadline"] = clockNow.addingTimeInterval(1).timeIntervalSinceReferenceDate }
+            savedChoices["recoveryDecisions"] = savedDecisions; fixture["choices"] = savedChoices
+            try JSONSerialization.data(withJSONObject: fixture).write(to: runtime, options: .atomic)
+            state = makeState(); try await sync(state)
+            provider.pause()
+            state.resolveRecoveryDecision(.now, for: [first])
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.phase == .responded && state.choices.recoveryDecisions?[first.episodeKey]?.deadline == nil,
+                "the real now button durably acknowledges the choice before async manual preflight")
+            clockNow = clockNow.addingTimeInterval(2)
+            state.recompute(allowExecution: false)
+            check(!state.choices.keepAliveEpisodes.contains(first.episodeKey) && state.choices.keepAliveEpisodes.contains(second.episodeKey),
+                "timeout during preflight cannot cancel the chosen episode but still expires unanswered peers")
+            provider.release()
+            for _ in 0..<400 { if !appExecution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
+            check(appRecorder.count == 1 && appExecution.hasAttempted(first) && !appExecution.hasAttempted(second),
+                "the real manual coordinator sends only the explicitly chosen episode through the fake transport")
+
+            // A preflight error must keep a responded decision and must not enter an immediate retry loop.
+            clockNow = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+            for key in savedDecisions.keys { savedDecisions[key]?["deadline"] = clockNow.addingTimeInterval(600).timeIntervalSinceReferenceDate }
+            savedChoices["recoveryDecisions"] = savedDecisions; fixture["choices"] = savedChoices
+            try JSONSerialization.data(withJSONObject: fixture).write(to: runtime, options: .atomic)
+            fresh.capturedAt = clockNow; provider.set(fresh)
+            state = makeState(); try await sync(state)
+            provider.set(fresh, failing: true)
+            state.resolveRecoveryDecision(.now, for: [second])
+            for _ in 0..<100 { if !appExecution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
+            check(state.choices.recoveryDecisions?[second.episodeKey]?.phase == .responded && !appExecution.hasAttempted(second) && appRecorder.count == 1,
+                "manual preflight failure keeps an explicit responded state without a send or cancellation")
+            let readsAfterFailure = provider.readCount
+            try await Task.sleep(nanoseconds: 100_000_000)
+            check(provider.readCount == readsAfterFailure && !appExecution.running,
+                "an execution completion refresh cannot spin into immediate automatic retries")
+            state = makeState()
+            state.openRecoveryDecisions { opened += 1 }
+            check(state.choices.recoveryDecisions?[second.episodeKey]?.phase == .responded && appRecorder.count == 1,
+                "restart and an old notification cannot retry a failed explicit continuation")
+            // At a real schedule node B is approved, while A must remain awaiting a decision.
+            clockNow = Date()
+            fresh.capturedAt = clockNow; provider.set(fresh)
+            let nodeParts = Calendar.current.dateComponents([.hour, .minute], from: clockNow)
+            appDefaults.set(nodeParts.hour! * 60 + nodeParts.minute!, forKey: "dailyAnchorMinutes")
+            let multiRuntime = root.appendingPathComponent("multi/pending-runtime.json")
+            let multiRecorder = BatchRecorder(expected: 1)
+            let multiExecution = ExecutionCoordinator(provider: provider, makeResumeTransport: { BatchTransport(recorder: multiRecorder) },
+                defaults: appDefaults, ledgerURL: multiRuntime.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), codexHome: home)
+            let multiState = AppState(provider: provider, defaults: appDefaults, runtimeURL: multiRuntime, codexHome: home,
+                execution: multiExecution, startMonitoring: false)
+            try await sync(multiState)
+            check(multiRecorder.count == 0 && multiState.choices.recoveryDecisions?[first.episodeKey] != nil,
+                "fresh ask decisions still block the real schedule node before any user approval")
+            multiState.resolveRecoveryDecision(.plan, for: [second])
+            for _ in 0..<400 { if !multiExecution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
+            check(multiRecorder.count == 1 && multiExecution.hasAttempted(second) && !multiExecution.hasAttempted(first) &&
+                  multiState.choices.recoveryDecisions?[first.episodeKey] != nil,
+                "an unanswered task cannot block a different explicitly scheduled task or join its automatic batch")
+            multiState.usage.stop(); multiState.sessions.stop()
+            state.usage.stop(); state.sessions.stop()
+        }
+
+        // A waiting decision must not suppress the ordinary keep-alive at a due node.
+        do {
+            let root = temp.appendingPathComponent("reminder-keepalive")
+            let home = root.appendingPathComponent("codex")
+            let traces = home.appendingPathComponent("sessions")
+            let runtime = root.appendingPathComponent("support/pending-runtime.json")
+            try FileManager.default.createDirectory(at: traces, withIntermediateDirectories: true)
+            var connection: OpaquePointer?
+            sqlite3_open(home.appendingPathComponent("logs_1.sqlite").path, &connection)
+            sqlite3_exec(connection, "CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil)
+            sqlite3_close(connection)
+            let at = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+            var pingNow = at
+            let path = traces.appendingPathComponent("rollout-\(parentID).jsonl")
+            try (metadata(parentID, at: at.addingTimeInterval(-300)) + event("error", at.addingTimeInterval(-120), ["message": "usage_limit_reached"]))
+                .write(to: path, atomically: true, encoding: .utf8)
+            let idle = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: at.addingTimeInterval(18000)),
+                weekly: QuotaWindow(usedPercent: 5, windowMinutes: 10080, resetsAt: at.addingTimeInterval(604800)),
+                capturedAt: at, accountID: "test-account", sourceFile: "app-server", zeroUseWindowActive: false)
+            let provider = RecoveryTestUsage(snapshot: idle)
+            let suite = "keeper.reminder.ping." + UUID().uuidString
+            let prefs = UserDefaults(suiteName: suite)!
+            defer { prefs.removePersistentDomain(forName: suite) }
+            let parts = Calendar.current.dateComponents([.hour, .minute], from: at)
+            prefs.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "ask", "dailyAnchorMinutes": parts.hour! * 60 + parts.minute!])
+            let pings = ReminderTestPing()
+            let resumes = BatchRecorder(expected: 1)
+            let execution = ExecutionCoordinator(provider: provider, makeResumeTransport: { BatchTransport(recorder: resumes) }, defaults: prefs,
+                ledgerURL: root.appendingPathComponent("support/resume-attempts.json"), pingTransport: pings, codexHome: home, now: { pingNow })
+            func makeState() -> AppState { AppState(provider: provider, defaults: prefs, runtimeURL: runtime, codexHome: home,
+                execution: execution, startMonitoring: false, now: { pingNow }) }
+            var state = makeState()
+            state.sessions.refresh()
+            for _ in 0..<30 { try await Task.sleep(nanoseconds: 10_000_000) }
+            state.usage.refresh()
+            for _ in 0..<40 { try await Task.sleep(nanoseconds: 10_000_000) }
+            state.recompute()
+            for _ in 0..<40 { if !execution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
+            let target = state.availableTasks.first!
+            check(pings.count == 1 && execution.confirmations.filter { $0.kind == .keepAlive }.count == 1,
+                "a waiting decision still permits one confirmed scheduled keep-alive through real AppState")
+            check(resumes.count == 0 && !execution.hasAttempted(target) && state.choices.recoveryDecisions?[target.episodeKey]?.phase == .waitingForActivity,
+                "normal keep-alive never continues or clears the waiting task")
+            var summary = MenuSummary.build(plan: state.nextAction, usage: state.usage.snapshot, schedule: state.schedule, tasks: state.selectedTasks)
+            summary.applyRecoveryReminder(tasks: state.availableTasks, choices: state.choices)
+            check(summary.statusText == L10n.text("待决定") && summary.reminderBody.contains(L10n.text("Keeper 会继续按计划保活。")),
+                "the waiting menu describes normal keep-alive without promising an automatic continuation")
+            let originalDecision = state.choices.recoveryDecisions?[target.episodeKey]
+            func settle() async throws { for _ in 0..<40 { try await Task.sleep(nanoseconds: 10_000_000) } }
+            func snapshot(at time: Date) -> UsageSnapshot {
+                var result = idle; result.capturedAt = time; result.fiveHour?.resetsAt = time.addingTimeInterval(18000)
+                return result
+            }
+            func reload(_ value: UsageSnapshot) async throws {
+                provider.set(value)
+                state = makeState()
+                state.sessions.refresh(); try await settle()
+                state.usage.refresh(); try await settle()
+            }
+            func setPhase(_ phase: RecoveryDecision.Phase, deadline: Date?, account: String = "test-account") throws {
+                var data = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
+                var choices = data["choices"] as! [String: Any]
+                var decisions = choices["recoveryDecisions"] as! [String: [String: Any]]
+                decisions[target.episodeKey]?["phase"] = phase.rawValue
+                decisions[target.episodeKey]?["deadline"] = deadline?.timeIntervalSinceReferenceDate
+                choices["recoveryDecisions"] = decisions; data["choices"] = choices
+                data["accounts"] = [target.id: account]
+                try JSONSerialization.data(withJSONObject: data).write(to: runtime, options: .atomic)
+            }
+            state.recompute(); try await settle()
+            check(pings.count == 1, "repeated refreshes do not duplicate an already attempted keep-alive node")
+            pingNow = at.addingTimeInterval(18000)
+            try await reload(snapshot(at: pingNow))
+            check(pings.count == 2 && state.choices.recoveryDecisions?[target.episodeKey] == originalDecision && resumes.count == 0,
+                "an ignored long-term reminder survives the next normal keep-alive node without a countdown or resume")
+            pingNow = at.addingTimeInterval(36000)
+            let deadline = pingNow.addingTimeInterval(600)
+            try setPhase(.waitingForChoice, deadline: deadline)
+            try await reload(snapshot(at: pingNow))
+            check(pings.count == 3 && state.choices.recoveryDecisions?[target.episodeKey]?.deadline == deadline,
+                "normal keep-alive preserves an already running reminder deadline across restart")
+            pingNow = at.addingTimeInterval(54000)
+            try setPhase(.responded, deadline: nil, account: "previous-account")
+            try await reload(snapshot(at: pingNow))
+            check(pings.count == 4 && state.choices.recoveryDecisions?[target.episodeKey]?.phase == .responded && resumes.count == 0,
+                "a manually handled or other-account paused task cannot globally stop keep-alive on the current account")
+
+            pingNow = at.addingTimeInterval(86400)
+            var unavailable = snapshot(at: pingNow); unavailable.zeroUseWindowActive = true
+            try await reload(unavailable)
+            check(pings.count == 4, "an existing active window still suppresses keep-alive with a pending reminder")
+            unavailable = snapshot(at: pingNow); unavailable.capturedAt = pingNow.addingTimeInterval(-61)
+            try await reload(unavailable)
+            check(pings.count == 4, "stale quota never permits keep-alive while reminders are ignored")
+            unavailable = snapshot(at: pingNow); unavailable.weekly?.usedPercent = 100
+            try await reload(unavailable)
+            check(pings.count == 4, "weekly exhaustion still blocks keep-alive while reminders are ignored")
+            var failedSummary = MenuSummary.build(plan: state.nextAction, usage: nil, schedule: state.schedule, tasks: state.selectedTasks)
+            failedSummary.applyIssues(usageError: "同步失败", sessionError: nil, executionFailure: nil, executionAction: "保活")
+            failedSummary.applyRecoveryReminder(tasks: state.availableTasks, choices: state.choices)
+            check(!failedSummary.reminderTitle.isEmpty && !failedSummary.reminderBody.isEmpty && !failedSummary.error.isEmpty && failedSummary.note.isEmpty,
+                "a standalone persistent reminder stays visible alongside sync errors without becoming a footnote")
+
+            // Stage a fresh, idle reading without dispatch, then race the execution preflight.
+            func readyForRace() async throws {
+                prefs.set(false, forKey: "enabled")
+                try await reload(snapshot(at: pingNow))
+                prefs.set(true, forKey: "enabled")
+                provider.pause()
+                state.recompute()
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            try await readyForRace()
+            var switched = snapshot(at: pingNow); switched.accountID = "different-account"
+            provider.set(switched); provider.release(); try await settle()
+            check(pings.count == 4 && execution.lastFailure != nil,
+                "changing the actual ping account during preflight still blocks every send")
+            try await readyForRace()
+            unavailable = snapshot(at: pingNow); unavailable.zeroUseWindowActive = true
+            provider.set(unavailable); provider.release(); try await settle()
+            check(pings.count == 4, "a window that becomes active during ping preflight is not opened again")
+            try await readyForRace()
+            let surprisePath = traces.appendingPathComponent("rollout-\(childID).jsonl")
+            try (metadata(childID, at: pingNow.addingTimeInterval(-60)) + event("error", pingNow.addingTimeInterval(-1), ["message": "usage_limit_reached"]))
+                .write(to: surprisePath, atomically: true, encoding: .utf8)
+            provider.release(); try await settle()
+            check(pings.count == 4 && execution.lastFailure != nil,
+                "the final fresh task scan rejects a newly paused episode outside the frozen ignored set")
+            try FileManager.default.removeItem(at: surprisePath)
+            try await readyForRace()
+            let originalTrace = try String(contentsOf: path, encoding: .utf8)
+            try (originalTrace + event("user_message", pingNow)).write(to: path, atomically: true, encoding: .utf8)
+            state.sessions.refresh(); try await settle()
+            provider.release(); try await settle()
+            check(pings.count == 4 && state.choices.recoveryDecisions?[target.episodeKey] == nil,
+                "a changed task that revokes the frozen ignored state aborts the pending keep-alive")
+            check(resumes.count == 0 && !execution.hasAttempted(target),
+                "all keep-alive paths leave the paused task's resume attempt ledger untouched")
+            state.usage.stop(); state.sessions.stop()
+        }
+
         print("\(count - failed)/\(count) regression checks passed")
         if failed > 0 { exit(1) }
     }
@@ -1157,6 +1717,25 @@ final class FakeTransport: CodexTransport {
         return ["method": "turn/completed", "params": ["threadId": threadID, "turn": ["id": "turn-1", "status": "completed"]]]
     }
     func close() { closed = true }
+}
+
+final class UnnotifiedExitProcess: Process, @unchecked Sendable {
+    // NSTask is a class cluster on macOS; forward process work to its concrete instance.
+    private let child = Process()
+    var holdExitNotification = false
+    private let exitWait = DispatchSemaphore(value: 0)
+    override var executableURL: URL? { get { child.executableURL } set { child.executableURL = newValue } }
+    override var arguments: [String]? { get { child.arguments } set { child.arguments = newValue } }
+    override var environment: [String: String]? { get { child.environment } set { child.environment = newValue } }
+    override var standardInput: Any? { get { child.standardInput } set { child.standardInput = newValue } }
+    override var standardOutput: Any? { get { child.standardOutput } set { child.standardOutput = newValue } }
+    override var standardError: Any? { get { child.standardError } set { child.standardError = newValue } }
+    override var processIdentifier: Int32 { child.processIdentifier }
+    override var isRunning: Bool { holdExitNotification || child.isRunning }
+    override func run() throws { try child.run() }
+    override func terminate() { child.terminate() }
+    override func waitUntilExit() { exitWait.wait() }
+    func releaseExitWait() { exitWait.signal() }
 }
 
 struct FakePingUsage: UsageProvider {
@@ -1286,4 +1865,43 @@ final class CompatibilityTransport: CodexTransport {
     }
     func nextMessage(timeout: TimeInterval) throws -> [String: Any] { throw CodexConnectionError.timeout }
     func close() { closes += 1 }
+}
+
+final class RecoveryTestUsage: UsageProvider, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var snapshot: UsageSnapshot
+    private var failing = false
+    private var paused = false
+    private var reads = 0
+    init(snapshot: UsageSnapshot) { self.snapshot = snapshot }
+    var readCount: Int { condition.lock(); defer { condition.unlock() }; return reads }
+    func pingModel() throws -> PingModel { PingModel(model: "gpt-5.6-luna", reasoningEffort: "low") }
+    func set(_ value: UsageSnapshot, failing: Bool = false) {
+        condition.lock(); defer { condition.unlock() }
+        snapshot = value; self.failing = failing
+    }
+    func pause() { condition.lock(); paused = true; condition.unlock() }
+    func release() { condition.lock(); paused = false; condition.broadcast(); condition.unlock() }
+    func read() throws -> UsageSnapshot {
+        condition.lock(); defer { condition.unlock() }
+        reads += 1
+        let limit = Date().addingTimeInterval(3)
+        while paused { if !condition.wait(until: limit) { throw CodexConnectionError.timeout } }
+        if failing { throw CodexConnectionError.timeout }
+        return snapshot
+    }
+}
+
+final class ReminderTestPing: PingTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+    var count: Int { lock.lock(); defer { lock.unlock() }; return calls }
+    func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider) throws -> UsageSnapshot {
+        lock.lock(); calls += 1; lock.unlock()
+        var after = before
+        after.zeroUseWindowActive = true
+        after.fiveHour?.usedPercent = 1
+        return after
+    }
+    func cancel() {}
 }

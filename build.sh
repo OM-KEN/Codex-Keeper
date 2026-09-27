@@ -56,7 +56,8 @@ SOURCES=(
     UI/SettingsView.swift
     UI/OnboardingView.swift
 )
-RESOURCES=(Info.plist assets/NOTICE.md en.lproj/Localizable.strings zh-Hans.lproj/Localizable.strings)
+ICON_SOURCE="Codex Keeper.jpg"
+RESOURCES=(Info.plist assets/NOTICE.md en.lproj/Localizable.strings zh-Hans.lproj/Localizable.strings "$ICON_SOURCE")
 BUILD_FILES=(build.sh VERSION)
 
 echo "🔨 Building CodexKeeper..."
@@ -95,6 +96,18 @@ plutil -replace CFBundleVersion -string "$VERSION" "$STAGED_APP/Contents/Info.pl
 
 cp assets/NOTICE.md "$STAGED_APP/Contents/Resources/ThirdPartyNotices.md"
 cp -R en.lproj zh-Hans.lproj "$STAGED_APP/Contents/Resources/"
+
+# Generate the standard macOS icon sizes from the supplied artwork.
+ICONSET="$STAGING/AppIcon.iconset"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+    sips -s format png --resampleHeightWidth "$size" "$size" "$ICON_SOURCE" \
+        --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+    retina=$((size * 2))
+    sips -s format png --resampleHeightWidth "$retina" "$retina" "$ICON_SOURCE" \
+        --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$STAGED_APP/Contents/Resources/AppIcon.icns"
 
 # Match Copied: development signing when available, no notarization requirement.
 codesign -s "$IDENTITY" -f "$STAGED_APP"

@@ -16,14 +16,16 @@ import Darwin
     private let codexHome: URL
     private let makeResumeTransport: () -> ResumeTransport
     private let defaults: UserDefaults
+    private let now: () -> Date
     private var activeTransports: [String: ResumeTransport] = [:]
     private let pingTransport: PingTransport
     private var ledgerHealthy = true
     private var generation = 0
     private var executionLock: Int32 = -1
 
-    init(provider: UsageProvider = AppServerUsageProvider(), makeResumeTransport: @escaping () -> ResumeTransport = { OwnedSessionResumeTransport() }, defaults: UserDefaults = .standard, ledgerURL: URL? = nil, pingTransport: PingTransport = PTYPingTransport(), codexHome: URL = CodexEnvironment.home) {
+    init(provider: UsageProvider = AppServerUsageProvider(), makeResumeTransport: @escaping () -> ResumeTransport = { OwnedSessionResumeTransport() }, defaults: UserDefaults = .standard, ledgerURL: URL? = nil, pingTransport: PingTransport = PTYPingTransport(), codexHome: URL = CodexEnvironment.home, now: @escaping () -> Date = Date.init) {
         self.codexHome = codexHome
+        self.now = now
         self.pingTransport = pingTransport
         self.provider = provider
         self.makeResumeTransport = makeResumeTransport
@@ -57,7 +59,7 @@ import Darwin
 
     func ping(schedule: ScheduleEngine, accountID: String?, ignoredEpisodes: Set<String> = [], hasPending: @escaping () -> Bool) {
         guard ledgerHealthy, defaults.bool(forKey: "enabled"),
-              !running, let node = schedule.currentNode(), let accountID else { return }
+              !running, let node = schedule.currentNode(at: now()), let accountID else { return }
         let key = "ping:\(accountID):\(node.timeIntervalSince1970)"
         guard !attempts.contains(key) else { return }
         let operation = generation
@@ -76,12 +78,12 @@ import Darwin
                 guard operation == generation, defaults.bool(forKey: "enabled"),
                       (defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480) == schedule.anchorMinutes,
                       accountID == before.accountID, !hasPending() else { throw CodexConnectionError.server("状态已改变，取消本次保活") }
-                let decision = DecisionEngine(schedule: schedule).decide(enabled: true, autoResume: false, earlyRecoveryPolicy: "ask", usage: before, blocked: [])
+                let decision = DecisionEngine(schedule: schedule).decide(now: now(), enabled: true, autoResume: false, earlyRecoveryPolicy: "ask", usage: before, blocked: [])
                 guard case .ping = decision else { status = decision.text; running = false; return }
                 let blocked = try await Task.detached { try SessionWatcher.freshBlockedSessions(codexHome: self.codexHome) }.value
                 guard blocked.allSatisfy({ ignoredEpisodes.contains($0.episodeKey) }), !hasPending(), operation == generation,
-                      defaults.bool(forKey: "enabled"), before.isFresh(at: Date()),
-                      schedule.currentNode() == node else { throw CodexConnectionError.server("保活条件已改变，等待重新确认") }
+                      defaults.bool(forKey: "enabled"), before.isFresh(at: now()),
+                      schedule.currentNode(at: now()) == node else { throw CodexConnectionError.server("保活条件已改变，等待重新确认") }
                 attempts.insert(key)
                 try FileManager.default.createDirectory(at: ledgerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try JSONEncoder().encode(Array(attempts)).write(to: ledgerURL, options: .atomic)
