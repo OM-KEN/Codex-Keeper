@@ -134,6 +134,7 @@ struct SettingsView: View {
                         TextField(L10n.text("留空则自动查找"), text: $cliPathDraft)
                             .textFieldStyle(.roundedBorder)
                             .accessibilityLabel(L10n.text("备用 Codex CLI 路径"))
+                            .labelsHidden()
                             .onSubmit(saveCLIPath)
                         Button(L10n.text("选择文件…"), action: chooseCLIPath)
                     }
