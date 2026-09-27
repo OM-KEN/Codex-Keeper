@@ -32,6 +32,7 @@ If project files changed or cannot be checked, Keeper adds a separate check remi
 The disk image is not notarized. If macOS blocks the first launch, verify the download source and follow [Apple's instructions for opening the app](https://support.apple.com/en-us/102445).
 
 If quota sync fails, click the refresh button beside the main time. If it keeps failing, check your network, Codex sign-in, and version.
+If the official Codex CLI cannot be found, enter or choose its executable file under **Fallback Codex CLI Path** in Settings, then click **Save**. Paths with `~/` or spaces are supported. The fallback is used only when automatic discovery fails; save an empty field to clear it. Saving a changed path immediately retries quota sync.
 
 ---
 

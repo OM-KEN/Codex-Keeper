@@ -861,6 +861,142 @@ import Darwin
         let runningCLI = runningBundle.appendingPathComponent("Contents/Resources/codex").path
         check(try CodexLocator.binary(environment: [:], userHome: locatorHome, runningBundles: [runningBundle], isExecutable: { $0 == runningCLI }).path == runningCLI,
             "locator finds running official bundle outside standard Applications")
+        let nestedCLIPath = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        let currentBundles = [runningBundle, URL(fileURLWithPath: "/Applications/Codex.app"),
+            URL(fileURLWithPath: "/Applications/ChatGPT.app"), locatorHome.appendingPathComponent("Applications/Codex.app"),
+            locatorHome.appendingPathComponent("Applications/ChatGPT.app")]
+        for bundle in currentBundles {
+            let executable = bundle.appendingPathComponent(nestedCLIPath).path
+            check((try? CodexLocator.binary(environment: [:], userHome: locatorHome, runningBundles: [runningBundle],
+                isExecutable: { $0 == executable }))?.path == executable,
+                "locator finds nested CLI without shell PATH: \(bundle.path)")
+        }
+        let nestedRunningCLI = runningBundle.appendingPathComponent(nestedCLIPath).path
+        check((try? CodexLocator.binary(environment: ["PATH": "/custom/bin"], userHome: locatorHome, runningBundles: [runningBundle],
+            isExecutable: { [nestedRunningCLI, userCLI, "/Applications/Codex.app/Contents/Resources/codex", "/custom/bin/codex"].contains($0) }))?.path == nestedRunningCLI,
+            "running official nested CLI takes priority over other installations and PATH")
+        let manualCLI = locatorHome.appendingPathComponent("manual CLI/codex")
+        try FileManager.default.createDirectory(at: manualCLI.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\nexit 0\n".write(to: manualCLI, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: manualCLI.path)
+        check((try? CodexLocator.binary(environment: [:], userHome: locatorHome, runningBundles: [],
+            fallbackPath: manualCLI.path, isExecutable: { _ in false })) == manualCLI,
+            "locator uses saved executable only when all automatic candidates are missing")
+        check((try? CodexLocator.binary(environment: [:], userHome: locatorHome, runningBundles: [],
+            fallbackPath: " \n~/manual CLI/codex\t ", isExecutable: { _ in false })) == manualCLI,
+            "manual CLI fallback trims whitespace and expands tilde while preserving spaces")
+        check((try? CodexLocator.binary(environment: [:], userHome: locatorHome, runningBundles: [runningBundle],
+            fallbackPath: manualCLI.path, isExecutable: { $0 == nestedRunningCLI }))?.path == nestedRunningCLI,
+            "automatic CLI discovery takes priority over a valid manual fallback")
+        check((try? CodexLocator.binary(environment: ["PATH": "/custom/bin"], userHome: locatorHome, runningBundles: [],
+            fallbackPath: "relative/invalid", isExecutable: { $0 == "/custom/bin/codex" }))?.path == "/custom/bin/codex",
+            "a stale manual fallback cannot block successful automatic discovery")
+        check(try CodexLocator.validateFallbackPath(" \n\t ", userHome: locatorHome) == nil,
+            "blank manual CLI path clears fallback")
+        let nonExecutableCLI = manualCLI.deletingLastPathComponent().appendingPathComponent("not-executable")
+        try Data().write(to: nonExecutableCLI)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nonExecutableCLI.path)
+        let linkedCLI = manualCLI.deletingLastPathComponent().appendingPathComponent("codex-link")
+        let linkedDirectory = manualCLI.deletingLastPathComponent().appendingPathComponent("directory-link")
+        let brokenCLI = manualCLI.deletingLastPathComponent().appendingPathComponent("broken-link")
+        try FileManager.default.createSymbolicLink(at: linkedCLI, withDestinationURL: manualCLI)
+        try FileManager.default.createSymbolicLink(at: linkedDirectory, withDestinationURL: manualCLI.deletingLastPathComponent())
+        try FileManager.default.createSymbolicLink(at: brokenCLI, withDestinationURL: locatorHome.appendingPathComponent("missing"))
+        check(try CodexLocator.validateFallbackPath(linkedCLI.path) == linkedCLI,
+            "manual CLI accepts executable symlinks and preserves the link path")
+        let literalCLI = manualCLI.deletingLastPathComponent().appendingPathComponent("codex $(literal) ; file")
+        try FileManager.default.copyItem(at: manualCLI, to: literalCLI)
+        check(try CodexLocator.validateFallbackPath(literalCLI.path)?.path == literalCLI.path,
+            "manual CLI treats shell metacharacters as literal filename characters")
+        for (path, expected) in [("relative/codex", CodexCLIPathError.relative), ("$HOME/codex", .relative),
+            (locatorHome.appendingPathComponent("missing").path, .missing), (brokenCLI.path, .missing),
+            (manualCLI.deletingLastPathComponent().path, .notFile), (linkedDirectory.path, .notFile),
+            (nonExecutableCLI.path, .notExecutable)] {
+            do {
+                _ = try CodexLocator.validateFallbackPath(path, userHome: locatorHome)
+                check(false, "manual CLI rejects invalid path: \(path)")
+            } catch {
+                check(error as? CodexCLIPathError == expected && !error.localizedDescription.isEmpty,
+                    "manual CLI returns a localized validation error: \(expected)")
+            }
+        }
+        let fallbackSuite = "keeper.cli-fallback.tests." + UUID().uuidString
+        let fallbackDefaults = UserDefaults(suiteName: fallbackSuite)!
+        defer { fallbackDefaults.removePersistentDomain(forName: fallbackSuite) }
+        check(try CodexLocator.saveFallbackPath(" \n~/manual CLI/codex\t", defaults: fallbackDefaults, userHome: locatorHome) == manualCLI.path &&
+            fallbackDefaults.string(forKey: CodexLocator.fallbackPathKey) == manualCLI.path,
+            "saving manual CLI persists the validated absolute path")
+        check((try? CodexLocator.saveFallbackPath(nonExecutableCLI.path, defaults: fallbackDefaults)) == nil &&
+            fallbackDefaults.string(forKey: CodexLocator.fallbackPathKey) == manualCLI.path,
+            "invalid manual CLI save preserves the previous valid setting")
+        check(try CodexLocator.saveFallbackPath(" \n ", defaults: fallbackDefaults).isEmpty &&
+            fallbackDefaults.object(forKey: CodexLocator.fallbackPathKey) == nil,
+            "saving blank removes the stored CLI fallback")
+        check((try? CodexLocator.binary(environment: [:], userHome: locatorHome, runningBundles: [],
+            fallbackPath: fallbackDefaults.string(forKey: CodexLocator.fallbackPathKey), isExecutable: { _ in false })) == nil,
+            "cleared fallback cannot be reused when automatic discovery fails")
+
+        var fallbackClock: TimeInterval = 100
+        var fallbackFailures = 0
+        let fallbackFailureProvider = AppServerUsageProvider(makeTransport: {
+            fallbackFailures += 1; throw CodexConnectionError.unavailable
+        }, contextIdentity: { nil }, fallbackPath: { fallbackDefaults.string(forKey: CodexLocator.fallbackPathKey) }, uptime: { fallbackClock })
+        _ = try? fallbackFailureProvider.read()
+        _ = try? fallbackFailureProvider.readForUserRefresh()
+        try CodexLocator.saveFallbackPath(manualCLI.path, defaults: fallbackDefaults)
+        _ = try? fallbackFailureProvider.read()
+        check(fallbackFailures == 2, "a changed fallback does not bypass background failure backoff")
+        _ = try? fallbackFailureProvider.readForUserRefresh()
+        check(fallbackFailures == 3, "a saved path change permits one immediate manual retry inside the five-second limit")
+        for _ in 0..<10 {
+            try CodexLocator.saveFallbackPath("  " + manualCLI.path + "  ", defaults: fallbackDefaults)
+            _ = try? fallbackFailureProvider.readForUserRefresh()
+            _ = try? fallbackFailureProvider.read()
+        }
+        check(fallbackFailures == 3, "equivalent saves and repeated reads retain manual throttling and background backoff")
+        fallbackClock += 5
+        _ = try? fallbackFailureProvider.readForUserRefresh()
+        check(fallbackFailures == 4, "failure after changed-path retry still uses the existing five-second manual cooldown")
+        try CodexLocator.saveFallbackPath("", defaults: fallbackDefaults)
+        _ = try? fallbackFailureProvider.readForUserRefresh()
+        check(fallbackFailures == 5, "clearing the saved path also permits one explicit retry")
+
+        var fallbackConnections = 0
+        let fallbackTransport = CountingUsageTransport()
+        let fallbackProvider = AppServerUsageProvider(makeTransport: {
+            fallbackConnections += 1
+            _ = try CodexLocator.binary(environment: [:], userHome: locatorHome, runningBundles: [],
+                fallbackPath: fallbackDefaults.string(forKey: CodexLocator.fallbackPathKey), isExecutable: { _ in false })
+            return fallbackTransport
+        }, contextIdentity: { nil }, fallbackPath: { fallbackDefaults.string(forKey: CodexLocator.fallbackPathKey) }, uptime: { fallbackClock })
+        _ = try? fallbackProvider.read()
+        _ = try? fallbackProvider.readForUserRefresh()
+        let fallbackRuntime = temp.appendingPathComponent("fallback-support/pending-runtime.json")
+        let fallbackState = AppState(provider: fallbackProvider, defaults: fallbackDefaults, runtimeURL: fallbackRuntime,
+            codexHome: locatorHome, startMonitoring: false)
+        try CodexLocator.saveFallbackPath(manualCLI.path, defaults: fallbackDefaults)
+        for _ in 0..<300 {
+            if fallbackConnections == 3 && !fallbackState.usage.refreshing { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        check(fallbackConnections == 3 && fallbackState.usage.snapshot?.sourceFile == "app-server" && fallbackState.usage.lastError == nil,
+            "saving a fallback drives AppState's immediate manual quota retry without restart")
+        try CodexLocator.saveFallbackPath(manualCLI.path, defaults: fallbackDefaults)
+        _ = try? CodexLocator.saveFallbackPath(nonExecutableCLI.path, defaults: fallbackDefaults)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        check(fallbackTransport.calls == 1, "unchanged or invalid saves do not enqueue another quota refresh")
+        fallbackTransport.delay = 0.05
+        fallbackState.usage.refresh()
+        try CodexLocator.saveFallbackPath("", defaults: fallbackDefaults)
+        for _ in 0..<300 {
+            if fallbackTransport.calls == 3 && !fallbackState.usage.refreshing { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        check(fallbackTransport.calls == 3 && fallbackConnections == 3 && fallbackTransport.closes == 0 && fallbackTransport.maxActive == 1,
+            "path changes queue one read behind active quota work and reuse its healthy connection")
+        let fallbackEvents = try String(contentsOf: fallbackRuntime.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"), encoding: .utf8)
+        check(fallbackEvents.contains("cli_path") && fallbackEvents.contains("usage_refresh_queued"),
+            "saved-path refreshes use the existing manual-refresh diagnostic flow")
         check(CodexEnvironment.home(environment: ["CODEX_HOME": "/custom/codex"], userHome: locatorHome).path == "/custom/codex" &&
             CodexEnvironment.home(environment: [:], userHome: locatorHome) == locatorHome.appendingPathComponent(".codex"), "unified home supports override and default")
         let emptyHome = temp.appendingPathComponent("empty-codex-home")

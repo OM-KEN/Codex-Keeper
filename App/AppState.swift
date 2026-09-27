@@ -57,6 +57,9 @@ import Network
             if !running { self?.recompute(allowExecution: false) }
         }.store(in: &cancellables)
         sessions.watchedIDs = Set(confirmed.keys)
+        observers.append(NotificationCenter.default.addObserver(forName: CodexLocator.fallbackPathChanged, object: defaults, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.usage.refresh(manual: true, source: "cli_path") }
+        })
         guard startMonitoring else { recompute(allowExecution: false); return }
         observers.append(NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.recompute() }
