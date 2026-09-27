@@ -29,7 +29,7 @@ struct DecisionEngine {
 
     func plan(now: Date = Date(), calendar: Calendar = .current, enabled: Bool, autoResume: Bool,
               earlyRecoveryPolicy: String, usage: UsageSnapshot?, blocked: [BlockedSession],
-              observedRecovery: Bool = false, heldForPlan: Bool = false) -> NextAction {
+              observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false) -> NextAction {
         let target = blocked.first
         let mode: NextActionMode = target != nil ? .resume : .keepAlive
         func wait(_ reason: String, at date: Date? = nil) -> NextAction {
@@ -45,6 +45,10 @@ struct DecisionEngine {
         let atNode = schedule.currentNode(at: now, calendar: calendar) != nil
         let nextNode = schedule.nextNode(after: now, calendar: calendar)
         if let target {
+            if needsRecoveryDecision {
+                return NextAction(mode: .resume, date: nil, decision: .wait(reason: "等待续跑决定"),
+                    note: "等待续跑决定", needsRecoveryDecision: true)
+            }
             if let reset = blockingReset {
                 guard reset > now else { return wait("等待额度恢复确认") }
                 let date: Date
@@ -53,6 +57,10 @@ struct DecisionEngine {
                     date = schedule.anchorProtection(at: reset, calendar: calendar).anchor
                 } else { date = reset }
                 return wait(date == reset ? "额度恢复并确认后续跑" : "恢复后顺延至计划时间", at: date)
+            }
+            if earlyRecoveryPolicy == "ask", !observedRecovery, !heldForPlan {
+                return NextAction(mode: .resume, date: nil, decision: .wait(reason: "额度已恢复，等待决定"),
+                    note: "额度已恢复，等待决定", needsRecoveryDecision: true)
             }
             if atNode { return NextAction(mode: .resume, date: now, decision: .resume(project: target.project, reason: "计划节点，额度已确认可用"), note: "额度已确认可用") }
             let inProtection = schedule.isInAnchorProtection(at: now, calendar: calendar)
@@ -82,6 +90,16 @@ struct DecisionEngine {
 
 /// Distinguish an observed scheduled reset from an early/manual quota reset.
 enum UsageRecovery {
+    static func hasAvailableQuota(for target: BlockedSession, usage: UsageSnapshot?, boundAccount: String?, now: Date) -> Bool {
+        guard let account = boundAccount, !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let usage, usage.accountID == account, usage.isFresh(at: now),
+              usage.fiveHour != nil || usage.weekly != nil,
+              (usage.fiveHour?.usedPercent ?? 0) < 100, (usage.weekly?.usedPercent ?? 0) < 100 else { return false }
+        if target.fiveHourResetAt != nil && usage.fiveHour == nil { return false }
+        if target.weeklyResetAt != nil && usage.weekly == nil { return false }
+        return true
+    }
+
     /// A known quota stop keeps its scheduled deadline through missed polls or environment invalidation.
     /// Historical evidence never replaces fresh quota or the executor's task/account checks.
     static func canResumeAfterScheduledReset(_ target: BlockedSession, usage: UsageSnapshot?, boundAccount: String?, now: Date) -> Bool {

@@ -67,11 +67,10 @@ struct OnboardingView: View {
         switch step {
         case 0:
             VStack(alignment: .leading, spacing: 14) {
-                Image(systemName: "waveform.path.ecg")
-                    .font(.system(size: 30, weight: .medium))
-                    .foregroundStyle(.tint)
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .scaledToFit()
                     .frame(width: 64, height: 64)
-                    .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
                 Text("Codex Keeper").font(.title.weight(.semibold))
             }
         case 1:
@@ -106,7 +105,7 @@ struct OnboardingView: View {
         default:
             VStack(alignment: .leading, spacing: 14) {
                 Text(L10n.text("2. 自动继续任务")).font(.title2.weight(.semibold))
-                Text(L10n.text("任务因额度用完而暂停后，会在额度恢复后自动发送“继续”。"))
+                Text(L10n.text("任务因额度用完而暂停后，确认额度正常恢复时会自动继续；其他恢复情况会先提醒你选择。"))
                     .font(.system(size: NSFont.systemFontSize + 1))
                     .foregroundStyle(.primary.opacity(0.8))
                     .lineSpacing(3)

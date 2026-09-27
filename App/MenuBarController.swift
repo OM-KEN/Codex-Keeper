@@ -41,6 +41,9 @@ import UserNotifications
             notifications.add(UNNotificationRequest(identifier: "keeper-ping-wait-" + UUID().uuidString,
                 content: content, trigger: nil))
         }.store(in: &cancellables)
+        appState.$recoveryReminderTasks.receive(on: DispatchQueue.main).sink { [weak self] tasks in
+            self?.sendRecoveryReminders(for: tasks)
+        }.store(in: &cancellables)
         appState.objectWillChange.sink { [weak self] _ in
             guard let self, !self.updateScheduled else { return }
             self.updateScheduled = true
@@ -64,6 +67,44 @@ import UserNotifications
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .list, .sound])
+    }
+
+    private func sendRecoveryReminders(for tasks: [BlockedSession]) {
+        for task in tasks {
+            let key = task.episodeKey
+            guard let reminder = appState.claimRecoveryReminder(for: key) else { continue }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let settings = await UNUserNotificationCenter.current().notificationSettings()
+                guard self.appState.recoveryReminderIsCurrent(for: key, phase: reminder.phase),
+                      settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+                    self.appState.finishRecoveryReminder(for: key, phase: reminder.phase, delivered: false)
+                    return
+                }
+                let content = UNMutableNotificationContent()
+                content.title = L10n.text("有暂停的任务等你处理")
+                content.body = task.displayName + "\n" + reminder.message + "\n" + L10n.text("点击查看任务。Keeper 会继续按计划保活。")
+                content.sound = .default
+                content.userInfo = ["keeper_action": "recovery-decision"]
+                do {
+                    try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "keeper-recovery-" + key, content: content, trigger: nil))
+                    self.appState.finishRecoveryReminder(for: key, phase: reminder.phase, delivered: true)
+                } catch {
+                    self.appState.finishRecoveryReminder(for: key, phase: reminder.phase, delivered: false)
+                }
+            }
+        }
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void) {
+        if response.notification.request.content.userInfo["keeper_action"] as? String == "recovery-decision" {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.appState.openRecoveryDecisions { self.openTasks() }
+            }
+        }
+        completionHandler()
     }
 
     @discardableResult private func row(_ title: String, action: Selector? = nil) -> NSMenuItem {
@@ -103,6 +144,7 @@ import UserNotifications
         }
         host.layoutSubtreeIfNeeded()
         host.frame.size = NSSize(width: 304, height: host.fittingSize.height)
+        cancelResumeItem?.title = L10n.text(appState.nextAction?.needsRecoveryDecision == true ? "选择续跑方式…" : "取消下一次自动继续")
         cancelResumeItem?.isHidden = !enabled || appState.selectedTasks.isEmpty
         cancelResumeItem?.isEnabled = !appState.execution.running
     }
@@ -113,6 +155,7 @@ import UserNotifications
             var summary = MenuSummary(headline: "已停用")
             summary.isRefreshing = appState.usage.refreshing
             summary.refreshMessage = appState.usage.refreshMessage
+            summary.applyRecoveryReminder(tasks: appState.availableTasks, choices: appState.choices, keepAliveEnabled: false)
             return summary
         }
         var summary = MenuSummary.build(plan: appState.nextAction, usage: appState.usage.snapshot,
@@ -140,6 +183,7 @@ import UserNotifications
                 summary.headline = "保活等待中"
             }
         }
+        summary.applyRecoveryReminder(tasks: appState.availableTasks, choices: appState.choices)
         summary.isRefreshing = appState.usage.refreshing
         summary.refreshMessage = appState.usage.refreshMessage
         return summary
@@ -158,6 +202,7 @@ import UserNotifications
         rebuildMenu()
     }
     @objc private func useKeepAlive() {
+        if appState.nextAction?.needsRecoveryDecision == true { openTasks(); return }
         let tasks = appState.availableTasks
         guard let plan = appState.cancellationPlan else {
             appState.refresh()
