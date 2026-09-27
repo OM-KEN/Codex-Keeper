@@ -201,7 +201,9 @@ final class AppServerUsageProvider: UsageProvider {
     private let makeTransport: () throws -> CodexTransport
     private let contextIdentity: () throws -> Data?
     private let accountIdentity: () throws -> String?
+    private let fallbackPath: () -> String?
     private let uptime: () -> TimeInterval
+    private var lastFallbackPath: String?
     private var transport: CodexTransport?
     private var identity: Data?
     private var retryAfter: TimeInterval = 0
@@ -214,10 +216,13 @@ final class AppServerUsageProvider: UsageProvider {
     init(makeTransport: @escaping () throws -> CodexTransport = { try AppServerClient(usageOnly: true) },
          contextIdentity: (() throws -> Data?)? = nil,
          accountIdentity: (() throws -> String?)? = nil,
+         fallbackPath: @escaping () -> String? = { UserDefaults.standard.string(forKey: CodexLocator.fallbackPathKey) },
          uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.makeTransport = makeTransport
         self.contextIdentity = contextIdentity ?? { try Self.authenticationIdentity() }
         self.accountIdentity = accountIdentity ?? (contextIdentity == nil ? { try Self.authenticationAccountID() } : { nil })
+        self.fallbackPath = fallbackPath
+        self.lastFallbackPath = fallbackPath()
         self.uptime = uptime
     }
 
@@ -310,10 +315,12 @@ final class AppServerUsageProvider: UsageProvider {
 
     private func withConnection<T>(manual: Bool = false, _ operation: (CodexTransport) throws -> T) throws -> T {
         lock.lock(); defer { lock.unlock() }
+        let currentFallbackPath = fallbackPath()
         if uptime() < retryAfter, let lastFailure {
             // A deliberate retry can bypass background backoff, but repeated clicks cannot spawn a storm.
-            guard manual, uptime() >= manualRetryAfter else { throw lastFailure }
+            guard manual, currentFallbackPath != lastFallbackPath || uptime() >= manualRetryAfter else { throw lastFailure }
         }
+        lastFallbackPath = currentFallbackPath
         if manual { manualRetryAfter = uptime() + 5 }
         do {
             let currentIdentity = try contextIdentity()
@@ -417,21 +424,67 @@ enum CodexEnvironment {
     }
 }
 
+enum CodexCLIPathError: LocalizedError, Equatable {
+    case relative, missing, notFile, notExecutable
+    var errorDescription: String? {
+        switch self {
+        case .relative: return L10n.text("请输入 Codex CLI 的绝对路径（可使用 ~/）。")
+        case .missing: return L10n.text("找不到该文件，请检查路径。")
+        case .notFile: return L10n.text("请选择 Codex CLI 可执行文件，不能选择文件夹。")
+        case .notExecutable: return L10n.text("该文件不可执行，请选择 Codex CLI 可执行文件。")
+        }
+    }
+}
+
 enum CodexLocator {
-    static func binary() throws -> URL {
-        let bundles = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.openai.codex" }.compactMap { $0.bundleURL }
-        return try binary(environment: ProcessInfo.processInfo.environment, userHome: FileManager.default.homeDirectoryForCurrentUser, runningBundles: bundles)
+    static let fallbackPathKey = "codexCLIFallbackPath"
+    static let fallbackPathChanged = Notification.Name("CodexKeeperCLIFallbackPathChanged")
+
+    static func validateFallbackPath(_ raw: String, userHome: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let path = trimmed.hasPrefix("~/") ? userHome.appendingPathComponent(String(trimmed.dropFirst(2))).path : trimmed
+        guard path.hasPrefix("/") else { throw CodexCLIPathError.relative }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { throw CodexCLIPathError.missing }
+        guard !isDirectory.boolValue,
+              (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            throw CodexCLIPathError.notFile
+        }
+        guard FileManager.default.isExecutableFile(atPath: url.path) else { throw CodexCLIPathError.notExecutable }
+        return url
     }
 
-    static func binary(environment: [String: String], userHome: URL, runningBundles: [URL],
-                       isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) throws -> URL {
-        var paths = runningBundles.map { $0.appendingPathComponent("Contents/Resources/codex").path }
-        for directory in ["/Applications", userHome.appendingPathComponent("Applications").path] {
-            for app in ["Codex.app", "ChatGPT.app"] { paths.append(directory + "/" + app + "/Contents/Resources/codex") }
+    @discardableResult static func saveFallbackPath(_ raw: String, defaults: UserDefaults = .standard,
+                                                    userHome: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> String {
+        let path = try validateFallbackPath(raw, userHome: userHome)?.path
+        if path != defaults.string(forKey: fallbackPathKey) {
+            if let path { defaults.set(path, forKey: fallbackPathKey) }
+            else { defaults.removeObject(forKey: fallbackPathKey) }
+            NotificationCenter.default.post(name: fallbackPathChanged, object: defaults)
         }
+        return path ?? ""
+    }
+
+    static func binary() throws -> URL {
+        let bundles = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.openai.codex" }.compactMap { $0.bundleURL }
+        return try binary(environment: ProcessInfo.processInfo.environment, userHome: FileManager.default.homeDirectoryForCurrentUser,
+            runningBundles: bundles, fallbackPath: UserDefaults.standard.string(forKey: fallbackPathKey))
+    }
+
+    static func binary(environment: [String: String], userHome: URL, runningBundles: [URL], fallbackPath: String? = nil,
+                       isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) throws -> URL {
+        let relativePaths = ["Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex", "Contents/Resources/codex"]
+        var bundles = runningBundles
+        for directory in ["/Applications", userHome.appendingPathComponent("Applications").path] {
+            for app in ["Codex.app", "ChatGPT.app"] { bundles.append(URL(fileURLWithPath: directory).appendingPathComponent(app)) }
+        }
+        var paths = bundles.flatMap { bundle in relativePaths.map { bundle.appendingPathComponent($0).path } }
         paths += (environment["PATH"] ?? "").split(separator: ":").filter { $0.hasPrefix("/") }.map { String($0) + "/codex" }
         paths += ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
-        guard let path = paths.first(where: isExecutable) else { throw CodexConnectionError.unavailable }
-        return URL(fileURLWithPath: path)
+        if let path = paths.first(where: isExecutable) { return URL(fileURLWithPath: path) }
+        if let fallback = try validateFallbackPath(fallbackPath ?? "", userHome: userHome) { return fallback }
+        throw CodexConnectionError.unavailable
     }
 }

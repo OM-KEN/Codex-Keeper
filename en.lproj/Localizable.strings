@@ -77,6 +77,16 @@
 "项目文件有变化或无法核对时，Keeper 会在所选续跑内容前单独加上：\n\n“%@”" = "If project files changed or cannot be checked, Keeper adds this as a separate paragraph before your selected resume message:\n\n“%@”";
 "开机自启" = "Open at Login";
 "请在“系统设置 → 通用 → 登录项”中允许 Codex Keeper 登录时打开" = "Allow Codex Keeper to open at login in System Settings → General → Login Items.";
+"备用 Codex CLI 路径" = "Fallback Codex CLI Path";
+"留空则自动查找" = "Leave blank for automatic discovery";
+"仅在自动查找失败时使用；留空则自动查找" = "Used only if automatic discovery fails. Leave blank for automatic discovery.";
+"选择文件…" = "Choose File…";
+"选择 Codex CLI 可执行文件" = "Choose the Codex CLI executable file";
+"已保存" = "Saved";
+"请输入 Codex CLI 的绝对路径（可使用 ~/）。" = "Enter an absolute Codex CLI path (~/ is supported).";
+"找不到该文件，请检查路径。" = "File not found. Check the path.";
+"请选择 Codex CLI 可执行文件，不能选择文件夹。" = "Choose a Codex CLI executable file, not a folder.";
+"该文件不可执行，请选择 Codex CLI 可执行文件。" = "This file is not executable. Choose the Codex CLI executable file.";
 "已选择 %d 个任务" = "Selected tasks: %d";
 "%@ · %@ · %@ 暂停" = "Paused · %@ · %@ · %@";
 "发送内容" = "Message to Send";

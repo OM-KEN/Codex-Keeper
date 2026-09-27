@@ -1,5 +1,6 @@
 import SwiftUI
 import ServiceManagement
+import AppKit
 
 struct SettingsView: View {
     @AppStorage("enabled") private var enabled = true
@@ -13,6 +14,9 @@ struct SettingsView: View {
     @State private var loginError: String?
     @State private var showingCustomMessageEditor = false
     @State private var customMessageDraft = ""
+    @State private var cliPathDraft = UserDefaults.standard.string(forKey: CodexLocator.fallbackPathKey) ?? ""
+    @State private var cliPathError: String?
+    @State private var cliPathSaved = false
     private var dailySchedule: String {
         let calendar = Calendar.current
         let today = Date()
@@ -46,6 +50,25 @@ struct SettingsView: View {
         let hasCustomText = resumeMessageCustomized || (savedResumeMessage != "继续" && savedResumeMessage != "Continue")
         customMessageDraft = hasCustomText ? savedResumeMessage : ""
         showingCustomMessageEditor = true
+    }
+    private func saveCLIPath() {
+        do {
+            cliPathDraft = try CodexLocator.saveFallbackPath(cliPathDraft)
+            cliPathError = nil
+            cliPathSaved = true
+        } catch { cliPathError = error.localizedDescription; cliPathSaved = false }
+    }
+    private func chooseCLIPath() {
+        let panel = NSOpenPanel()
+        panel.message = L10n.text("选择 Codex CLI 可执行文件")
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = true
+        panel.showsHiddenFiles = true
+        panel.begin { response in
+            if response == .OK, let url = panel.url { cliPathDraft = url.path }
+        }
     }
     var body: some View {
         Form {
@@ -105,10 +128,38 @@ struct SettingsView: View {
                 }))
                 if let loginError { Text(loginError).font(.caption).foregroundStyle(.secondary) }
             }
+            Section(L10n.text("备用 Codex CLI 路径")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        TextField(L10n.text("留空则自动查找"), text: $cliPathDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel(L10n.text("备用 Codex CLI 路径"))
+                            .onSubmit(saveCLIPath)
+                        Button(L10n.text("选择文件…"), action: chooseCLIPath)
+                    }
+                    HStack(alignment: .top) {
+                        Text(L10n.text("仅在自动查找失败时使用；留空则自动查找"))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                        Button(L10n.text("保存"), action: saveCLIPath)
+                    }
+                    if let cliPathError {
+                        Text(cliPathError).font(.caption).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if cliPathSaved {
+                        Text(L10n.text("已保存")).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .padding(12)
         .frame(minWidth: 480, idealWidth: 480, minHeight: 540, idealHeight: 620)
+        .onChange(of: cliPathDraft) { value in
+            cliPathError = nil
+            if value != (UserDefaults.standard.string(forKey: CodexLocator.fallbackPathKey) ?? "") { cliPathSaved = false }
+        }
         .sheet(isPresented: $showingCustomMessageEditor) {
             VStack(alignment: .leading, spacing: 12) {
                 Text(L10n.text("编辑自定义内容")).font(.headline)
