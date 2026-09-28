@@ -50,7 +50,8 @@ struct MenuSummaryView: View {
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(L10n.text(summary.headline))
-                        .font(.system(size: summary.isTime ? 38 : 24, weight: .semibold)).monospacedDigit()
+                        .font(.system(size: summary.isTime ? 38 : 24, weight: .semibold,
+                            design: summary.isTime ? .rounded : .default))
                     if !summary.action.isEmpty {
                         Text(L10n.text(summary.action)).font(.system(size: 17, weight: .semibold))
                     }
@@ -77,22 +78,31 @@ struct MenuSummaryView: View {
                         .accessibilityLabel(L10n.format("同步状态：%@", summary.refreshMessage))
                 }
                 if let title = summary.tasks.first {
+                    let bubble = MenuTaskBubble(showsTail: summary.timeline.last?.kind == .resume)
                     Button(action: openTasks) {
                         HStack(spacing: 5) {
                             Image(systemName: summary.taskCount > 1 ? "bubble.left.and.text.bubble.right" : "text.bubble")
-                            Text(title).lineLimit(1).truncationMode(.tail)
+                            Text(title).lineLimit(2).truncationMode(.tail)
                             if summary.taskCount > 1 {
                                 Text(L10n.format("等%d个会话", summary.taskCount)).foregroundStyle(.primary).fixedSize()
                             }
                             Spacer(minLength: 0)
                             Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
                         }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
-                        .foregroundStyle(tasksHovered ? Color.accentColor : Color.secondary)
-                        .padding(.horizontal, 6).padding(.vertical, 5)
-                        .background(tasksHovered ? Color.accentColor.opacity(0.10) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 5))
-                        .contentShape(Rectangle())
-                    }.buttonStyle(.plain).padding(.top, 4).help(L10n.text("选择会话和续跑方式"))
+                        .foregroundStyle(tasksHovered ? Color.accentColor : Color.primary)
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                        .padding(.bottom, bubble.showsTail ? 5 : 0)
+                        .background {
+                            bubble.fill(.regularMaterial)
+                                .overlay {
+                                    bubble.fill(Color.accentColor.opacity(tasksHovered ? 0.10 : 0))
+                                }
+                                .overlay {
+                                    bubble.stroke(tasksHovered ? Color.accentColor.opacity(0.35) : Color.primary.opacity(0.10), lineWidth: 1)
+                                }
+                        }
+                        .contentShape(bubble)
+                    }.buttonStyle(.plain).padding(.top, 6).help(title + "\n" + L10n.text("选择会话和续跑方式"))
                         .onHover { tasksHovered = $0 }
                 }
                 if summary.timeline.count > 1 {
@@ -103,34 +113,71 @@ struct MenuSummaryView: View {
                         .fixedSize(horizontal: false, vertical: true).padding(.top, 3)
                 }
             }
-            if !summary.quotas.isEmpty {
-                Divider()
-                VStack(spacing: 10) {
-                    ForEach(summary.quotas) { quota in
-                        HStack(spacing: 6) {
-                            Text(L10n.text(quota.name)).foregroundStyle(.secondary).frame(width: 31, alignment: .leading)
-                            if quota.remaining.rounded() <= 0 {
-                                // Native ProgressView keeps a minimum fill even at zero.
-                                Capsule().fill(Color.primary.opacity(0.05))
-                                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.05)))
-                                    .frame(height: 8)
-                                    .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
-                                    .accessibilityValue("0%")
-                            } else {
-                                ProgressView(value: max(0, min(100, quota.remaining)), total: 100)
-                                    .progressViewStyle(.linear).tint(.accentColor)
-                                    .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
-                            }
-                            Text("\(Int(max(0, min(100, quota.remaining)).rounded()))%")
-                                .monospacedDigit().frame(width: 32, alignment: .trailing)
-                            Text(L10n.text(quota.detail)).foregroundStyle(.secondary)
-                                .frame(width: 106, alignment: .trailing).lineLimit(1)
-                        }.font(.system(size: 11))
-                    }
-                }
-            }
         }
         .padding(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
+        .frame(width: 304, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct MenuTaskBubble: Shape {
+    let showsTail: Bool
+
+    func path(in rect: CGRect) -> Path {
+        let bottom = rect.maxY - (showsTail ? 5 : 0)
+        let radius = min(14, (bottom - rect.minY) / 2)
+        return Path { path in
+            path.move(to: CGPoint(x: rect.minX + radius, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY + radius), control: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: bottom - radius))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX - radius, y: bottom), control: CGPoint(x: rect.maxX, y: bottom))
+            if showsTail {
+                let center = rect.maxX - 22
+                path.addLine(to: CGPoint(x: center + 7, y: bottom))
+                path.addCurve(to: CGPoint(x: center + 0.6, y: bottom + 4.6),
+                    control1: CGPoint(x: center + 4, y: bottom), control2: CGPoint(x: center + 3, y: bottom + 2.8))
+                path.addQuadCurve(to: CGPoint(x: center - 0.6, y: bottom + 4.6), control: CGPoint(x: center, y: bottom + 5.4))
+                path.addCurve(to: CGPoint(x: center - 7, y: bottom),
+                    control1: CGPoint(x: center - 3, y: bottom + 2.8), control2: CGPoint(x: center - 4, y: bottom))
+            }
+            path.addLine(to: CGPoint(x: rect.minX + radius, y: bottom))
+            path.addQuadCurve(to: CGPoint(x: rect.minX, y: bottom - radius), control: CGPoint(x: rect.minX, y: bottom))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + radius))
+            path.addQuadCurve(to: CGPoint(x: rect.minX + radius, y: rect.minY), control: CGPoint(x: rect.minX, y: rect.minY))
+            path.closeSubpath()
+        }
+    }
+}
+
+struct MenuQuotaView: View {
+    let quotas: [MenuQuota]
+
+    var body: some View {
+        VStack(spacing: 10) {
+            ForEach(quotas) { quota in
+                HStack(spacing: 6) {
+                    Text(L10n.text(quota.name)).foregroundStyle(.secondary).frame(width: 31, alignment: .leading)
+                    if quota.remaining.rounded() <= 0 {
+                        // Native ProgressView keeps a minimum fill even at zero.
+                        Capsule().fill(Color.primary.opacity(0.05))
+                            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.05)))
+                            .frame(height: 8)
+                            .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
+                            .accessibilityValue("0%")
+                    } else {
+                        ProgressView(value: max(0, min(100, quota.remaining)), total: 100)
+                            .progressViewStyle(.linear).tint(.accentColor)
+                            .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
+                    }
+                    Text("\(Int(max(0, min(100, quota.remaining)).rounded()))%")
+                        .monospacedDigit().frame(width: 32, alignment: .trailing)
+                    Text(L10n.text(quota.detail)).foregroundStyle(.secondary)
+                        .frame(width: 106, alignment: .trailing).lineLimit(1)
+                }.font(.system(size: 11))
+            }
+        }
+        .padding(EdgeInsets(top: 10, leading: 16, bottom: 14, trailing: 16))
         .frame(width: 304, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
     }

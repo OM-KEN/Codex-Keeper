@@ -75,7 +75,13 @@ import AppKit
                     ForEach(cases.indices, id: \.self) { index in
                         VStack(alignment: .leading, spacing: 10) {
                             Text(cases[index].0).font(.system(size: 12, weight: .semibold)).padding(.leading, 6)
-                            MenuSummaryView(summary: cases[index].1).background(Color.white).clipShape(RoundedRectangle(cornerRadius: 12))
+                            VStack(spacing: 0) {
+                                MenuSummaryView(summary: cases[index].1)
+                                if !cases[index].1.quotas.isEmpty {
+                                    Divider()
+                                    MenuQuotaView(quotas: cases[index].1.quotas)
+                                }
+                            }.background(Color.white).clipShape(RoundedRectangle(cornerRadius: 12))
                         }.frame(maxHeight: .infinity, alignment: .top)
                     }
                 }

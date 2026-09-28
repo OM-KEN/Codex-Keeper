@@ -8,8 +8,12 @@ import UserNotifications
     private let menu = NSMenu()
     private var summaryHost: NSHostingView<MenuSummaryView>?
     private let summaryItem = NSMenuItem()
+    private var quotaHost: NSHostingView<MenuQuotaView>?
+    private let quotaItem = NSMenuItem()
+    private let quotaSeparator = NSMenuItem.separator()
     private var cancelResumeItem: NSMenuItem?
     private var settingsWindow: NSWindow?
+    private var cliPathWindow: NSWindow?
     private var tasksWindow: NSWindow?
     private let appState = AppState()
     private var updateScheduled = false
@@ -56,7 +60,7 @@ import UserNotifications
             }
         }.store(in: &cancellables)
         rebuildMenu()
-        if CommandLine.arguments.contains("--show-settings") { openSettings() }
+        if CommandLine.arguments.contains("--show-settings") { openKeeperSettings() }
     }
 
     // Refresh on every opening; the observation above updates the visible menu when it returns.
@@ -137,9 +141,14 @@ import UserNotifications
             summaryHost = host
             summaryItem.view = host
             menu.addItem(summaryItem)
+            menu.addItem(quotaSeparator)
             cancelResumeItem = row(L10n.text("取消下一次自动继续"), action: #selector(useKeepAlive))
+            let quotaHost = NSHostingView(rootView: MenuQuotaView(quotas: summary.quotas))
+            self.quotaHost = quotaHost
+            quotaItem.view = quotaHost
+            menu.addItem(quotaItem)
             menu.addItem(.separator())
-            row(L10n.text("设置…"), action: #selector(openSettings)).keyEquivalent = ","
+            row(L10n.text("设置…"), action: #selector(openKeeperSettings)).keyEquivalent = ","
             row(L10n.text("退出 Codex Keeper"), action: #selector(quitApp)).keyEquivalent = "q"
         }
         host.layoutSubtreeIfNeeded()
@@ -147,6 +156,13 @@ import UserNotifications
         cancelResumeItem?.title = L10n.text(appState.nextAction?.needsRecoveryDecision == true ? "选择续跑方式…" : "取消下一次自动继续")
         cancelResumeItem?.isHidden = !enabled || appState.selectedTasks.isEmpty
         cancelResumeItem?.isEnabled = !appState.execution.running
+        quotaHost?.rootView = MenuQuotaView(quotas: summary.quotas)
+        quotaHost?.layoutSubtreeIfNeeded()
+        if let quotaHost {
+            quotaHost.frame.size = NSSize(width: 304, height: quotaHost.fittingSize.height)
+        }
+        quotaItem.isHidden = summary.quotas.isEmpty
+        quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
     }
 
     private func makeSummary() -> MenuSummary {
@@ -190,12 +206,38 @@ import UserNotifications
     }
 
     @objc private func showExecutionIssue() {
+        if (try? CodexLocator.binary()) == nil {
+            openCLIPath()
+            return
+        }
         let alert = NSAlert()
         alert.messageText = L10n.text("Codex Keeper 遇到问题")
         alert.informativeText = L10n.text(makeSummary().error)
         alert.addButton(withTitle: L10n.text("好"))
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+    private func openCLIPath() {
+        if cliPathWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 200), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = L10n.text("设置 Codex 路径")
+            window.center(); window.isReleasedWhenClosed = false
+            cliPathWindow = window
+        }
+        let previousPath = UserDefaults.standard.string(forKey: CodexLocator.fallbackPathKey)
+        let host = NSHostingView(rootView: CodexCLIPathView(
+            cancel: { [weak self] in self?.cliPathWindow?.close() },
+            saved: { [weak self] in
+                self?.cliPathWindow?.close()
+                // Changed paths already trigger AppState's immediate refresh notification.
+                if previousPath == UserDefaults.standard.string(forKey: CodexLocator.fallbackPathKey) {
+                    self?.refreshUsage()
+                }
+            }))
+        cliPathWindow?.contentView = host
+        cliPathWindow?.setContentSize(host.fittingSize)
+        NSApp.activate(ignoringOtherApps: true)
+        cliPathWindow?.makeKeyAndOrderFront(nil)
     }
     private func refreshUsage() {
         appState.refresh(manual: true, source: "button")
@@ -238,7 +280,7 @@ import UserNotifications
         NSApp.activate(ignoringOtherApps: true)
         tasksWindow?.makeKeyAndOrderFront(nil)
     }
-    @objc func openSettings() {
+    @objc func openKeeperSettings() {
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 540), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = L10n.text("Codex Keeper 设置")

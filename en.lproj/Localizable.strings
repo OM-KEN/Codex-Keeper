@@ -63,7 +63,7 @@
 "额度恢复后自动继续" = "Resume After Quota Resets";
 "自动续跑说明" = "Auto-resume information";
 "正常恢复后继续；其他恢复情况提醒你选择。" = "Resume after normal recovery; otherwise, notify you and wait for your choice.";
-"因额度用尽而暂停的任务，将在额度正常恢复后自动继续。提前恢复或恢复情况不明时，会提醒你选择；未选择时提醒一直保留，任务不会自动继续，Keeper 仍按计划保活。你可以现在继续、按计划继续或取消本次；发送前会再次确认额度和任务状态。" = "Tasks paused by quota exhaustion resume after normal recovery. For early or uncertain recovery, Keeper waits for your choice. An unanswered reminder stays, the task does not resume automatically, and scheduled keep-alives continue. You can continue now, continue as scheduled, or cancel this continuation. Quota and task state are checked again before sending.";
+"因额度用尽而暂停的任务，将在额度正常恢复后自动继续。提前恢复或恢复情况不明时，会提醒你选择。" = "Tasks paused by quota exhaustion resume after normal recovery. For early or uncertain recovery, Keeper waits for your choice.";
 "发送给 Codex 的内容" = "Message to Codex";
 "默认发送“%@”" = "Default: %@";
 "自定义内容" = "Custom Message";
@@ -82,6 +82,10 @@
 "仅在自动查找失败时使用；留空则自动查找" = "Used only if automatic discovery fails. Leave blank for automatic discovery.";
 "选择文件…" = "Choose File…";
 "选择 Codex CLI 可执行文件" = "Choose the Codex CLI executable file";
+"设置 Codex 路径" = "Set Codex Path";
+"自动查找失败。请选择 Codex CLI 可执行文件，或填写它的完整路径。" = "Automatic discovery failed. Choose the Codex CLI executable file or enter its full path.";
+"Codex CLI 的完整路径" = "Full path to Codex CLI";
+"保存并重试" = "Save and Retry";
 "已保存" = "Saved";
 "请输入 Codex CLI 的绝对路径（可使用 ~/）。" = "Enter an absolute Codex CLI path (~/ is supported).";
 "找不到该文件，请检查路径。" = "File not found. Check the path.";
