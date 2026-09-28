@@ -5,7 +5,7 @@
 A quiet Codex companion in your Mac menu bar.
 
 - **Keep active:** Try to start a new 5-hour quota window at scheduled times.
-- **Auto-resume:** Try to continue paused tasks after normal quota recovery is confirmed. If quota recovers early or the recovery is uncertain, ask you to choose first.
+- **Auto-resume:** Try to continue paused tasks after normal quota recovery is confirmed. For early or uncertain recovery, notify you and wait for your choice.
 - **View quota:** See the remaining 5-hour and weekly quota and the next scheduled action.
 
 ## Requirements
@@ -21,7 +21,7 @@ This is a beta for local Codex tasks. Keep-alive requires access to `gpt-5.6-lun
 3. Keep-alive and auto-resume are enabled by default. Adjust or disable them in the menu bar settings.
 4. When tasks are waiting to resume, click a task name in the menu to choose tasks and edit the message to send. If a task needs your decision, select **Review task** in the reminder at the top of the menu.
 
-Keeper also sends a system notification. Choose **Continue now**, **Continue as scheduled**, or **Cancel this time**. The reminder stays until you use Codex again. After confirmed usage, leaving it unanswered for 10 minutes cancels this continuation while preserving the task and its history. Waiting for your decision does not stop scheduled keep-alives.
+Keeper also sends a system notification. Choose **Continue now**, **Continue as scheduled**, or **Cancel this time**. If you do not choose, the reminder stays and the task does not resume automatically or get cancelled after ten minutes. Scheduled keep-alives continue. Choosing **Continue as scheduled** allows a resume attempt at the next feasible node after checking quota and task state again. Explicit cancellation skips only this continuation and preserves the task and its history.
 
 The Codex desktop app may be closed, but Keeper must keep running and your Mac must be awake and online. Keeper skips keep-alive when a valid quota window is already active. Disabling Keeper pauses automatic actions.
 
