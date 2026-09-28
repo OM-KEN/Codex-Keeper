@@ -14,7 +14,7 @@ open .build/CodexKeeper.app
 
 界面支持简体中文与英语，跟随 macOS 为应用选择的语言。中文文案作为 `L10n` 的回退键，英文位于 `en.lproj/Localizable.strings`；新增面向用户的文字须补齐英文键值。`build.sh` 将两种语言资源复制入 App，并把它们计入构建指纹。设置中的默认续跑内容不可编辑，按当前语言发送“继续”或“Continue”；选择自定义后通过弹窗保存内容，切回默认时保留自定义文字以便再次选择。旧偏好没有明确模式时，保存的内置默认值按默认处理，其他非空内容和已标记的自定义值按自定义处理；旧版手动改回与默认值完全相同的文字无法区分，按默认值处理。
 
-默认优先使用本机 Apple Development 证书，没有证书则使用临时签名，因此其他开发者不需要作者证书也能编译。可设置 `CODE_SIGN_IDENTITY`。构建先在临时目录完成并验证签名，再替换目标应用；运行中的目标应用不会被覆盖。使用 `BUILD_DIR=.build/candidate ./build.sh` 可以保留当前运行版本。
+默认使用临时签名，避免安装包包含个人开发者证书中的邮箱和身份标识，因此其他开发者不需要作者证书也能编译。如需证书签名，可显式设置 `CODE_SIGN_IDENTITY`，该证书的公开身份信息会随应用分发。构建先在临时目录完成并验证签名，再替换目标应用；运行中的目标应用不会被覆盖。使用 `BUILD_DIR=.build/candidate ./build.sh` 可以保留当前运行版本。
 
 应用图标源文件是根目录的 `Codex Keeper.jpg`，纳入构建指纹并原样保留。构建时用系统 `sips` 和 `iconutil` 在临时目录生成标准十种尺寸，再将 `AppIcon.icns` 放入应用资源，由 `CFBundleIconFile` 引用；生成资源不提交。首次引导显示同一应用图标，菜单栏仍使用表示运行状态的系统符号。
 
@@ -43,9 +43,9 @@ python3 -m venv .build/dmg-tools
 PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 ```
 
-输出为 `.build/CodexKeeper-<VERSION>.dmg`。按 Copied 的方式分发：优先使用 Apple Development 签名，没有证书时使用临时签名，不要求 Developer ID 或公证。`--release` 可用于发布构建，与默认构建使用同一签名策略。
+输出为 `.build/CodexKeeper-<VERSION>.dmg`。默认以临时签名分发，不要求 Developer ID 或公证，也不自动使用本机个人开发者证书。`--release` 可用于发布构建，与默认构建使用同一签名策略；设置 `CODE_SIGN_IDENTITY` 可显式选择证书签名。
 
-公开仓库为 [OM-KEN/Codex-Keeper](https://github.com/OM-KEN/Codex-Keeper)。版本来自 `VERSION`；普通修复和现有交互的局部改善发布 patch，有明显新使用场景时发布 minor，不兼容变化发布 major。发布 tag 为 `v<VERSION>`，标题为 `Codex Keeper v<VERSION> (macOS)`，仅上传 `CodexKeeper-<VERSION>.dmg`。正文参考 Copied，按 What's New、Fixes、新功能、修复排列；同类英中内容对应，无该类变化时省略。许可说明见 `assets/NOTICE.md`，只覆盖所复用的背景和布局。
+公开仓库为 [OM-KEN/Codex-Keeper](https://github.com/OM-KEN/Codex-Keeper)。版本来自 `VERSION`；普通修复和现有交互的局部改善发布 patch，有明显新使用场景时发布 minor，不兼容变化发布 major。发布 tag 为 `v<VERSION>`，标题为 `Codex Keeper v<VERSION> (macOS)`，仅上传 `CodexKeeper-<VERSION>.dmg`。正文参考 Copied，按 What's New、Fixes、新功能、修复排列；同类英中内容对应，无该类变化时省略。项目采用根目录 `LICENSE` 中的 MIT 许可；`assets/NOTICE.md` 保留所复用背景和布局的许可。构建时将两者一并放入应用资源。
 
 发布前运行回归、构建及 DMG 校验，挂载检查 Finder 背景、图标布局、App 和 Applications 链接，并记录大小及 SHA-256；发布后核对远端提交、tag、稳定版与 Latest 状态，以及唯一 DMG 资产的下载、大小和校验和。提交、推送及发布仍需维护者明确同意。另一台 Mac 的首次安装、登录读取、登录项、保活及续跑验收，以及 macOS 13 真机验证仍待完成。
 

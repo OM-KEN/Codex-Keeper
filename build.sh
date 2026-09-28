@@ -4,19 +4,12 @@ set -euo pipefail
 cd "$(dirname "$0")"
 APP_NAME="CodexKeeper"
 BUILD_DIR="${BUILD_DIR:-.build}"
-# --release produces the same unnotarized distribution build used by Copied.
+# --release produces an unnotarized distribution build.
 if [[ "$#" != 0 && !( "$#" == 1 && "$1" == "--release" ) ]]; then
     echo "Usage: $0 [--release]" >&2
     exit 1
 fi
-IDENTITY="${CODE_SIGN_IDENTITY:-}"
-if [[ -z "$IDENTITY" ]]; then
-    if security find-identity -v -p codesigning | grep -F '"Apple Development:' >/dev/null; then
-        IDENTITY="Apple Development"
-    else
-        IDENTITY="-"
-    fi
-fi
+IDENTITY="${CODE_SIGN_IDENTITY:--}"
 MIN_OS=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' Info.plist)
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 MACOS_DIR="$APP_BUNDLE/Contents/MacOS"
@@ -57,7 +50,7 @@ SOURCES=(
     UI/OnboardingView.swift
 )
 ICON_SOURCE="Codex Keeper.jpg"
-RESOURCES=(Info.plist assets/NOTICE.md en.lproj/Localizable.strings zh-Hans.lproj/Localizable.strings "$ICON_SOURCE")
+RESOURCES=(Info.plist LICENSE assets/NOTICE.md en.lproj/Localizable.strings zh-Hans.lproj/Localizable.strings "$ICON_SOURCE")
 BUILD_FILES=(build.sh VERSION)
 
 echo "🔨 Building CodexKeeper..."
@@ -94,6 +87,7 @@ cp Info.plist "$STAGED_APP/Contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$STAGED_APP/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$VERSION" "$STAGED_APP/Contents/Info.plist"
 
+cp LICENSE "$STAGED_APP/Contents/Resources/LICENSE"
 cp assets/NOTICE.md "$STAGED_APP/Contents/Resources/ThirdPartyNotices.md"
 cp -R en.lproj zh-Hans.lproj "$STAGED_APP/Contents/Resources/"
 
@@ -109,7 +103,7 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$STAGED_APP/Contents/Resources/AppIcon.icns"
 
-# Match Copied: development signing when available, no notarization requirement.
+# Certificate signing is an explicit opt-in; ad-hoc signing keeps personal details out.
 codesign -s "$IDENTITY" -f "$STAGED_APP"
 codesign --verify --strict "$STAGED_APP"
 if [[ -f "$APP_BUNDLE/Contents/MacOS/$APP_NAME" ]] && lsof -t "$APP_BUNDLE/Contents/MacOS/$APP_NAME" >/dev/null 2>&1; then

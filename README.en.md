@@ -64,6 +64,10 @@ If the official Codex CLI cannot be found, click the error message in the menu, 
 
 </details>
 
+## License
+
+This project is open source under the [MIT License](LICENSE). You may use, modify, and distribute it, including for commercial use, provided you retain the copyright and license notice. See the [third-party notices](assets/NOTICE.md) for reused assets.
+
 ---
 
 This is an independent project and is not affiliated with OpenAI. Developers can build it using the [development guide](docs/DEVELOPMENT.md), which is currently in Chinese.

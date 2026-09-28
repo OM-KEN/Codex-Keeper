@@ -64,6 +64,10 @@ Apple Silicon Mac（M 系列芯片），macOS 13 或更新版本。先安装 Cod
 
 </details>
 
+## 开源许可
+
+本项目采用 [MIT 许可证](LICENSE) 开源，可自由使用、修改和分发，包括商用；请保留版权和许可声明。复用素材的许可见[第三方说明](assets/NOTICE.md)。
+
 ---
 
 这是独立项目，与 OpenAI 无隶属关系。开发者可按[开发说明](docs/DEVELOPMENT.md)自行构建。
