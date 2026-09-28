@@ -2,37 +2,67 @@
 
 [简体中文](README.md)
 
-A quiet Codex companion in your Mac menu bar.
+**Start quota windows on your schedule. Resume tasks when quota resets.**
 
-- **Keep active:** Try to start a new 5-hour quota window at scheduled times.
-- **Auto-resume:** Try to continue paused tasks after normal quota recovery is confirmed. For early or uncertain recovery, notify you and wait for your choice.
-- **View quota:** See the remaining 5-hour and weekly quota and the next scheduled action.
+A small Codex utility in your Mac menu bar:
+
+- **Start the quota timer early:** Start a 5-hour quota window before you use Codex, following your daily schedule, so it is easier to plan around your routine.
+- **Resume after quota resets:** When a task pauses because quota runs out, automatically continue it once normal quota recovery is confirmed.
+- **Check quota anytime:** See your remaining 5-hour and weekly quota and the next keep-alive or resume time in the menu bar.
 
 ## Requirements
 
 An Apple Silicon Mac running macOS 13 or later. Install Codex and sign in with a ChatGPT account first.
 
-This is a beta for local Codex tasks. Keep-alive requires access to `gpt-5.6-luna`. Keeper does not increase your quota or bypass quota limits.
+This is a beta for local Codex tasks. Scheduled keep-alives require access to `gpt-5.6-luna`; Keeper does not increase your quota or bypass quota limits.
 
 ## Getting started
 
-1. Download the DMG from [GitHub Releases](https://github.com/OM-KEN/Codex-Keeper/releases/latest), open it, drag **CodexKeeper** to **Applications**, and launch it.
-2. In the first-run guide, choose a daily start time and select **Get Started**. For example, the schedule preview for `08:00` shows `08:00 · 13:00 · 18:00 · 23:00`.
-3. Keep-alive and auto-resume are enabled by default. Adjust or disable them in the menu bar settings.
-4. When tasks are waiting to resume, click a task name in the menu to choose tasks and edit the message to send. If a task needs your decision, select **Review task** in the reminder at the top of the menu.
+1. [Download the installer](https://github.com/OM-KEN/Codex-Keeper/releases/latest), drag Codex Keeper to **Applications**, and open it.
+2. Set a daily start time and select **Get Started**.
 
-Keeper also sends a system notification. Choose **Continue now**, **Continue as scheduled**, or **Cancel this time**. If you do not choose, the reminder stays and the task does not resume automatically or get cancelled after ten minutes. Scheduled keep-alives continue. Choosing **Continue as scheduled** allows a resume attempt at the next feasible node after checking quota and task state again. Explicit cancellation skips only this continuation and preserves the task and its history.
+Keep-alive and auto-resume are enabled by default. Click the menu bar icon to view quota, tasks, and settings.
 
-The Codex desktop app may be closed, but Keeper must keep running and your Mac must be awake and online. Keeper skips keep-alive when a valid quota window is already active. Disabling Keeper pauses automatic actions.
+Keep Keeper running and your Mac awake and online while using it.
 
-The interface supports Simplified Chinese and English and follows the macOS language setting for the app. Changing languages does not overwrite a message you customized for auto-resume.
-In Settings, choose the language-aware default “Continue” or edit a custom message in a dialog.
-If project files changed or cannot be checked, Keeper adds a separate check reminder before the resume message by default; you can turn it off in Settings.
+## Common questions
+
+<details>
+<summary>When does a paused task resume automatically?</summary>
+
+Tasks paused because quota runs out resume once normal quota recovery is confirmed. If recovery is early or uncertain, Keeper asks you to choose.
+
+Select **Review task** in the reminder at the top of the menu, or use the system notification to choose:
+
+- **Continue now:** Try to resume after checking quota and task state.
+- **Continue as scheduled:** Try to resume at the next feasible scheduled time, after checking quota and task state again.
+- **Cancel this time:** Skip this continuation and preserve the task and its history.
+
+If you do not choose, the reminder stays and the task does not resume automatically. Scheduled keep-alives continue.
+
+</details>
+
+<details>
+<summary>Can I change the message sent when a task resumes?</summary>
+
+Click a task name in the menu to select tasks and edit the message. You can also use the text saved in that task's Codex input box.
+
+In Settings, choose the default “Continue” or edit a custom message. The interface supports Simplified Chinese and English and follows the macOS language setting for the app. The default message follows the language; custom messages stay as written.
+
+If project files changed or cannot be checked, Keeper adds a reminder before the resume message asking Codex to check the project and progress first. You can turn it off in Settings.
+
+</details>
+
+<details>
+<summary>What if the app won't open or quota sync fails?</summary>
 
 The disk image is not notarized. If macOS blocks the first launch, verify the download source and follow [Apple's instructions for opening the app](https://support.apple.com/en-us/102445).
 
-If quota sync fails, click the refresh button beside the main time. If it keeps failing, check your network, Codex sign-in, and version.
-If the official Codex CLI cannot be found, click the error message in the menu, enter or choose its executable file in the path dialog, then click **Save and Retry**. Paths with `~/` or spaces are supported. The fallback is used only when automatic discovery fails, so normal Settings needs no path entry. Saving immediately retries quota sync.
+If quota sync fails, click the refresh button beside the time. If it keeps failing, check your network, Codex sign-in, and version.
+
+If the official Codex CLI cannot be found, click the error message in the menu, enter or choose its executable file, then select **Save and Retry**. Paths with `~/` or spaces are supported. You only need to enter a path if automatic discovery fails.
+
+</details>
 
 ---
 
