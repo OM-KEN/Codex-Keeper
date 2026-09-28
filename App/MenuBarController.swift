@@ -83,7 +83,7 @@ import UserNotifications
                 }
                 let content = UNMutableNotificationContent()
                 content.title = L10n.text("有暂停的任务等你处理")
-                content.body = task.displayName + "\n" + reminder.message + "\n" + L10n.text("点击查看任务。Keeper 会继续按计划保活。")
+                content.body = task.displayName + "\n" + reminder.message + "\n" + L10n.text("点击查看任务或调整续跑方式。")
                 content.sound = .default
                 content.userInfo = ["keeper_action": "recovery-decision"]
                 do {
@@ -155,7 +155,7 @@ import UserNotifications
             var summary = MenuSummary(headline: "已停用")
             summary.isRefreshing = appState.usage.refreshing
             summary.refreshMessage = appState.usage.refreshMessage
-            summary.applyRecoveryReminder(tasks: appState.availableTasks, choices: appState.choices, keepAliveEnabled: false)
+            summary.applyRecoveryReminder(tasks: appState.availableTasks, choices: appState.choices)
             return summary
         }
         var summary = MenuSummary.build(plan: appState.nextAction, usage: appState.usage.snapshot,

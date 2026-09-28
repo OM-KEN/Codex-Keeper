@@ -33,7 +33,7 @@ struct DecisionEngine {
         let target = blocked.first
         let mode: NextActionMode = target != nil ? .resume : .keepAlive
         func wait(_ reason: String, at date: Date? = nil) -> NextAction {
-            NextAction(mode: mode, date: date, decision: .wait(reason: reason), note: reason)
+            NextAction(mode: mode, date: date, decision: .wait(reason: reason), note: reason, needsRecoveryDecision: needsRecoveryDecision)
         }
         guard enabled else { return wait("已停用") }
         guard let usage, usage.fiveHour != nil || usage.weekly != nil else { return wait("等待额度同步") }
@@ -45,10 +45,10 @@ struct DecisionEngine {
         let atNode = schedule.currentNode(at: now, calendar: calendar) != nil
         let nextNode = schedule.nextNode(after: now, calendar: calendar)
         if let target {
-            if needsRecoveryDecision {
-                return NextAction(mode: .resume, date: nil, decision: .wait(reason: "等待续跑决定"),
-                    note: "等待续跑决定", needsRecoveryDecision: true)
+            if target.fiveHourResetAt != nil && five == nil || target.weeklyResetAt != nil && usage.weekly == nil {
+                return wait("等待额度恢复确认")
             }
+            if needsRecoveryDecision { return wait("等待续跑决定") }
             if let reset = blockingReset {
                 guard reset > now else { return wait("等待额度恢复确认") }
                 let date: Date
@@ -58,6 +58,7 @@ struct DecisionEngine {
                 } else { date = reset }
                 return wait(date == reset ? "额度恢复并确认后续跑" : "恢复后顺延至计划时间", at: date)
             }
+            guard usage.capturedAt > target.blockedAt else { return wait("等待额度恢复确认") }
             if earlyRecoveryPolicy == "ask", !observedRecovery, !heldForPlan {
                 return NextAction(mode: .resume, date: nil, decision: .wait(reason: "额度已恢复，等待决定"),
                     note: "额度已恢复，等待决定", needsRecoveryDecision: true)
@@ -92,7 +93,7 @@ struct DecisionEngine {
 enum UsageRecovery {
     static func hasAvailableQuota(for target: BlockedSession, usage: UsageSnapshot?, boundAccount: String?, now: Date) -> Bool {
         guard let account = boundAccount, !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let usage, usage.accountID == account, usage.isFresh(at: now),
+              let usage, usage.accountID == account, usage.isFresh(at: now), usage.capturedAt > target.blockedAt,
               usage.fiveHour != nil || usage.weekly != nil,
               (usage.fiveHour?.usedPercent ?? 0) < 100, (usage.weekly?.usedPercent ?? 0) < 100 else { return false }
         if target.fiveHourResetAt != nil && usage.fiveHour == nil { return false }

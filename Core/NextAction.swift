@@ -51,12 +51,8 @@ struct RecoveryDecision: Codable, Equatable {
 
     var message: String {
         switch phase {
-        case .waitingForActivity:
-            return L10n.text("暂不倒计时。等你再次使用 Codex 后，会留出10分钟选择。")
-        case .waitingForChoice:
-            guard let deadline else { return L10n.text("请选择如何处理这个任务。") }
-            let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
-            return L10n.format("请在 %@ 前选择。到时未处理，这次就不再自动继续，原任务会保留。", clock.string(from: deadline))
+        case .waitingForActivity, .waitingForChoice:
+            return L10n.text("未选择时，提醒会一直保留，任务不会自动继续。")
         case .responded:
             return L10n.text("你已选择「现在继续」。若执行失败，请查看提示后重试。")
         }
@@ -74,22 +70,7 @@ struct ResumeChoices: Codable, Equatable {
         recoveryDecisions?[task.episodeKey] = RecoveryDecision(recoveredAt: now)
     }
 
-    mutating func observeUserActivity(for task: BlockedSession, now: Date) {
-        guard recoveryDecisions?[task.episodeKey]?.phase == .waitingForActivity else { return }
-        recoveryDecisions?[task.episodeKey]?.phase = .waitingForChoice
-        recoveryDecisions?[task.episodeKey]?.deadline = now.addingTimeInterval(600)
-        recoveryDecisions?[task.episodeKey]?.notification = .pending
-    }
-
-    mutating func expireRecoveryDecisions(at now: Date) {
-        for (key, value) in recoveryDecisions ?? [:] where value.phase == .waitingForChoice && value.deadline.map({ now >= $0 }) == true {
-            keepAliveEpisodes.insert(key)
-            recoveryDecisions?.removeValue(forKey: key)
-        }
-    }
-
-    mutating func resolveRecoveryDecision(_ choice: RecoveryChoice, for task: BlockedSession, now: Date) -> Bool {
-        expireRecoveryDecisions(at: now)
+    mutating func resolveRecoveryDecision(_ choice: RecoveryChoice, for task: BlockedSession) -> Bool {
         let key = task.episodeKey
         guard recoveryDecisions?[key] != nil, !keepAliveEpisodes.contains(key), !deselectedEpisodes.contains(key) else { return false }
         switch choice {

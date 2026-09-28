@@ -105,7 +105,7 @@ struct OnboardingView: View {
         default:
             VStack(alignment: .leading, spacing: 14) {
                 Text(L10n.text("2. 自动继续任务")).font(.title2.weight(.semibold))
-                Text(L10n.text("因额度用尽而暂停的任务，将在额度恢复后自动继续"))
+                Text(L10n.text("因额度用尽而暂停的任务，将在额度正常恢复后自动继续；提前恢复时提醒你选择，未选择时不会继续。"))
                     .font(.system(size: NSFont.systemFontSize + 1))
                     .foregroundStyle(.primary.opacity(0.8))
                     .lineSpacing(3)
