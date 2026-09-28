@@ -23,7 +23,7 @@
 "退出 Codex Keeper" = "Quit Codex Keeper";
 "设置你的每日计划" = "Set Your Daily Schedule";
 "每 5 小时让 Codex 自动保持活动，帮你更充分地利用每天的额度。" = "Keep Codex active every 5 hours to make better use of your daily quota.";
-"因额度用尽而暂停的任务，将在额度恢复后自动继续" = "Tasks paused because quota was exhausted will resume automatically when quota is restored.";
+"因额度用尽而暂停的任务，将在额度正常恢复后自动继续；提前恢复时提醒你选择，未选择时不会继续。" = "Tasks paused by quota exhaustion resume after normal recovery. For early recovery, Keeper reminds you and waits for your choice.";
 "保持活动" = "Keep Active";
 "自动继续" = "Resume";
 "自动继续任务" = "Auto-resume Tasks";
@@ -62,8 +62,8 @@
 "计划预览：%@" = "Schedule Preview: %@";
 "额度恢复后自动继续" = "Resume After Quota Resets";
 "自动续跑说明" = "Auto-resume information";
-"确认额度正常恢复后继续；其他恢复情况先提醒你选择。" = "Resume after normal quota recovery is confirmed; ask you to choose in other cases.";
-"因额度用尽而暂停的任务，将在额度恢复后自动继续。提前恢复或恢复情况不明时，会先提醒你选择。等待选择期间，Keeper 仍会按计划保活。" = "Tasks paused because quota was exhausted will resume automatically when quota is restored. If quota recovers early or recovery is uncertain, Keeper asks you to choose first. Scheduled keep-alives continue while it waits for your decision.";
+"正常恢复后继续；其他恢复情况提醒你选择。" = "Resume after normal recovery; otherwise, notify you and wait for your choice.";
+"因额度用尽而暂停的任务，将在额度正常恢复后自动继续。提前恢复或恢复情况不明时，会提醒你选择；未选择时提醒一直保留，任务不会自动继续，Keeper 仍按计划保活。你可以现在继续、按计划继续或取消本次；发送前会再次确认额度和任务状态。" = "Tasks paused by quota exhaustion resume after normal recovery. For early or uncertain recovery, Keeper waits for your choice. An unanswered reminder stays, the task does not resume automatically, and scheduled keep-alives continue. You can continue now, continue as scheduled, or cancel this continuation. Quota and task state are checked again before sending.";
 "发送给 Codex 的内容" = "Message to Codex";
 "默认发送“%@”" = "Default: %@";
 "自定义内容" = "Custom Message";
@@ -119,6 +119,7 @@
 "额度恢复已确认" = "Quota recovery confirmed";
 "按选择立即继续" = "Resume immediately as selected";
 "额度已恢复" = "Quota has recovered";
+"额度已恢复，等待决定" = "Quota recovered; waiting for your choice";
 "按计划自动继续" = "Resume on schedule";
 "额度恢复后按计划保活" = "Keep active on schedule after quota recovery";
 "当前无需保活" = "No keep-alive needed now";
@@ -217,7 +218,6 @@
 "刷新失败，请点击刷新按钮重试。" = "Refresh failed. Click Refresh to try again.";
 "上次%@失败：%@" = "Previous %@ failed: %@";
 
-"额度已恢复，等待决定" = "Quota recovered; waiting for your choice";
 "等待续跑决定" = "Waiting for your choice";
 "选择续跑方式…" = "Choose how to continue…";
 "现在继续" = "Continue now";
@@ -229,9 +229,6 @@
 "有%d个暂停的任务等你处理" = "%d paused tasks need your attention";
 "处理任务" = "Review task";
 "任务还在暂停" = "This task is still paused";
-"暂不倒计时。等你再次使用 Codex 后，会留出10分钟选择。" = "There is no countdown yet. After you use Codex again, you will have 10 minutes to choose.";
-"请选择如何处理这个任务。" = "Choose what to do with this task.";
-"请在 %@ 前选择。到时未处理，这次就不再自动继续，原任务会保留。" = "Choose by %@. If you do not, this continuation will be skipped. Your task will stay available.";
+"未选择时，提醒会一直保留，任务不会自动继续。" = "The reminder stays until you choose. This task will not resume automatically.";
 "你已选择「现在继续」。若执行失败，请查看提示后重试。" = "You chose “Continue now”. If it fails, check the execution message and retry.";
-"Keeper 会继续按计划保活。" = "Keeper will continue its scheduled keep-alives.";
-"点击查看任务。Keeper 会继续按计划保活。" = "Click to review the task. Keeper will continue its scheduled keep-alives.";
+"点击查看任务或调整续跑方式。" = "Click to view the task or change how it resumes.";

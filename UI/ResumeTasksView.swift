@@ -24,8 +24,6 @@ struct ResumeTasksView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(L10n.text("任务还在暂停")).font(.headline)
                             Text(decision.message).font(.callout).foregroundStyle(.secondary)
-                            Text(L10n.text("Keeper 会继续按计划保活。"))
-                                .font(.callout).foregroundStyle(.secondary)
                             HStack {
                                 Button(L10n.text("现在继续")) { state.resolveRecoveryDecision(.now, for: [task]) }
                                 Button(L10n.text("按计划继续")) { state.resolveRecoveryDecision(.plan, for: [task]) }

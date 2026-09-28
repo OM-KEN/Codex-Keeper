@@ -204,7 +204,6 @@ import Network
             let current = Set(blockedSessions.filter { !execution.hasAttempted($0) }.map(\.episodeKey))
             choices.recoveryDecisions = choices.recoveryDecisions?.filter { current.contains($0.key) }
         }
-        choices.expireRecoveryDecisions(at: now)
         let earlyPolicy = defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask"
         if defaults.bool(forKey: "enabled"), defaults.bool(forKey: "autoResume"), earlyPolicy == "ask",
            sessions.hasScanned, sessions.detectionError == nil {
@@ -216,21 +215,6 @@ import Network
                 }
             }
         }
-        if defaults.bool(forKey: "enabled"), defaults.bool(forKey: "autoResume"), sessions.hasScanned,
-           sessions.detectionError == nil,
-           let keeperStarts = ExecutionEventLog(url: runtimeURL.deletingLastPathComponent().appendingPathComponent("execution-events.jsonl")).resumeStarts() {
-            for target in availableTasks where choices.recoveryDecisions?[target.episodeKey]?.phase == .waitingForActivity {
-                guard UsageRecovery.hasAvailableQuota(for: target, usage: usage.snapshot,
-                    boundAccount: accountBindings[target.id], now: now) else { continue }
-                if let snapshot = usage.snapshot, sessions.sessions.contains(where: {
-                    guard !$0.isSubagent, let activity = $0.userUsage else { return false }
-                    return activity.promptAt > target.blockedAt && activity.usageAt <= now && activity.matches(snapshot) &&
-                        (keeperStarts[$0.id] ?? .distantPast).timeIntervalSince1970 < floor(target.blockedAt.timeIntervalSince1970)
-                }) {
-                    choices.observeUserActivity(for: target, now: now)
-                }
-            }
-        }
         guard saveRuntime() else { return }
         let reminders = defaults.bool(forKey: "enabled") && defaults.bool(forKey: "autoResume") && sessions.detectionError == nil ? selectedTasks.filter {
             choices.recoveryDecisions?[$0.episodeKey]?.phase != .responded &&
@@ -239,6 +223,7 @@ import Network
         } : []
         if recoveryReminderTasks != reminders { recoveryReminderTasks = reminders }
         let chosen = selectedTasks
+        let automatic = chosen.filter { choices.recoveryDecisions?[$0.episodeKey] == nil }
         let engine = DecisionEngine(schedule: schedule)
         func checkedPlan(for targets: [BlockedSession]) -> NextAction {
             var plan = engine.plan(now: now, enabled: defaults.bool(forKey: "enabled"), autoResume: defaults.bool(forKey: "autoResume"),
@@ -246,6 +231,9 @@ import Network
                 observedRecovery: hasConfirmedRecovery(for: targets),
                 heldForPlan: targets.contains { heldForPlan.contains($0.episodeKey) },
                 needsRecoveryDecision: targets.contains { choices.recoveryDecisions?[$0.episodeKey] != nil })
+            if defaults.bool(forKey: "enabled"), !targets.isEmpty, targets.allSatisfy({ choices.recoveryDecisions?[$0.episodeKey]?.phase == .responded }) {
+                plan = NextAction(mode: .resume, date: nil, decision: .wait(reason: "等待续跑决定"), note: "等待续跑决定", needsRecoveryDecision: true)
+            }
             if defaults.bool(forKey: "enabled"), targets.contains(where: { target in
                 guard let snapshot = usage.snapshot, snapshot.isFresh(at: now) else { return false }
                 return (target.fiveHourResetAt != nil && snapshot.fiveHour == nil) || (target.weeklyResetAt != nil && snapshot.weekly == nil)
@@ -260,7 +248,16 @@ import Network
             }
             return plan
         }
-        var plan = checkedPlan(for: chosen)
+        var plan = automatic.map { checkedPlan(for: [$0]) }.min {
+            ($0.date ?? .distantFuture) < ($1.date ?? .distantFuture)
+        } ?? checkedPlan(for: chosen)
+        if automatic.isEmpty, chosen.contains(where: {
+            let recovery = choices.recoveryDecisions?[$0.episodeKey]
+            return recovery != nil && recovery?.phase != .responded
+        }) {
+            plan = checkedPlan(for: [])
+            plan.needsRecoveryDecision = true
+        }
         if defaults.bool(forKey: "enabled"), sessions.detectionError == nil, !availableTasks.isEmpty && chosen.isEmpty {
             plan = NextAction(mode: .resume, date: nil, decision: .wait(reason: "请选择要继续的任务"), note: "请选择要继续的任务")
         }
@@ -273,9 +270,12 @@ import Network
             execution.ping(schedule: schedule, accountID: usage.snapshot?.accountID, ignoredEpisodes: ignored,
                 hasPending: { [weak self] in self?.canKeepAlive(ignoring: ignored) != true })
         }
-        // One unanswered episode must not hold back another task explicitly approved for this node.
-        let automatic = chosen.filter { choices.recoveryDecisions?[$0.episodeKey] == nil }
-        if !automatic.isEmpty, case .resume = checkedPlan(for: automatic).decision { startResume(tasks: automatic) }
+        // Each eligible task is checked independently of tasks waiting for a choice.
+        let ready = automatic.filter { target in
+            if case .resume = checkedPlan(for: [target]).decision { return true }
+            return false
+        }
+        if !ready.isEmpty { startResume(tasks: ready) }
     }
 
     private func canKeepAlive(ignoring episodes: Set<String>) -> Bool {
@@ -309,7 +309,7 @@ import Network
         recompute(allowExecution: false)
         guard defaults.bool(forKey: "enabled"), defaults.bool(forKey: "autoResume"), sessions.detectionError == nil else { return }
         let targets = selectedTasks.filter { keys.contains($0.episodeKey) && choices.recoveryDecisions?[$0.episodeKey] != nil }
-        let resolved = targets.filter { choices.resolveRecoveryDecision(choice, for: $0, now: now()) }
+        let resolved = targets.filter { choices.resolveRecoveryDecision(choice, for: $0) }
         for target in resolved {
             if choice == .plan { heldForPlan.insert(target.episodeKey) }
         }

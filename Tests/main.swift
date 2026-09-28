@@ -87,6 +87,56 @@ import Darwin
         check(!UsageRecovery.isNatural(from: recoveryBefore, to: changedRecovery, now: recoveryObserved), "missing quota window cannot count as recovered")
         changedRecovery = recoveryAfter; changedRecovery.weekly = QuotaWindow(usedPercent: 100, windowMinutes: 10080, resetsAt: recoveryObserved.addingTimeInterval(3600))
         check(!UsageRecovery.isNatural(from: recoveryBefore, to: changedRecovery, now: recoveryObserved), "weekly exhaustion still blocks recovery")
+        // A fresh poll from before the quota stop does not prove that the stopped task recovered.
+        do {
+            let blockedAt = date("2026-09-27T17:48:08Z")
+            let reset = date("2026-09-27T20:07:35Z")
+            let observed = date("2026-09-27T17:48:23Z")
+            let target = BlockedSession(id: "snapshot-before-stop", project: "Recovery", cwd: "/fixture",
+                blockedAt: blockedAt, fiveHourResetAt: reset, weeklyResetAt: nil,
+                fileURL: URL(fileURLWithPath: "/fixture/rollout.jsonl"))
+            var live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 97, windowMinutes: 300, resetsAt: reset),
+                weekly: QuotaWindow(usedPercent: 32, windowMinutes: 10080, resetsAt: reset.addingTimeInterval(604800)),
+                capturedAt: date("2026-09-27T17:48:04Z"), accountID: "timing-account", sourceFile: "app-server")
+            func available(_ snapshot: UsageSnapshot?, account: String? = "timing-account") -> Bool {
+                UsageRecovery.hasAvailableQuota(for: target, usage: snapshot, boundAccount: account, now: observed)
+            }
+            check(!available(live), "fresh 97-percent snapshot captured four seconds before the stop cannot create a recovery decision")
+            live.capturedAt = blockedAt
+            check(!available(live), "a snapshot captured at the stop cannot prove recovery either")
+            live.capturedAt = observed
+            check(available(live), "available quota sampled after the stop remains eligible for an early-recovery decision")
+            check(!available(nil) && !available(live, account: nil) && !available(live, account: " ") && !available(live, account: "other"),
+                "recovery reminder still requires a live snapshot and matching nonempty account binding")
+            var changed = live; changed.capturedAt = observed.addingTimeInterval(-61)
+            check(!available(changed), "a stale sample cannot establish reminder eligibility")
+            changed = live; changed.sourceFile = "rollout.jsonl"
+            check(!available(changed), "rollout fallback cannot establish reminder eligibility")
+            changed = live; changed.fiveHour = nil
+            check(!available(changed), "a stopped five-hour window must exist in the recovery sample")
+            changed = live; changed.weekly?.usedPercent = 100
+            check(!available(changed), "weekly exhaustion still prevents a recovery decision")
+            let node = date("2026-09-28T00:00:00Z")
+            let atNodeTarget = BlockedSession(id: target.id, project: target.project, cwd: target.cwd, blockedAt: node,
+                fiveHourResetAt: node.addingTimeInterval(18000), weeklyResetAt: nil, fileURL: target.fileURL)
+            var shanghai = cal; shanghai.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+            for offset in [-4.0, 0.0] {
+                changed = live; changed.capturedAt = node.addingTimeInterval(offset); changed.fiveHour?.resetsAt = node.addingTimeInterval(18000)
+                let pendingPlan = DecisionEngine(schedule: schedule).plan(now: node.addingTimeInterval(15), calendar: shanghai, enabled: true, autoResume: true,
+                    earlyRecoveryPolicy: "ask", usage: changed, blocked: [atNodeTarget])
+                check(pendingPlan.date == nil && pendingPlan.decision == .wait(reason: "等待额度恢复确认"),
+                    "a \(Int(offset))-second pre-stop sample cannot authorize continuation inside the scheduled node")
+            }
+
+            let recoveredAt = date("2026-09-27T20:07:49Z")
+            live.capturedAt = recoveredAt; live.fiveHour?.usedPercent = 0
+            live.fiveHour?.resetsAt = recoveredAt.addingTimeInterval(18000); live.zeroUseWindowActive = false
+            let recovered = UsageRecovery.canResumeAfterScheduledReset(target, usage: live, boundAccount: "timing-account", now: recoveredAt)
+            let protected = DecisionEngine(schedule: schedule).plan(now: recoveredAt, calendar: shanghai, enabled: true, autoResume: true,
+                earlyRecoveryPolicy: "ask", usage: live, blocked: [target], observedRecovery: recovered)
+            check(recovered && protected.date == date("2026-09-28T00:00:00Z") && protected.decision == .wait(reason: "按计划自动继续"),
+                "04:07 Beijing natural recovery waits through the 03:00-08:00 anchor protection interval")
+        }
         // Sept 22: the last live exhausted poll was 14:19; the first recovered poll was 14:47.
         do {
             let reset = date("2026-09-22T06:31:12Z")
@@ -158,7 +208,7 @@ import Darwin
         let localNode = schedule.nodes(on: now)[1]
         let future = localNode.addingTimeInterval(3600)
         let engine = DecisionEngine(schedule: schedule)
-        // A weekly stop that recovered early must never silently become a 23:00 promise.
+        // Early recovery waits for a choice, including at a scheduled node.
         do {
             let at = date("2026-09-27T10:30:00Z")
             let windowReset = date("2026-09-27T15:06:00Z")
@@ -170,19 +220,21 @@ import Darwin
             var shanghai = cal; shanghai.timeZone = TimeZone(identifier: "Asia/Shanghai")!
             let waiting = engine.plan(now: at, calendar: shanghai, enabled: true, autoResume: true,
                 earlyRecoveryPolicy: "ask", usage: live, blocked: [task])
-            check(waiting.date == nil && waiting.decision == .wait(reason: "额度已恢复，等待决定"),
-                "early weekly recovery asks instead of promising the next plan node")
+            check(waiting.date == nil && waiting.needsRecoveryDecision && waiting.decision == .wait(reason: "额度已恢复，等待决定"),
+                "early weekly recovery retains a reminder without promising an automatic continuation")
             let node = date("2026-09-27T15:00:00Z")
             live.capturedAt = node
             let atNode = engine.plan(now: node, calendar: shanghai, enabled: true, autoResume: true,
                 earlyRecoveryPolicy: "ask", usage: live, blocked: [task])
-            check(atNode.decision == .wait(reason: "额度已恢复，等待决定"),
-                "an unconfirmed recovery cannot bypass the ask policy at 23:00")
+            check(atNode.date == nil && atNode.needsRecoveryDecision && atNode.decision == .wait(reason: "额度已恢复，等待决定"),
+                "an unanswered early-recovery reminder cannot continue automatically at 23:00")
             live.capturedAt = at
-            let summary = MenuSummary.build(plan: waiting, usage: live, schedule: schedule, tasks: [task], now: at)
+            var keepAlivePlan = engine.plan(now: at, calendar: shanghai, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [])
+            keepAlivePlan.needsRecoveryDecision = true
+            let summary = MenuSummary.build(plan: keepAlivePlan, usage: live, schedule: schedule, tasks: [task], now: at)
             let clock = DateFormatter(); clock.dateFormat = "HH:mm"
-            check(summary.headline == clock.string(from: windowReset) && summary.action == "额度重置" && summary.statusSymbol == "arrow.clockwise.circle.fill",
-                "waiting for a recovery decision shows the actual 23:06 reset with the reset icon")
+            check(summary.headline == clock.string(from: windowReset) && summary.action == "额度重置" && summary.statusSymbol == "arrow.clockwise.circle.fill" && summary.badge == "计划外" && summary.tasks == [task.displayName],
+                "an unanswered task retains its entry while the off-plan idle window shows the real reset")
         }
         let full = QuotaWindow(usedPercent: 100, windowMinutes: 300, resetsAt: localNode.addingTimeInterval(-1))
         let weekly = QuotaWindow(usedPercent: 100, windowMinutes: 10080, resetsAt: future)
@@ -478,6 +530,65 @@ import Darwin
         let delayedMenu = MenuSummary.build(plan: delayedPlan, usage: delayedQuota, schedule: schedule, tasks: [], now: localNode)
         check(delayedMenu.badge == "计划内" && delayedMenu.timeline.first?.time == "08:01", "103-second drift remains aligned while displaying the actual window time")
         check(delayedPlan.date == delayedQuota.fiveHour?.resetsAt, "next keepalive waits for the actual reset within grace rather than skipping five hours")
+        // Unanswered reminders retain their task while the main time follows normal keep-alive.
+        do {
+            let start = schedule.nodes(on: now)[0]
+            let at = start.addingTimeInterval(600)
+            let task = BlockedSession(id: "planned-waiting", project: "Recovery", cwd: "/fixture",
+                blockedAt: start.addingTimeInterval(-600), fiveHourResetAt: nil, weeklyResetAt: nil,
+                fileURL: URL(fileURLWithPath: "/fixture/planned-waiting.jsonl"))
+            var choices = ResumeChoices(); choices.requestRecoveryDecision(for: task, now: at)
+            var live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 5, windowMinutes: 300, resetsAt: start.addingTimeInterval(18000)),
+                weekly: nil, capturedAt: at, accountID: "timing-account", sourceFile: "app-server")
+            let clock = DateFormatter(); clock.dateFormat = "HH:mm"
+            func waitingMenu(_ quota: UsageSnapshot, confirmations: [ExecutionConfirmation] = []) -> MenuSummary {
+                var plan = engine.plan(now: at, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: quota, blocked: [])
+                plan.needsRecoveryDecision = true
+                var summary = MenuSummary.build(plan: plan, usage: quota, schedule: schedule, tasks: [task], confirmations: confirmations, now: at)
+                summary.applyRecoveryReminder(tasks: [task], choices: choices)
+                return summary
+            }
+            for drift in [0.0, 103.0, 180.0] {
+                live.fiveHour?.resetsAt = start.addingTimeInterval(18000 + drift)
+                let confirmed = ExecutionConfirmation(kind: .keepAlive, actionAt: start.addingTimeInterval(drift),
+                    confirmedAt: at, windowStart: start.addingTimeInterval(drift))
+                let summary = waitingMenu(live, confirmations: [confirmed])
+                let planned = engine.plan(now: at, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [])
+                let independent = MenuSummary.build(plan: planned, usage: live, schedule: schedule, tasks: [task], confirmations: [confirmed], now: at)
+                check(summary.headline == independent.headline && summary.action == "保持活动" && summary.statusSymbol == "waveform.path.ecg" && summary.badge == "计划内",
+                    "an unanswered on-plan window shows the normal keep-alive time and icon with \(Int(drift))-second drift")
+                check(summary.timeline.map(\.date) == independent.timeline.map(\.date) && summary.timeline.first?.kind == .completedKeepAlive && !summary.timeline.contains { $0.kind == .resume },
+                    "an unanswered reminder retains confirmed history without inventing a future continuation with \(Int(drift))-second drift")
+                check(summary.tasks == [task.displayName] && summary.taskCount == 1 && !summary.reminderTitle.isEmpty && summary.reminderBody.contains(L10n.text("未选择时，提醒会一直保留，任务不会自动继续。")),
+                    "an unanswered window retains its paused task and standalone reminder with \(Int(drift))-second drift")
+            }
+            live.fiveHour?.resetsAt = start.addingTimeInterval(18000)
+            live.weekly = QuotaWindow(usedPercent: 100, windowMinutes: 10080, resetsAt: at.addingTimeInterval(86400))
+            let weeklyPlan = engine.plan(now: at, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [])
+            let exhausted = waitingMenu(live)
+            check(exhausted.headline == clock.string(from: weeklyPlan.date!) && exhausted.timeline.contains { $0.kind == .keepAlive && $0.date == weeklyPlan.date } && weeklyPlan.date! > live.fiveHour!.resetsAt,
+                "weekly exhaustion moves keep-alive to the next feasible node without approving the unanswered task")
+            live.weekly?.resetsAt = at.addingTimeInterval(-1)
+            let unconfirmed = waitingMenu(live)
+            check(!unconfirmed.isTime && unconfirmed.timeline.isEmpty && unconfirmed.action.isEmpty,
+                "elapsed weekly exhaustion without confirmation never fabricates an action time")
+            live.weekly = nil; live.fiveHour?.resetsAt = start.addingTimeInterval(18300)
+            let offPlan = waitingMenu(live)
+            check(offPlan.action == "额度重置" && offPlan.statusSymbol == "arrow.clockwise.circle.fill" && offPlan.badge == "计划外" && offPlan.headline == clock.string(from: live.fiveHour!.resetsAt) && !offPlan.reminderTitle.isEmpty,
+                "off-plan waiting tasks retain the reminder while showing the real-window reset")
+            live.fiveHour?.usedPercent = 0; live.zeroUseWindowActive = false
+            let noWindow = waitingMenu(live)
+            check(noWindow.isTime && noWindow.action == "保持活动" && noWindow.statusSymbol == "waveform.path.ecg" && noWindow.timeline.map(\.kind) == [.keepAlive] && !noWindow.reminderTitle.isEmpty,
+                "available quota without an active window shows normal keep-alive and the unanswered reminder")
+            live.zeroUseWindowActive = nil
+            let unknownActivity = waitingMenu(live)
+            check(unknownActivity.isSyncing && !unknownActivity.isTime && unknownActivity.badge.isEmpty && unknownActivity.quotas.first?.detail == "—" && !unknownActivity.reminderTitle.isEmpty,
+                "unknown window activity waits for sync while retaining the unanswered reminder")
+            let approvedPlan = engine.plan(now: at, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [task], heldForPlan: true)
+            let approved = MenuSummary.build(plan: approvedPlan, usage: live, schedule: schedule, tasks: [task], now: at)
+            check(approved.isTime && approved.action == "自动继续" && approved.statusSymbol == "paperplane" && approved.badge.isEmpty && approved.quotas.first?.detail == "—" && approved.timeline.map(\.kind) == [.resume],
+                "an explicitly approved continuation retains its valid plan without inventing unknown window details")
+        }
         let resumeMenu = MenuSummary.build(plan: plannedResume, usage: exhaustedEvening, schedule: schedule, tasks: [resetTarget], now: evening)
         check(resumeMenu.action == "自动继续" && resumeMenu.tasks == [resetTarget.displayName], "resume still shows pending task and automatic action")
         let staleMenu = MenuSummary.build(plan: displayPlan, usage: oldEvening, schedule: schedule, tasks: [], now: evening)
@@ -544,10 +655,14 @@ import Darwin
         check(!rollout.isFresh(at: now), "recent rollout remains fallback evidence")
         let pending = BlockedSession(id: session.id, project: session.project, cwd: temp.path, blockedAt: localNode.addingTimeInterval(-60), fiveHourResetAt: localNode.addingTimeInterval(-5), weeklyResetAt: nil, fileURL: file)
         let onlyWeek = UsageSnapshot(fiveHour: nil, weekly: QuotaWindow(usedPercent: 5, windowMinutes: 10080, resetsAt: future), capturedAt: localNode, sourceFile: "app-server")
-        let weeklyResume = engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "immediately", usage: onlyWeek, blocked: [pending])
+        check(engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "immediately", usage: onlyWeek, blocked: [pending]) == .wait(reason: "等待额度恢复确认"),
+            "a five-hour stop still requires its five-hour window before continuation")
+        let weeklyOnlyTarget = BlockedSession(id: pending.id, project: pending.project, cwd: pending.cwd, blockedAt: pending.blockedAt,
+            fiveHourResetAt: nil, weeklyResetAt: localNode.addingTimeInterval(-5), fileURL: pending.fileURL)
+        let weeklyResume = engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "immediately", usage: onlyWeek, blocked: [weeklyOnlyTarget])
         if case .resume = weeklyResume { check(true, "weekly-only supports resume") } else { check(false, "weekly-only supports resume") }
         var stale = onlyWeek; stale.capturedAt = localNode.addingTimeInterval(-61)
-        if case .resume = engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "immediately", usage: stale, blocked: [pending]) { check(false, "stale snapshot prevents resume") } else { check(true, "stale snapshot prevents resume") }
+        if case .resume = engine.decide(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "immediately", usage: stale, blocked: [weeklyOnlyTarget]) { check(false, "stale snapshot prevents resume") } else { check(true, "stale snapshot prevents resume") }
         let prefix = "session_loop{thread_id=UUID}:submission_dispatch{otel.name=\"op.dispatch.turn_input\"}:turn{model=\"example\"}:session_task.run:run_turn: Turn error: "
         check(QuotaErrorLogProvider.isQuotaTurnError(prefix + "You've hit your usage limit."), "real quoted log span is accepted")
         check(!QuotaErrorLogProvider.isQuotaTurnError("prompt: Turn error: You've hit your usage limit."), "prompt quote does not prove stop")
@@ -1316,48 +1431,48 @@ import Darwin
         do {
             var decisions = ResumeChoices()
             decisions.requestRecoveryDecision(for: pending, now: now)
-            decisions.expireRecoveryDecisions(at: now.addingTimeInterval(86400))
-            check(decisions.recoveryDecisions?[pending.episodeKey]?.phase == .waitingForActivity && decisions.keepAliveEpisodes.isEmpty,
-                "no confirmed human usage keeps the decision indefinitely without a cancellation deadline")
-            decisions.recoveryDecisions?[pending.episodeKey]?.notification = .delivered
-            decisions.observeUserActivity(for: pending, now: now)
+            check(decisions.recoveryDecisions?[pending.episodeKey]?.phase == .waitingForActivity && decisions.recoveryDecisions?[pending.episodeKey]?.deadline == nil && decisions.keepAliveEpisodes.isEmpty,
+                "a new early-recovery reminder has no cancellation countdown")
             let deadline = now.addingTimeInterval(600)
-            check(decisions.recoveryDecisions?[pending.episodeKey]?.deadline == deadline && decisions.recoveryDecisions?[pending.episodeKey]?.notification == .pending,
-                "first verified user activity starts a full ten minutes and refreshes the stage notification")
-            decisions.observeUserActivity(for: pending, now: now.addingTimeInterval(50))
-            decisions.requestRecoveryDecision(for: pending, now: now.addingTimeInterval(100))
+            decisions.recoveryDecisions?[pending.episodeKey]?.phase = .waitingForChoice
+            decisions.recoveryDecisions?[pending.episodeKey]?.deadline = deadline
+            decisions.recoveryDecisions?[pending.episodeKey]?.notification = .delivered
+            decisions.requestRecoveryDecision(for: pending, now: deadline.addingTimeInterval(3600))
             let saved = try JSONDecoder().decode(ResumeChoices.self, from: JSONEncoder().encode(decisions))
-            check(saved == decisions && saved.recoveryDecisions?[pending.episodeKey]?.deadline == deadline,
-                "polls, repeated activity and restart preserve the original deadline")
-            var beforeDeadline = saved
-            check(beforeDeadline.resolveRecoveryDecision(.now, for: pending, now: deadline.addingTimeInterval(-1)),
-                "explicit continue is accepted immediately before the deadline")
-            beforeDeadline.expireRecoveryDecisions(at: deadline.addingTimeInterval(3600))
-            check(beforeDeadline.recoveryDecisions?[pending.episodeKey]?.phase == .responded && beforeDeadline.recoveryDecisions?[pending.episodeKey]?.deadline == nil && beforeDeadline.keepAliveEpisodes.isEmpty,
-                "a chosen manual continuation cannot be cancelled while asynchronous preflight runs")
-            var expired = saved
-            check(!expired.resolveRecoveryDecision(.now, for: pending, now: deadline) && expired.keepAliveEpisodes.contains(pending.episodeKey),
-                "the exact deadline wins over an unsubmitted choice and cancels only that episode")
-            expired.requestRecoveryDecision(for: pending, now: deadline)
-            expired.requestRecoveryDecision(for: laterStop, now: deadline)
-            check(expired.recoveryDecisions?[pending.episodeKey] == nil && expired.recoveryDecisions?[laterStop.episodeKey]?.phase == .waitingForActivity,
-                "a cancelled episode stays cancelled while a new stop has its own decision")
+            check(saved == decisions && saved.recoveryDecisions?[pending.episodeKey]?.deadline == deadline && saved.keepAliveEpisodes.isEmpty,
+                "legacy phase and deadline survive restart without cancelling the unanswered reminder")
+            check(saved.recoveryDecisions?[pending.episodeKey]?.message == L10n.text("未选择时，提醒会一直保留，任务不会自动继续。"),
+                "a legacy countdown reminder explains that it waits for an explicit choice")
+            var afterDeadline = saved
+            check(afterDeadline.resolveRecoveryDecision(.now, for: pending) && afterDeadline.recoveryDecisions?[pending.episodeKey]?.phase == .responded && afterDeadline.recoveryDecisions?[pending.episodeKey]?.deadline == nil && afterDeadline.keepAliveEpisodes.isEmpty,
+                "an expired legacy deadline cannot cancel an explicit continue-now choice")
+            check(afterDeadline.keepAliveIgnoredEpisodes.contains(pending.episodeKey) && saved.keepAliveIgnoredEpisodes.contains(pending.episodeKey),
+                "manually handled and unanswered episodes both allow normal keep-alive")
+            var cancelled = saved
+            check(cancelled.resolveRecoveryDecision(.cancel, for: pending) && cancelled.keepAliveEpisodes.contains(pending.episodeKey),
+                "explicit cancel remains the only reminder choice that skips this continuation")
+            cancelled.requestRecoveryDecision(for: pending, now: deadline)
+            cancelled.requestRecoveryDecision(for: laterStop, now: deadline)
+            check(cancelled.recoveryDecisions?[pending.episodeKey] == nil && cancelled.recoveryDecisions?[laterStop.episodeKey]?.phase == .waitingForActivity,
+                "a cancelled episode stays cancelled while a new stop has its own reminder")
             var scheduled = saved
-            check(scheduled.resolveRecoveryDecision(.plan, for: pending, now: now) && scheduled.recoveryDecisions?[pending.episodeKey] == nil,
-                "explicit plan choice removes its inactivity deadline")
+            check(scheduled.resolveRecoveryDecision(.plan, for: pending) && scheduled.recoveryDecisions?[pending.episodeKey] == nil,
+                "an explicit plan choice dismisses its reminder")
             var deselected = saved
             deselected.deselectedEpisodes.insert(pending.episodeKey)
-            check(!deselected.resolveRecoveryDecision(.now, for: pending, now: now) && deselected.recoveryDecisions?[pending.episodeKey]?.deadline == deadline,
-                "deselecting cannot erase a pending decision or act on a different selection")
+            check(!deselected.resolveRecoveryDecision(.now, for: pending) && deselected.recoveryDecisions?[pending.episodeKey]?.deadline == deadline,
+                "deselecting cannot erase a reminder or act on a different selection")
             let persistedWait = engine.plan(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask",
                 usage: UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 1, windowMinutes: 300, resetsAt: future), weekly: nil, capturedAt: localNode, sourceFile: "app-server"),
                 blocked: [pending], observedRecovery: true, needsRecoveryDecision: true)
             check(persistedWait.needsRecoveryDecision && persistedWait.date == nil && persistedWait.decision == .wait(reason: "等待续跑决定"),
-                "a persisted decision blocks both later natural recovery and a scheduled node")
+                "a persisted unanswered reminder cannot continue at a scheduled node even after natural recovery")
             var inactive = recovered; inactive.fiveHour?.usedPercent = 0; inactive.zeroUseWindowActive = false
-            let noWindow = MenuSummary.build(plan: persistedWait, usage: inactive, schedule: schedule, tasks: [pending], now: inactive.capturedAt)
-            check(!noWindow.isTime && noWindow.action.isEmpty && noWindow.taskCount == 1 && noWindow.statusText == L10n.text("待决定"),
-                "a waiting decision without an active window never fabricates a reset time")
+            var inactivePlan = engine.plan(now: inactive.capturedAt, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: inactive, blocked: [])
+            inactivePlan.needsRecoveryDecision = true
+            let noWindow = MenuSummary.build(plan: inactivePlan, usage: inactive, schedule: schedule, tasks: [pending], now: inactive.capturedAt)
+            check(noWindow.isTime && noWindow.action == "保持活动" && noWindow.taskCount == 1 && noWindow.statusSymbol == "waveform.path.ecg",
+                "an unanswered reminder with no active window retains its task and displays normal keep-alive")
             var available = recovered; available.accountID = "test-account"
             check(!UsageRecovery.hasAvailableQuota(for: pending, usage: available, boundAccount: "other", now: available.capturedAt),
                 "a different account cannot generate a recovery reminder")
@@ -1551,7 +1666,9 @@ import Darwin
             let first = state.availableTasks.first { $0.id == parentID }!
             let second = state.availableTasks.first { $0.id == childID }!
             check(state.choices.recoveryDecisions?.count == 2 && state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForActivity && state.nextAction?.needsRecoveryDecision == true,
-                "real AppState persists both recovered episodes and waits indefinitely without human usage")
+                "real AppState persists unanswered reminders for both recovered episodes")
+            check(state.nextAction?.mode == .keepAlive && state.nextAction?.date != nil,
+                "unanswered reminders leave the main AppState plan on normal keep-alive")
             let initialReminder = state.claimRecoveryReminder(for: first.episodeKey)!
             state.finishRecoveryReminder(for: first.episodeKey, phase: initialReminder.phase, delivered: false)
             check(state.choices.recoveryDecisions?[first.episodeKey]?.notification == .unavailable && state.claimRecoveryReminder(for: first.episodeKey) == nil,
@@ -1589,26 +1706,31 @@ import Darwin
             try FileManager.default.removeItem(at: keeperEvent)
             try await sync(state)
             let deadline = observedAt.addingTimeInterval(600)
-            check(state.choices.recoveryDecisions?[first.episodeKey]?.deadline == deadline && state.choices.recoveryDecisions?[second.episodeKey]?.deadline == deadline,
-                "usage before app discovery but after the stop in this window gets ten full minutes from detection")
-            state.finishRecoveryReminder(for: first.episodeKey, phase: .waitingForActivity, delivered: true)
-            check(state.choices.recoveryDecisions?[first.episodeKey]?.notification == .pending,
-                "a delayed old-stage notification callback cannot acknowledge the countdown reminder")
-            let timedReminder = state.claimRecoveryReminder(for: first.episodeKey)!
-            state.finishRecoveryReminder(for: first.episodeKey, phase: timedReminder.phase, delivered: true)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.deadline == nil && state.choices.recoveryDecisions?[second.episodeKey]?.deadline == nil,
+                "human usage no longer starts a cancellation countdown for scheduled tasks")
+            state.finishRecoveryReminder(for: first.episodeKey, phase: .waitingForChoice, delivered: true)
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.notification == .unavailable,
+                "a legacy-stage notification callback cannot acknowledge the current reminder")
             state = makeState(); try await sync(state)
-            check(state.choices.recoveryDecisions?[first.episodeKey]?.deadline == deadline && state.claimRecoveryReminder(for: first.episodeKey) == nil,
-                "a restarted countdown retains its deadline and does not redeliver its notification")
+            check(state.choices.recoveryDecisions?[first.episodeKey]?.deadline == nil && state.claimRecoveryReminder(for: first.episodeKey) == nil,
+                "restart preserves the untimed reminder and does not redeliver its notification")
             let beforeActions = try Data(contentsOf: runtime)
             state.resolveRecoveryDecision(.plan, for: [second])
             let chosenPlan = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
             check((chosenPlan["held"] as? [String])?.contains(second.episodeKey) == true && state.choices.recoveryDecisions?[second.episodeKey] == nil,
                 "the real plan button durably releases only the selected episode into the existing schedule")
+            var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
+            var legacyChoices = legacy["choices"] as! [String: Any]
+            var legacyDecisions = legacyChoices["recoveryDecisions"] as! [String: [String: Any]]
+            legacyDecisions[first.episodeKey]?["phase"] = RecoveryDecision.Phase.waitingForChoice.rawValue
+            legacyDecisions[first.episodeKey]?["deadline"] = deadline.timeIntervalSinceReferenceDate
+            legacyChoices["recoveryDecisions"] = legacyDecisions; legacy["choices"] = legacyChoices
+            try JSONSerialization.data(withJSONObject: legacy).write(to: runtime, options: .atomic)
+            state = makeState(); try await sync(state)
             clockNow = deadline
             state.openRecoveryDecisions { opened += 1 }
-            state.resolveRecoveryDecision(.now, for: [first])
-            check(state.choices.keepAliveEpisodes.contains(first.episodeKey) && !state.choices.keepAliveEpisodes.contains(second.episodeKey) && appRecorder.count == 0,
-                "opening an expired notification and clicking now cancels only the unanswered episode")
+            check(!state.choices.keepAliveEpisodes.contains(first.episodeKey) && !state.choices.keepAliveEpisodes.contains(second.episodeKey) && state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForChoice && appRecorder.count == 0,
+                "opening a legacy reminder after ten minutes retains it without cancellation or continuation")
             let newStop = clockNow.addingTimeInterval(-5)
             try stopped(parentID, at: newStop).write(to: firstPath, atomically: true, encoding: .utf8)
             var fresh = live; fresh.capturedAt = clockNow; provider.set(fresh)
@@ -1628,7 +1750,10 @@ import Darwin
             var fixture = try JSONSerialization.jsonObject(with: beforeActions) as! [String: Any]
             var savedChoices = fixture["choices"] as! [String: Any]
             var savedDecisions = savedChoices["recoveryDecisions"] as! [String: [String: Any]]
-            for key in savedDecisions.keys { savedDecisions[key]?["deadline"] = clockNow.addingTimeInterval(1).timeIntervalSinceReferenceDate }
+            for key in savedDecisions.keys {
+                savedDecisions[key]?["phase"] = RecoveryDecision.Phase.waitingForChoice.rawValue
+                savedDecisions[key]?["deadline"] = clockNow.addingTimeInterval(1).timeIntervalSinceReferenceDate
+            }
             savedChoices["recoveryDecisions"] = savedDecisions; fixture["choices"] = savedChoices
             try JSONSerialization.data(withJSONObject: fixture).write(to: runtime, options: .atomic)
             state = makeState(); try await sync(state)
@@ -1638,8 +1763,8 @@ import Darwin
                 "the real now button durably acknowledges the choice before async manual preflight")
             clockNow = clockNow.addingTimeInterval(2)
             state.recompute(allowExecution: false)
-            check(!state.choices.keepAliveEpisodes.contains(first.episodeKey) && state.choices.keepAliveEpisodes.contains(second.episodeKey),
-                "timeout during preflight cannot cancel the chosen episode but still expires unanswered peers")
+            check(!state.choices.keepAliveEpisodes.contains(first.episodeKey) && !state.choices.keepAliveEpisodes.contains(second.episodeKey) && state.choices.recoveryDecisions?[second.episodeKey]?.phase == .waitingForChoice,
+                "an old deadline during manual preflight cannot cancel the chosen episode or unanswered scheduled peers")
             provider.release()
             for _ in 0..<400 { if !appExecution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
             check(appRecorder.count == 1 && appExecution.hasAttempted(first) && !appExecution.hasAttempted(second),
@@ -1661,34 +1786,193 @@ import Darwin
             try await Task.sleep(nanoseconds: 100_000_000)
             check(provider.readCount == readsAfterFailure && !appExecution.running,
                 "an execution completion refresh cannot spin into immediate automatic retries")
+            clockNow = Date(); fresh.capturedAt = clockNow; provider.set(fresh)
+            let retryNode = Calendar.current.dateComponents([.hour, .minute], from: clockNow)
+            appDefaults.set(retryNode.hour! * 60 + retryNode.minute!, forKey: "dailyAnchorMinutes")
+            try await sync(state); state.recompute()
+            check(state.choices.recoveryDecisions?[second.episodeKey]?.phase == .responded && !appExecution.hasAttempted(second) && appRecorder.count == 1 && !appExecution.running,
+                "a failed explicit continue-now choice cannot silently retry at a later scheduled node")
+            appDefaults.set(false, forKey: "enabled"); state.recompute(allowExecution: false)
+            check(state.nextAction?.note == "已停用", "a manually handled task cannot override the disabled Keeper state")
+            appDefaults.set(true, forKey: "enabled")
             state = makeState()
             state.openRecoveryDecisions { opened += 1 }
             check(state.choices.recoveryDecisions?[second.episodeKey]?.phase == .responded && appRecorder.count == 1,
                 "restart and an old notification cannot retry a failed explicit continuation")
-            // At a real schedule node B is approved, while A must remain awaiting a decision.
+            // Off node, a naturally recovered task must run independently of another task waiting for its plan.
             clockNow = Date()
             fresh.capturedAt = clockNow; provider.set(fresh)
             let nodeParts = Calendar.current.dateComponents([.hour, .minute], from: clockNow)
-            appDefaults.set(nodeParts.hour! * 60 + nodeParts.minute!, forKey: "dailyAnchorMinutes")
+            appDefaults.set((nodeParts.hour! * 60 + nodeParts.minute! + 1380) % 1440, forKey: "dailyAnchorMinutes")
+            let naturalReset = clockNow.addingTimeInterval(-60)
+            try (metadata(parentID, at: stopAt.addingTimeInterval(-60)) + event("token_count", stopAt.addingTimeInterval(-1), ["rate_limits": [
+                "limit_id": "codex", "primary": ["used_percent": 100, "window_minutes": 300, "resets_at": naturalReset.timeIntervalSince1970]]]) +
+                event("error", stopAt, ["message": "usage_limit_reached"]))
+                .write(to: firstPath, atomically: true, encoding: .utf8)
             let multiRuntime = root.appendingPathComponent("multi/pending-runtime.json")
+            var multiFixture = try JSONSerialization.jsonObject(with: beforeActions) as! [String: Any]
+            var multiChoices = multiFixture["choices"] as! [String: Any]
+            var multiDecisions = multiChoices["recoveryDecisions"] as! [String: [String: Any]]
+            multiDecisions.removeValue(forKey: first.episodeKey)
+            multiChoices["recoveryDecisions"] = multiDecisions; multiFixture["choices"] = multiChoices
+            var multiConfirmed = multiFixture["confirmed"] as! [String: Any]
+            multiConfirmed.removeValue(forKey: first.id); multiFixture["confirmed"] = multiConfirmed
+            try FileManager.default.createDirectory(at: multiRuntime.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: multiFixture).write(to: multiRuntime, options: .atomic)
             let multiRecorder = BatchRecorder(expected: 1)
             let multiExecution = ExecutionCoordinator(provider: provider, makeResumeTransport: { BatchTransport(recorder: multiRecorder) },
                 defaults: appDefaults, ledgerURL: multiRuntime.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), codexHome: home)
             let multiState = AppState(provider: provider, defaults: appDefaults, runtimeURL: multiRuntime, codexHome: home,
                 execution: multiExecution, startMonitoring: false)
             try await sync(multiState)
-            check(multiRecorder.count == 0 && multiState.choices.recoveryDecisions?[first.episodeKey] != nil,
-                "fresh ask decisions still block the real schedule node before any user approval")
-            multiState.resolveRecoveryDecision(.plan, for: [second])
             for _ in 0..<400 { if !multiExecution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
-            check(multiRecorder.count == 1 && multiExecution.hasAttempted(second) && !multiExecution.hasAttempted(first) &&
-                  multiState.choices.recoveryDecisions?[first.episodeKey] != nil,
-                "an unanswered task cannot block a different explicitly scheduled task or join its automatic batch")
+            check(multiRecorder.count == 1 && multiExecution.hasAttempted(first) && !multiExecution.hasAttempted(second) && multiState.choices.recoveryDecisions?[second.episodeKey] != nil,
+                "off-node natural recovery runs task A immediately while waiting task B keeps its next scheduled node")
+            multiState.resolveRecoveryDecision(.plan, for: [second])
+            check(multiRecorder.count == 1 && multiState.choices.recoveryDecisions?[second.episodeKey] == nil && multiState.nextAction?.date == multiState.schedule.nextNode(after: clockNow) && multiState.nextAction?.mode == .resume,
+                "an explicit plan choice approves the waiting task for the next scheduled continuation")
             multiState.usage.stop(); multiState.sessions.stop()
             state.usage.stop(); state.sessions.stop()
         }
 
-        // A waiting decision must not suppress the ordinary keep-alive at a due node.
+        // Replay pre-stop 97% -> confirmed exhaustion -> protected natural reset through production AppState.
+        do {
+            let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(".build/tests/resume-timing-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let home = root.appendingPathComponent("codex")
+            let traces = home.appendingPathComponent("sessions")
+            let runtime = root.appendingPathComponent("support/pending-runtime.json")
+            try FileManager.default.createDirectory(at: traces, withIntermediateDirectories: true)
+            var connection: OpaquePointer?
+            sqlite3_open(home.appendingPathComponent("logs_1.sqlite").path, &connection)
+            sqlite3_exec(connection, "CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil)
+            sqlite3_close(connection)
+            // Use the current minute as the anchor so the coordinator's real-clock preflight can run at the final node.
+            let parts = Calendar.current.dateComponents([.hour, .minute], from: Date())
+            let anchorMinutes = parts.hour! * 60 + parts.minute!
+            let anchor = Calendar.current.date(bySettingHour: parts.hour!, minute: parts.minute!, second: 0, of: Date())!
+            let blockedAt = anchor.addingTimeInterval(-22312)
+            let reset = anchor.addingTimeInterval(-13945)
+            var clockNow = blockedAt.addingTimeInterval(-4)
+            var live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 97, windowMinutes: 300, resetsAt: reset),
+                weekly: QuotaWindow(usedPercent: 32, windowMinutes: 10080, resetsAt: anchor.addingTimeInterval(604800)),
+                capturedAt: clockNow, accountID: "timing-account", sourceFile: "app-server")
+            let provider = RecoveryTestUsage(snapshot: live)
+            func header(_ id: String, at time: Date) throws -> String {
+                let payload: [String: Any] = ["id": id, "cwd": root.path, "timestamp": iso.string(from: time), "source": "vscode"]
+                return String(data: try JSONSerialization.data(withJSONObject: ["type": "session_meta", "timestamp": iso.string(from: time), "payload": payload]), encoding: .utf8)! + "\n"
+            }
+            func stoppedTrace(_ id: String, at time: Date, used: Int, resetsAt: Date) throws -> String {
+                try header(id, at: time.addingTimeInterval(-60)) + event("token_count", time.addingTimeInterval(-1), ["rate_limits": [
+                    "limit_id": "codex", "primary": ["used_percent": used, "window_minutes": 300, "resets_at": resetsAt.timeIntervalSince1970]]]) +
+                    event("error", time, ["message": "usage_limit_reached"])
+            }
+            let path = traces.appendingPathComponent("rollout-\(parentID).jsonl")
+            try header(parentID, at: blockedAt.addingTimeInterval(-60)).write(to: path, atomically: true, encoding: .utf8)
+            let suite = "keeper.resume.timing." + UUID().uuidString
+            let prefs = UserDefaults(suiteName: suite)!
+            defer { prefs.removePersistentDomain(forName: suite) }
+            prefs.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "ask", "resumeWorkspaceReminder": false,
+                "dailyAnchorMinutes": anchorMinutes])
+            let pings = ReminderTestPing()
+            let resumes = BatchRecorder(expected: 1)
+            let execution = ExecutionCoordinator(provider: provider, makeResumeTransport: { BatchTransport(recorder: resumes) }, defaults: prefs,
+                ledgerURL: runtime.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), pingTransport: pings, codexHome: home, now: { clockNow })
+            func makeState() -> AppState { AppState(provider: provider, defaults: prefs, runtimeURL: runtime, codexHome: home,
+                execution: execution, startMonitoring: false, now: { clockNow }) }
+            var state = makeState()
+            func settle() async throws { for _ in 0..<40 { try await Task.sleep(nanoseconds: 10_000_000) } }
+            func readUsage() async throws {
+                provider.set(live); state.usage.refresh(); try await settle()
+                state.recompute(allowExecution: false)
+            }
+            state.sessions.refresh(); try await settle(); try await readUsage()
+            clockNow = blockedAt.addingTimeInterval(15)
+            try stoppedTrace(parentID, at: blockedAt, used: 99, resetsAt: reset).write(to: path, atomically: true, encoding: .utf8)
+            state.sessions.refresh(); try await settle()
+            let target = state.availableTasks.first!
+            let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
+            let savedDecisions = (saved["choices"] as? [String: Any])?["recoveryDecisions"] as? [String: Any]
+            check(state.usage.snapshot?.capturedAt == blockedAt.addingTimeInterval(-4) && state.choices.recoveryDecisions?[target.episodeKey] == nil && savedDecisions?[target.episodeKey] == nil,
+                "production session refresh cannot persist an early-recovery decision from the fresh pre-stop 97-percent poll")
+            clockNow = blockedAt.addingTimeInterval(16)
+            live.capturedAt = clockNow; live.fiveHour?.usedPercent = 100
+            try await readUsage()
+            check(state.availableTasks.first?.fiveHourResetAt == reset && state.choices.recoveryDecisions?[target.episodeKey] == nil && state.nextAction?.date == anchor && resumes.count == 0 && pings.count == 0,
+                "the next 100-percent poll retains the true reset and waits for the protected anchor without creating a decision")
+            clockNow = reset.addingTimeInterval(-20); live.capturedAt = clockNow
+            try await readUsage()
+            clockNow = reset.addingTimeInterval(14); live.capturedAt = clockNow
+            live.fiveHour?.usedPercent = 0; live.fiveHour?.resetsAt = clockNow.addingTimeInterval(18000); live.zeroUseWindowActive = false
+            try await readUsage()
+            check(state.choices.recoveryDecisions?[target.episodeKey] == nil && state.nextAction?.date == anchor && state.nextAction?.decision == .wait(reason: "按计划自动继续") && resumes.count == 0 && pings.count == 0,
+                "a naturally observed reset inside anchor protection waits for the anchor through real AppState")
+            state = makeState(); state.sessions.refresh(); try await settle(); try await readUsage()
+            check(state.choices.recoveryDecisions?[target.episodeKey] == nil && state.nextAction?.date == anchor && resumes.count == 0,
+                "restart retains the natural-reset deadline and anchor protection without inventing a pending decision")
+            clockNow = Date(); live.capturedAt = clockNow; live.fiveHour?.resetsAt = clockNow.addingTimeInterval(18000)
+            try await readUsage()
+            for _ in 0..<400 { if !execution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
+            check(state.schedule.currentNode(at: clockNow) == anchor && resumes.count == 1 && execution.hasAttempted(target) && pings.count == 0 && execution.confirmations.filter { $0.kind == .resume }.count == 1,
+                "the protected task resumes once at its anchor through the fake transport instead of dispatching a ping")
+            state.recompute(); try await settle()
+            state = makeState(); state.sessions.refresh(); try await settle(); try await readUsage()
+            check(resumes.count == 1 && pings.count == 0 && execution.confirmations.filter { $0.kind == .resume }.count == 1,
+                "recompute and restart cannot duplicate the confirmed anchor continuation")
+
+            clockNow = anchor.addingTimeInterval(-600); live.capturedAt = clockNow; live.fiveHour?.resetsAt = clockNow.addingTimeInterval(18000)
+            try await readUsage()
+            let earlyStop = clockNow.addingTimeInterval(-120)
+            let earlyPath = traces.appendingPathComponent("rollout-\(childID).jsonl")
+            try stoppedTrace(childID, at: earlyStop, used: 100, resetsAt: clockNow.addingTimeInterval(18000)).write(to: earlyPath, atomically: true, encoding: .utf8)
+            state.sessions.refresh(); try await settle()
+            let earlyTask = state.availableTasks.first!
+            let earlyDecision = state.choices.recoveryDecisions?[earlyTask.episodeKey]
+            check(earlyTask.id == childID && earlyDecision?.phase == .waitingForActivity && state.nextAction?.date == anchor && state.nextAction?.mode == .keepAlive && resumes.count == 1,
+                "available quota after a stop creates an unanswered reminder while the main plan stays on keep-alive")
+            state = makeState(); state.sessions.refresh(); try await settle(); try await readUsage()
+            check(state.choices.recoveryDecisions?[earlyTask.episodeKey] == earlyDecision && state.nextAction?.date == anchor && resumes.count == 1,
+                "restart keeps an unanswered reminder without scheduling its continuation")
+            let earlySummary = MenuSummary.build(plan: state.nextAction, usage: state.usage.snapshot, schedule: state.schedule, tasks: state.selectedTasks, now: clockNow)
+            check(earlySummary.isTime && earlySummary.action == "保持活动" && earlySummary.statusSymbol == "waveform.path.ecg" && earlySummary.timeline.map(\.kind) == [.keepAlive] && earlySummary.tasks == [earlyTask.displayName],
+                "production unanswered reminder with no active window retains its task while showing normal keep-alive")
+            var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
+            var legacyChoices = legacy["choices"] as! [String: Any]
+            var legacyDecisions = legacyChoices["recoveryDecisions"] as! [String: [String: Any]]
+            legacyDecisions[earlyTask.episodeKey]?["phase"] = RecoveryDecision.Phase.waitingForChoice.rawValue
+            legacyDecisions[earlyTask.episodeKey]?["deadline"] = anchor.addingTimeInterval(-1).timeIntervalSinceReferenceDate
+            legacyChoices["recoveryDecisions"] = legacyDecisions; legacy["choices"] = legacyChoices
+            try JSONSerialization.data(withJSONObject: legacy).write(to: runtime, options: .atomic)
+            state = makeState(); state.sessions.refresh(); try await settle(); try await readUsage()
+            clockNow = Date(); live.capturedAt = clockNow; live.fiveHour?.resetsAt = clockNow.addingTimeInterval(18000)
+            let availableNow = live
+            for gate in ["exhausted", "missing", "account", "stale"] {
+                live = availableNow
+                switch gate {
+                case "exhausted": live.fiveHour?.usedPercent = 100
+                case "missing": live.fiveHour = nil
+                case "account": live.accountID = "different-account"
+                default: live.capturedAt = clockNow.addingTimeInterval(-61)
+                }
+                try await readUsage()
+                check(resumes.count == 1 && !execution.hasAttempted(earlyTask) && pings.count == 0 && !state.choices.keepAliveEpisodes.contains(earlyTask.episodeKey),
+                    "unanswered legacy reminder at its node remains pending with \(gate) quota without cancelling or sending")
+            }
+            live = availableNow; try await readUsage()
+            check(resumes.count == 1 && !execution.hasAttempted(earlyTask) && state.choices.recoveryDecisions?[earlyTask.episodeKey]?.phase == .waitingForChoice && !state.choices.keepAliveEpisodes.contains(earlyTask.episodeKey),
+                "an unanswered reminder with an expired legacy deadline stays pending at a node with available quota")
+            state.resolveRecoveryDecision(.plan, for: [earlyTask])
+            for _ in 0..<400 { if !execution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
+            check(resumes.count == 2 && execution.hasAttempted(earlyTask) && pings.count == 0 && execution.confirmations.filter { $0.kind == .resume }.count == 2 && !state.choices.keepAliveEpisodes.contains(earlyTask.episodeKey),
+                "explicit continue-as-scheduled choice resumes once at the node through normal preflight")
+            state.recompute(); try await settle()
+            check(resumes.count == 2 && execution.confirmations.filter { $0.kind == .resume }.count == 2,
+                "the explicitly approved scheduled continuation does not resend after completion")
+            state.usage.stop(); state.sessions.stop()
+        }
+
+        // A manually handled episode must not suppress ordinary keep-alive at due nodes.
         do {
             let root = temp.appendingPathComponent("reminder-keepalive")
             let home = root.appendingPathComponent("codex")
@@ -1719,6 +2003,13 @@ import Darwin
                 ledgerURL: root.appendingPathComponent("support/resume-attempts.json"), pingTransport: pings, codexHome: home, now: { pingNow })
             func makeState() -> AppState { AppState(provider: provider, defaults: prefs, runtimeURL: runtime, codexHome: home,
                 execution: execution, startMonitoring: false, now: { pingNow }) }
+            let storedTarget = BlockedSessionDetector.detect(in: [SessionWatcher.parse(url: path, mtime: at)!]).first!
+            var handledChoices = ResumeChoices(); handledChoices.requestRecoveryDecision(for: storedTarget, now: at)
+            _ = handledChoices.resolveRecoveryDecision(.now, for: storedTarget)
+            let savedChoices = try JSONSerialization.jsonObject(with: JSONEncoder().encode(handledChoices))
+            let savedTarget = try JSONSerialization.jsonObject(with: JSONEncoder().encode(storedTarget))
+            try JSONSerialization.data(withJSONObject: ["confirmed": [storedTarget.id: savedTarget], "accounts": [storedTarget.id: "test-account"],
+                "workspaces": [:], "held": [], "choices": savedChoices]).write(to: runtime, options: .atomic)
             var state = makeState()
             state.sessions.refresh()
             for _ in 0..<30 { try await Task.sleep(nanoseconds: 10_000_000) }
@@ -1728,14 +2019,13 @@ import Darwin
             for _ in 0..<40 { if !execution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
             let target = state.availableTasks.first!
             check(pings.count == 1 && execution.confirmations.filter { $0.kind == .keepAlive }.count == 1,
-                "a waiting decision still permits one confirmed scheduled keep-alive through real AppState")
-            check(resumes.count == 0 && !execution.hasAttempted(target) && state.choices.recoveryDecisions?[target.episodeKey]?.phase == .waitingForActivity,
-                "normal keep-alive never continues or clears the waiting task")
+                "a manually handled episode still permits one confirmed scheduled keep-alive through real AppState")
+            check(resumes.count == 0 && !execution.hasAttempted(target) && state.choices.recoveryDecisions?[target.episodeKey]?.phase == .responded,
+                "normal keep-alive never continues or clears a manually handled task")
             var summary = MenuSummary.build(plan: state.nextAction, usage: state.usage.snapshot, schedule: state.schedule, tasks: state.selectedTasks)
             summary.applyRecoveryReminder(tasks: state.availableTasks, choices: state.choices)
-            check(summary.statusText == L10n.text("待决定") && summary.reminderBody.contains(L10n.text("Keeper 会继续按计划保活。")),
-                "the waiting menu describes normal keep-alive without promising an automatic continuation")
-            let originalDecision = state.choices.recoveryDecisions?[target.episodeKey]
+            check(summary.statusText == L10n.text("待决定") && summary.reminderTitle.isEmpty,
+                "a manually handled task does not fabricate a scheduled automatic retry or an unanswered reminder")
             func settle() async throws { for _ in 0..<40 { try await Task.sleep(nanoseconds: 10_000_000) } }
             func snapshot(at time: Date) -> UsageSnapshot {
                 var result = idle; result.capturedAt = time; result.fiveHour?.resetsAt = time.addingTimeInterval(18000)
@@ -1760,20 +2050,25 @@ import Darwin
             state.recompute(); try await settle()
             check(pings.count == 1, "repeated refreshes do not duplicate an already attempted keep-alive node")
             pingNow = at.addingTimeInterval(18000)
+            try setPhase(.waitingForActivity, deadline: nil)
             try await reload(snapshot(at: pingNow))
-            check(pings.count == 2 && state.choices.recoveryDecisions?[target.episodeKey] == originalDecision && resumes.count == 0,
-                "an ignored long-term reminder survives the next normal keep-alive node without a countdown or resume")
+            check(pings.count == 2 && state.choices.recoveryDecisions?[target.episodeKey]?.phase == .waitingForActivity && resumes.count == 0,
+                "an unanswered reminder survives the next normal keep-alive node without automatic continuation")
+            summary = MenuSummary.build(plan: state.nextAction, usage: state.usage.snapshot, schedule: state.schedule, tasks: state.selectedTasks, now: pingNow)
+            summary.applyRecoveryReminder(tasks: state.availableTasks, choices: state.choices)
+            check(summary.action == "保持活动" && !summary.reminderTitle.isEmpty && summary.tasks == [target.displayName],
+                "an unanswered reminder remains visible with its task and normal keep-alive time after the node")
             pingNow = at.addingTimeInterval(36000)
-            let deadline = pingNow.addingTimeInterval(600)
+            let deadline = pingNow.addingTimeInterval(-600)
             try setPhase(.waitingForChoice, deadline: deadline)
             try await reload(snapshot(at: pingNow))
             check(pings.count == 3 && state.choices.recoveryDecisions?[target.episodeKey]?.deadline == deadline,
-                "normal keep-alive preserves an already running reminder deadline across restart")
+                "normal keep-alive preserves an unanswered expired legacy reminder across restart")
             pingNow = at.addingTimeInterval(54000)
-            try setPhase(.responded, deadline: nil, account: "previous-account")
+            try setPhase(.waitingForChoice, deadline: deadline, account: "previous-account")
             try await reload(snapshot(at: pingNow))
-            check(pings.count == 4 && state.choices.recoveryDecisions?[target.episodeKey]?.phase == .responded && resumes.count == 0,
-                "a manually handled or other-account paused task cannot globally stop keep-alive on the current account")
+            check(pings.count == 4 && state.choices.recoveryDecisions?[target.episodeKey]?.phase == .waitingForChoice && resumes.count == 0,
+                "an unanswered other-account task cannot globally stop keep-alive on the current account")
 
             pingNow = at.addingTimeInterval(86400)
             var unavailable = snapshot(at: pingNow); unavailable.zeroUseWindowActive = true
@@ -1787,7 +2082,9 @@ import Darwin
             check(pings.count == 4, "weekly exhaustion still blocks keep-alive while reminders are ignored")
             var failedSummary = MenuSummary.build(plan: state.nextAction, usage: nil, schedule: state.schedule, tasks: state.selectedTasks)
             failedSummary.applyIssues(usageError: "同步失败", sessionError: nil, executionFailure: nil, executionAction: "保活")
-            failedSummary.applyRecoveryReminder(tasks: state.availableTasks, choices: state.choices)
+            var waitingChoices = state.choices
+            waitingChoices.recoveryDecisions?[target.episodeKey]?.phase = .waitingForActivity
+            failedSummary.applyRecoveryReminder(tasks: state.availableTasks, choices: waitingChoices)
             check(!failedSummary.reminderTitle.isEmpty && !failedSummary.reminderBody.isEmpty && !failedSummary.error.isEmpty && failedSummary.note.isEmpty,
                 "a standalone persistent reminder stays visible alongside sync errors without becoming a footnote")
 
