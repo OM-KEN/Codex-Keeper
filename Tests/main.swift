@@ -10,6 +10,197 @@ import Darwin
             count += 1
             if !value { failed += 1; print("FAIL: \(name)") }
         }
+        do {
+            let updateSuite = "keeper.updates.tests." + UUID().uuidString
+            let updateDefaults = UserDefaults(suiteName: updateSuite)!
+            defer { updateDefaults.removePersistentDomain(forName: updateSuite) }
+            let currentVersion = SemanticVersion(tag: "0.1.4")!
+            check(SemanticVersion(tag: "v0.1.10")! > currentVersion &&
+                SemanticVersion(tag: "1.0.0")! > SemanticVersion(tag: "0.99.99")! &&
+                SemanticVersion(tag: "0.2.0")! > SemanticVersion(tag: "0.1.99")!,
+                "stable versions compare each numeric component instead of sorting strings")
+            check(SemanticVersion(tag: "V0.1.4") == currentVersion &&
+                ["0.1", "0.1.4-beta.1", "0.1.4+build", "01.1.4", "0.-1.4", "0.1.４"].allSatisfy { SemanticVersion(tag: $0) == nil },
+                "stable versions accept the tag prefix and reject noncanonical or prerelease versions")
+            func releaseResponse(_ tag: String = "v0.1.4", status: Int = 200, url: String? = nil) -> HTTPURLResponse {
+                let defaultURL = status == 404 ? "https://github.com/OM-KEN/Codex-Keeper/releases/latest" :
+                    "https://github.com/OM-KEN/Codex-Keeper/releases/tag/\(tag)"
+                return HTTPURLResponse(url: URL(string: url ?? defaultURL)!,
+                    statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+            }
+            let newRelease = AppRelease(version: SemanticVersion(tag: "0.1.10")!,
+                pageURL: releaseResponse("v0.1.10").url!)
+            check(LatestReleaseParser.parse(response: releaseResponse("v0.1.10")) == .release(newRelease),
+                "latest release redirect preserves the trusted stable version and release page")
+            check(LatestReleaseParser.parse(response: releaseResponse(status: 404)) == .noStableRelease,
+                "missing latest release reports that no stable release is available")
+            for status in [403, 500, 302] {
+                check(LatestReleaseParser.parse(response: releaseResponse(status: status)) == .failure,
+                    "unsuccessful or unfinished release response is not a successful check: \(status)")
+            }
+            let invalidReleaseURLs = [
+                "http://github.com/OM-KEN/Codex-Keeper/releases/tag/v0.1.10",
+                "https://github.com/OM-KEN/Copied/releases/tag/v0.1.10",
+                "https://github.com.evil.example/OM-KEN/Codex-Keeper/releases/tag/v0.1.10",
+                "https://github.com/OM-KEN/Codex-Keeper/releases/latest",
+                "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v0.1.10-beta.1",
+                "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v0.1.10/extra",
+                "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v0.1.10?next=elsewhere"
+            ]
+            check(invalidReleaseURLs.allSatisfy {
+                LatestReleaseParser.parse(response: releaseResponse(url: $0)) == .failure
+            }, "only a finished HTTPS release redirect for this repository and a numeric stable tag is accepted")
+            check(LatestReleaseParser.parse(response: releaseResponse(status: 404,
+                url: "https://github.com/OM-KEN/Copied/releases/latest")) == .failure,
+                "a missing release in another repository cannot report that Codex Keeper has no stable release")
+            check(LatestReleaseParser.parse(response: URLResponse(url: releaseResponse().url!, mimeType: nil,
+                expectedContentLength: 0, textEncodingName: nil)) == .failure,
+                "non-HTTP release responses cannot report an available update")
+            for tag in ["v0.1.4", "v0.1.3"] {
+                let service = AppUpdateService(defaults: updateDefaults, currentVersion: "0.1.4", loadResponse: { _ in releaseResponse(tag) })
+                await service.checkManually()
+                check(service.status == .upToDate && service.availableRelease == nil,
+                    "equal or older releases never offer a downgrade: \(tag)")
+            }
+            var requests: [URLRequest] = []
+            var pendingResponse: CheckedContinuation<URLResponse, Error>?
+            var requestStarted: CheckedContinuation<Void, Never>?
+            let service = AppUpdateService(defaults: updateDefaults, currentVersion: "0.1.4", loadResponse: { request in
+                requests.append(request)
+                return try await withCheckedThrowingContinuation {
+                    pendingResponse = $0
+                    requestStarted?.resume()
+                    requestStarted = nil
+                }
+            })
+            check(service.status == .idle && requests.isEmpty, "creating the update service does not start a check")
+            let firstCheck = Task { await service.checkManually() }
+            await withCheckedContinuation { requestStarted = $0 }
+            await service.checkManually()
+            check(service.status == .checking && requests.count == 1,
+                "another manual check does not send a duplicate request while the first is pending")
+            check(requests.first?.url?.absoluteString == "https://github.com/OM-KEN/Codex-Keeper/releases/latest" &&
+                requests.first?.httpMethod == "HEAD" && requests.first?.timeoutInterval == 10 &&
+                requests.first?.cachePolicy == .reloadIgnoringLocalCacheData,
+                "manual update request uses a fresh short HEAD request to this repository's latest release")
+            pendingResponse?.resume(returning: releaseResponse("v0.1.10"))
+            await firstCheck.value
+            check(service.status == .updateAvailable(newRelease) && service.availableRelease == newRelease,
+                "a new stable release exposes only its validated GitHub page")
+            var retryCount = 0
+            let retryService = AppUpdateService(defaults: updateDefaults, currentVersion: "0.1.4", loadResponse: { _ in
+                retryCount += 1
+                if retryCount == 1 { throw URLError(.timedOut) }
+                return releaseResponse()
+            })
+            await retryService.checkManually()
+            check(retryService.status == .failed && retryService.availableRelease == newRelease,
+                "network failure leaves a visible failed state and preserves a previously trusted release")
+            await retryService.checkManually()
+            check(retryService.status == .upToDate && retryCount == 2,
+                "a failed manual update check can immediately be retried")
+            let missingService = AppUpdateService(defaults: updateDefaults, currentVersion: "0.1.4", loadResponse: { _ in releaseResponse(status: 404) })
+            await missingService.checkManually()
+            check(missingService.status == .noStableRelease, "404 flows through to the manual no-stable-release state")
+            let invalidService = AppUpdateService(defaults: updateDefaults, currentVersion: "—", loadResponse: { _ in
+                check(false, "an unknown local version must not query for updates")
+                return releaseResponse()
+            })
+            await invalidService.checkManually()
+            check(invalidService.status == .failed, "an unknown local version does not claim the app is current")
+
+            let automaticSuite = "keeper.automatic-updates.tests." + UUID().uuidString
+            let automaticDefaults = UserDefaults(suiteName: automaticSuite)!
+            defer { automaticDefaults.removePersistentDomain(forName: automaticSuite) }
+            var clock = Date(timeIntervalSince1970: 1_800_000_000)
+            var automaticRequests = 0
+            let automaticService = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.4", now: { clock }, loadResponse: { _ in
+                automaticRequests += 1
+                return releaseResponse("v0.1.10")
+            })
+            check(automaticService.automaticRemindersEnabled && !automaticService.showsMenuUpdateIndicator && automaticRequests == 0,
+                "update reminders default to enabled without querying until an automatic trigger")
+            await automaticService.checkAutomaticallyIfDue()
+            check(automaticRequests == 1 && automaticService.showsMenuUpdateIndicator,
+                "a first automatic trigger checks the stable release and enables the menu reminder")
+            let restartedService = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.4", now: { clock }, loadResponse: { _ in
+                automaticRequests += 1
+                return releaseResponse("v0.1.10")
+            })
+            check(restartedService.availableRelease == newRelease && restartedService.showsMenuUpdateIndicator,
+                "a restart restores the trusted newer release before a throttled network check")
+            await restartedService.checkAutomaticallyIfDue()
+            clock.addTimeInterval(24 * 60 * 60 - 1)
+            await restartedService.checkAutomaticallyIfDue()
+            check(automaticRequests == 1, "successful automatic checks remain throttled across a restart for a full day")
+            clock.addTimeInterval(1)
+            await restartedService.checkAutomaticallyIfDue()
+            check(automaticRequests == 2, "automatic checking resumes exactly after the 24-hour interval")
+            restartedService.setAutomaticRemindersEnabled(false)
+            clock.addTimeInterval(24 * 60 * 60)
+            await restartedService.checkAutomaticallyIfDue()
+            check(automaticRequests == 2 && !restartedService.showsMenuUpdateIndicator && restartedService.availableRelease == newRelease,
+                "disabling reminders stops automatic queries and hides the menu marker while retaining the update link")
+            let disabledRestart = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.4", now: { clock }, loadResponse: { _ in
+                automaticRequests += 1
+                return releaseResponse("v0.1.10")
+            })
+            check(!disabledRestart.automaticRemindersEnabled && !disabledRestart.showsMenuUpdateIndicator,
+                "disabled reminders remain disabled after restarting")
+            await disabledRestart.checkManually()
+            check(automaticRequests == 3 && disabledRestart.availableRelease == newRelease && !disabledRestart.showsMenuUpdateIndicator,
+                "manual update checks and release links still work when reminders are disabled")
+            disabledRestart.setAutomaticRemindersEnabled(true)
+            check(disabledRestart.showsMenuUpdateIndicator,
+                "reenabling reminders immediately restores the known available-version marker")
+            var failureRequests = 0
+            let automaticRetry = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.4", now: { clock }, loadResponse: { _ in
+                failureRequests += 1
+                if failureRequests == 1 { throw URLError(.cannotConnectToHost) }
+                return releaseResponse("v0.1.10")
+            })
+            clock.addTimeInterval(24 * 60 * 60)
+            await automaticRetry.checkAutomaticallyIfDue()
+            check(failureRequests == 1 && automaticRetry.status == .failed && automaticRetry.showsMenuUpdateIndicator,
+                "an automatic network failure preserves the previously discovered menu update reminder")
+            clock.addTimeInterval(60 * 60 - 1)
+            await automaticRetry.checkAutomaticallyIfDue()
+            check(failureRequests == 1, "failed automatic checks back off for a full hour")
+            let failureRestart = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.4", now: { clock }, loadResponse: { _ in
+                failureRequests += 1
+                return releaseResponse("v0.1.10")
+            })
+            await failureRestart.checkAutomaticallyIfDue()
+            check(failureRequests == 1 && failureRestart.showsMenuUpdateIndicator,
+                "a restart preserves both failure backoff and the existing update marker")
+            clock.addTimeInterval(1)
+            await failureRestart.checkAutomaticallyIfDue()
+            check(failureRequests == 2 && failureRestart.status == .updateAvailable(newRelease),
+                "failed automatic checks can retry exactly after an hour")
+            let upgradedService = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.10", now: { clock }, loadResponse: { _ in releaseResponse("v0.1.10") })
+            check(upgradedService.availableRelease == nil && !upgradedService.showsMenuUpdateIndicator,
+                "installing the cached newer version removes the obsolete menu reminder")
+            automaticDefaults.set("https://github.com/OM-KEN/Copied/releases/tag/v99.0.0", forKey: "appUpdateCachedReleaseURL")
+            let invalidCacheService = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.4", now: { clock }, loadResponse: { _ in releaseResponse() })
+            check(invalidCacheService.availableRelease == nil && !invalidCacheService.showsMenuUpdateIndicator &&
+                automaticDefaults.object(forKey: "appUpdateCachedReleaseURL") == nil,
+                "an untrusted cached release is discarded instead of becoming a menu update link")
+            check(MenuVersionTextFormatter.string(version: "0.1.4", hasUpdate: false) == "版本 0.1.4" &&
+                MenuVersionTextFormatter.string(version: "0.1.4", hasUpdate: true) == "版本 0.1.4 · 有新版本",
+                "the available-version reminder follows the version text in the menu")
+            let environment = FeedbackEnvironment(appVersion: "0.1.4 + & #", macOSVersion: "15.7", chip: "Apple M4")
+            let emailURL = FeedbackSupport.emailURL(for: environment)!
+            let components = URLComponents(url: emailURL, resolvingAgainstBaseURL: false)!
+            let body = components.queryItems?.first { $0.name == "body" }?.value ?? ""
+            check(components.scheme == "mailto" && components.path == "omken.feedback@gmail.com" &&
+                components.queryItems?.first { $0.name == "subject" }?.value == "Codex Keeper 问题反馈" &&
+                body.contains(environment.appVersion) && body.contains(environment.macOSVersion) && body.contains(environment.chip) &&
+                body.contains("问题描述") && body.contains("复现步骤") && !emailURL.absoluteString.contains("+") &&
+                emailURL.absoluteString.contains("%0A"),
+                "feedback email preserves environment fields and encodes reserved characters and line breaks")
+            check(FeedbackSupport.githubIssueChooserURL.absoluteString == "https://github.com/OM-KEN/Codex-Keeper/issues/new/choose",
+                "GitHub feedback opens the issue chooser for Codex Keeper")
+        }
         let onboardingSuite = "keeper.onboarding.tests." + UUID().uuidString
         let onboardingDefaults = UserDefaults(suiteName: onboardingSuite)!
         defer { onboardingDefaults.removePersistentDomain(forName: onboardingSuite) }

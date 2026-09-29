@@ -27,6 +27,8 @@ SOURCES=(
     App/AppState.swift
     App/MenuBarController.swift
     Core/Localization.swift
+    Core/AppUpdateService.swift
+    Core/FeedbackSupport.swift
     Core/OnboardingPreferences.swift
     Core/ScheduleEngine.swift
     Core/DecisionEngine.swift
@@ -47,6 +49,7 @@ SOURCES=(
     UI/MenuSummaryView.swift
     UI/ResumeTasksView.swift
     UI/SettingsView.swift
+    UI/AboutView.swift
     UI/OnboardingView.swift
 )
 ICON_SOURCE="Codex Keeper.jpg"

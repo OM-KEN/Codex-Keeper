@@ -12,10 +12,13 @@ import UserNotifications
     private let quotaItem = NSMenuItem()
     private let quotaSeparator = NSMenuItem.separator()
     private var cancelResumeItem: NSMenuItem?
+    private var versionItem: NSMenuItem?
     private var settingsWindow: NSWindow?
+    private var aboutWindow: NSWindow?
     private var cliPathWindow: NSWindow?
     private var tasksWindow: NSWindow?
     private let appState = AppState()
+    private let updateService = AppUpdateService()
     private var updateScheduled = false
     private var notifiedCurrentPing = false
     private var cancellables = Set<AnyCancellable>()
@@ -48,7 +51,7 @@ import UserNotifications
         appState.$recoveryReminderTasks.receive(on: DispatchQueue.main).sink { [weak self] tasks in
             self?.sendRecoveryReminders(for: tasks)
         }.store(in: &cancellables)
-        appState.objectWillChange.sink { [weak self] _ in
+        Publishers.Merge(appState.objectWillChange, updateService.objectWillChange).sink { [weak self] _ in
             guard let self, !self.updateScheduled else { return }
             self.updateScheduled = true
             RunLoop.main.perform(inModes: [.common]) {
@@ -60,12 +63,13 @@ import UserNotifications
             }
         }.store(in: &cancellables)
         rebuildMenu()
+        updateService.startAutomaticChecks()
         if CommandLine.arguments.contains("--show-settings") { openKeeperSettings() }
     }
 
     // Refresh on every opening; the observation above updates the visible menu when it returns.
     func menuNeedsUpdate(_ menu: NSMenu) { appState.refresh(manual: true, source: "menu_open"); rebuildMenu() }
-    func shutdown() { appState.execution.cancelCurrent() }
+    func shutdown() { updateService.stop(); appState.execution.cancelCurrent() }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
@@ -149,6 +153,7 @@ import UserNotifications
             menu.addItem(quotaItem)
             menu.addItem(.separator())
             row(L10n.text("设置…"), action: #selector(openKeeperSettings)).keyEquivalent = ","
+            versionItem = row(L10n.format("版本 %@", AppVersion.currentString), action: #selector(openAbout))
             row(L10n.text("退出 Codex Keeper"), action: #selector(quitApp)).keyEquivalent = "q"
         }
         host.layoutSubtreeIfNeeded()
@@ -163,6 +168,19 @@ import UserNotifications
         }
         quotaItem.isHidden = summary.quotas.isEmpty
         quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
+        let hasUpdate = updateService.showsMenuUpdateIndicator
+        let versionTitle = MenuVersionTextFormatter.string(version: AppVersion.currentString, hasUpdate: hasUpdate)
+        versionItem?.title = versionTitle
+        versionItem?.attributedTitle = nil
+        if hasUpdate, let image = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: L10n.text("有新版本"))?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.white, .systemGreen])) {
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            attachment.bounds = NSRect(x: 0, y: -2, width: 13, height: 13)
+            let title = NSMutableAttributedString(string: versionTitle + " ", attributes: [.font: NSFont.menuFont(ofSize: 0)])
+            title.append(NSAttributedString(attachment: attachment))
+            versionItem?.attributedTitle = title
+        }
     }
 
     private func makeSummary() -> MenuSummary {
@@ -291,6 +309,18 @@ import UserNotifications
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+    @objc private func openAbout() {
+        if aboutWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 380), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = L10n.text("关于 Codex Keeper")
+            window.contentView = NSHostingView(rootView: AboutView(updateService: updateService))
+            window.center(); window.isReleasedWhenClosed = false
+            window.collectionBehavior.insert(.moveToActiveSpace)
+            aboutWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        aboutWindow?.makeKeyAndOrderFront(nil)
     }
     @objc private func quitApp() { NSApp.terminate(nil) }
 }

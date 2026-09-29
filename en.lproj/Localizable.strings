@@ -236,3 +236,31 @@
 "未选择时，提醒会一直保留，任务不会自动继续。" = "The reminder stays until you choose. This task will not resume automatically.";
 "你已选择「现在继续」。若执行失败，请查看提示后重试。" = "You chose “Continue now”. If it fails, check the execution message and retry.";
 "点击查看任务或调整续跑方式。" = "Click to view the task or change how it resumes.";
+
+/* About, manual updates, and feedback */
+"版本 %@" = "Version %@";
+"版本 %@ · 有新版本" = "Version %@ · Update Available";
+"有新版本" = "Update Available";
+"更新提醒" = "Update Reminders";
+"关于 Codex Keeper" = "About Codex Keeper";
+"软件更新" = "Software Updates";
+"尚未检查更新" = "Updates have not been checked";
+"正在检查更新…" = "Checking for updates…";
+"正在检查…" = "Checking…";
+"检查更新" = "Check for Updates";
+"已是最新版本" = "You're up to date";
+"发现新版本 %@" = "Version %@ is available";
+"当前没有稳定版本" = "No stable release is available";
+"检查更新失败，请稍后重试。" = "Could not check for updates. Try again later.";
+"前往 GitHub 更新" = "View Update on GitHub";
+"支持与反馈" = "Support and Feedback";
+"问题反馈…" = "Report an Issue…";
+"问题反馈" = "Report an Issue";
+"邮件或 GitHub" = "Email or GitHub";
+"发送邮件" = "Send Email";
+"在 GitHub 提交 Issue" = "Open a GitHub Issue";
+"无法打开链接" = "Could Not Open Link";
+"无法打开邮件应用，请手动发送至 %@。" = "Could not open your email app. Send feedback to %@ manually.";
+"无法打开 GitHub，请稍后重试。" = "Could not open GitHub. Try again later.";
+"Codex Keeper 问题反馈" = "Codex Keeper Feedback";
+"应用版本：%@\nmacOS：%@\n芯片：%@\n\n问题描述：\n\n复现步骤：\n1. " = "App version: %@\nmacOS: %@\nChip: %@\n\nIssue description:\n\nSteps to reproduce:\n1. ";
