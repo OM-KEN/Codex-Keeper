@@ -64,6 +64,15 @@ If the official Codex CLI cannot be found, click the error message in the menu, 
 
 </details>
 
+<details>
+<summary>How do I check for updates or report a problem?</summary>
+
+Click the version number below **Settings…** in the menu to open About. It shows the app icon and version, lets you check for updates, and offers feedback by email or GitHub.
+
+Update Reminders are enabled by default. When a newer version is available, **Update Available** and a green up arrow appear after the version number. Open About and select **View Update on GitHub** to download it. You can turn off reminders in About or check manually at any time.
+
+</details>
+
 ## License
 
 This project is open source under the [MIT License](LICENSE). You may use, modify, and distribute it, including for commercial use, provided you retain the copyright and license notice. See the [third-party notices](assets/NOTICE.md) for reused assets.
