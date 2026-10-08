@@ -47,7 +47,7 @@ PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 
 输出为 `.build/CodexKeeper-<VERSION>.dmg`。默认以临时签名分发，不要求 Developer ID 或公证，也不自动使用本机个人开发者证书。`--release` 可用于发布构建，与默认构建使用同一签名策略；设置 `CODE_SIGN_IDENTITY` 可显式选择证书签名。
 
-公开仓库为 [OM-KEN/Codex-Keeper](https://github.com/OM-KEN/Codex-Keeper)。版本来自 `VERSION`；普通修复和现有交互的局部改善发布 patch，有明显新使用场景时发布 minor，不兼容变化发布 major。发布 tag 为 `v<VERSION>`，标题为 `Codex Keeper v<VERSION> (macOS)`，仅上传 `CodexKeeper-<VERSION>.dmg`。正文参考 Copied，按 What's New、Fixes、新功能、修复排列；同类英中内容对应，无该类变化时省略。项目采用根目录 `LICENSE` 中的 MIT 许可；`assets/NOTICE.md` 保留所复用背景和布局的许可。构建时将两者一并放入应用资源。
+公开仓库为 [OM-KEN/Codex-Keeper](https://github.com/OM-KEN/Codex-Keeper)。版本来自 `VERSION`；普通修复和现有交互的局部改善发布 patch，有明显新使用场景时发布 minor，不兼容变化发布 major。发布 tag 为 `v<VERSION>`，标题为 `Codex Keeper v<VERSION> (macOS)`，仅上传 `CodexKeeper-<VERSION>.dmg`。正文面向普通用户，描述实际使用变化，避免协议、认证和日志等实现术语；按 What's New、Fixes、新功能、修复排列，同类英中内容对应，无该类变化时省略。项目采用根目录 `LICENSE` 中的 MIT 许可；`assets/NOTICE.md` 保留所复用背景和布局的许可。构建时将两者一并放入应用资源。
 
 发布前运行回归、构建及 DMG 校验，挂载检查 Finder 背景、图标布局、App 和 Applications 链接，并记录大小及 SHA-256；发布后核对远端提交、tag、稳定版与 Latest 状态，以及唯一 DMG 资产的下载、大小和校验和。提交、推送及发布仍需维护者明确同意。另一台 Mac 的首次安装、登录读取、登录项、保活及续跑验收，以及 macOS 13 真机验证仍待完成。
 
@@ -101,7 +101,7 @@ PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 
 2026-10-04：本地保活修复完成，独立回归 524/524 项通过，macOS 13 arm64 构建及严格临时签名验证通过。覆盖原始漏发时间、十分钟保活与三分钟续跑边界、四轮累计延迟、原节点去重与重启、暂时读取失败恢复、账户与致命错误、取消，以及完整日志轮换。23:39 更新本机 `/Applications/CodexKeeper.app`，23:39:18 确认真实 app-server 额度读取成功；执行日志与尝试记录校验和一致，暂停状态和选择完整保留，仅集合数组的序列化顺序变化。随后仍出现 `connection_failed`，新日志已区分实际额度 RPC 失败与未发请求的冷却；网络具体原因和跨日稳定性尚未确认。本轮未强制发送真实保活或续跑，版本号仍为 0.1.5，未提交、推送或发布。原应用和验证证据位于主项目 `.build/verification/keepalive-recovery-20261004-232906/`。
 
-2026-10-08：连接与菜单状态修复完成，独立回归 573/573 项通过，macOS 13 arm64 构建及严格临时签名验证通过。覆盖可重试 RPC 错误后的同一连接恢复、认证变化与不可读时拒绝重试和旧读数、致命错误关闭连接、真实管道中断后的有界清理，以及临时读取失败、无有效读数和已查看执行失败的菜单状态。本机已安装该实现，真实日志确认暂时上游错误后复用额度专用连接并恢复读取；通知设置中的应用图标已目视确认。保活与连接修复合并纳入 v0.1.6，发布验证记录位于 `.build/release-v0.1.6/`；本轮未强制发送真实保活或续跑消息，跨日稳定性仍待观察。
+2026-10-08：连接与菜单状态修复完成，独立回归 573/573 项通过，macOS 13 arm64 构建及严格临时签名验证通过。覆盖可重试 RPC 错误后的同一连接恢复、认证变化与不可读时拒绝重试和旧读数、致命错误关闭连接、真实管道中断后的有界清理，以及临时读取失败、无有效读数和已查看执行失败的菜单状态。本机现役应用为 v0.1.6，与发布包二进制一致；此前真实日志确认暂时上游错误后复用额度专用连接并恢复读取，通知设置中的应用图标已目视确认。保活与连接修复已随 v0.1.6 发布，发布验证记录位于 `.build/release-v0.1.6/`；本轮未强制发送真实保活或续跑消息，跨日稳定性仍待观察。
 
 ## 现役行为
 
