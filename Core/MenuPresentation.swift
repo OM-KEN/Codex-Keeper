@@ -192,3 +192,143 @@ extension MenuSummary {
         return result
     }
 }
+
+/// Display continuity only. Cached summaries never supply quota or plans to the executor.
+struct MenuPresentation {
+    private struct Configuration: Equatable {
+        let anchorMinutes: Int
+        let autoResume: Bool
+        let earlyRecoveryPolicy: String
+        let choices: ResumeChoices
+        let timeZone: String
+        let day: Date
+    }
+    private struct CachedSummary {
+        let summary: MenuSummary
+        let capturedAt: Date
+        let accountID: String?
+        let plan: NextAction
+        let tasks: [BlockedSession]
+        let availableTasks: [BlockedSession]
+        let choices: ResumeChoices
+    }
+    private var configuration: Configuration?
+    private var cached: CachedSummary?
+    private var executionBase: (summary: MenuSummary, capturedAt: Date?, accountID: String?)?
+    private var wasRunning = false
+    private var wasRefreshing = false
+    private var refreshRequested = false
+    private var showsRefreshFeedback = false
+
+    mutating func requestRefreshFeedback() {
+        refreshRequested = true
+        showsRefreshFeedback = true
+    }
+
+    mutating func build(plan: NextAction?, usage: UsageSnapshot?, schedule: ScheduleEngine,
+                        tasks: [BlockedSession], availableTasks: [BlockedSession], choices: ResumeChoices,
+                        enabled: Bool = true, autoResume: Bool = true, earlyRecoveryPolicy: String = "ask",
+                        confirmations: [ExecutionConfirmation] = [], usageError: String? = nil,
+                        usageErrorIsTransient: Bool = false, sessionError: String? = nil,
+                        running: Bool = false, executionMode: NextActionMode? = nil,
+                        executionFailure: String? = nil, executionFailureIsCurrent: Bool = false,
+                        executionWarning: String? = nil, refreshing: Bool = false,
+                        refreshMessage: String = "", now: Date = Date()) -> MenuSummary {
+        // Notification delivery and retired deadlines do not change the user's action plan.
+        var currentChoices = choices
+        for key in currentChoices.recoveryDecisions?.keys.map({ $0 }) ?? [] {
+            currentChoices.recoveryDecisions?[key]?.notification = .pending
+            currentChoices.recoveryDecisions?[key]?.deadline = nil
+        }
+        var configuredChoices = currentChoices
+        configuredChoices.recoveryDecisions = nil
+        let currentConfiguration = Configuration(anchorMinutes: schedule.anchorMinutes, autoResume: autoResume,
+            earlyRecoveryPolicy: earlyRecoveryPolicy, choices: configuredChoices,
+            timeZone: TimeZone.current.identifier, day: Calendar.current.startOfDay(for: now))
+        let fatalIssue = sessionError != nil || (usageError != nil && !usageErrorIsTransient) || plan?.note == "账户已改变"
+        let changedAccount = usage?.sourceFile == "app-server" && (cached != nil || executionBase != nil) &&
+            usage?.accountID != (cached?.accountID ?? executionBase?.accountID)
+        if !enabled || fatalIssue || changedAccount || configuration != currentConfiguration {
+            cached = nil
+            executionBase = nil
+        }
+        configuration = currentConfiguration
+        let selected = tasks.sorted { $0.episodeKey < $1.episodeKey }
+        let available = availableTasks.sorted { $0.episodeKey < $1.episodeKey }
+        if let previous = cached, previous.tasks != selected || previous.availableTasks != available || previous.choices != currentChoices {
+            cached = nil
+        }
+        if refreshing && !wasRefreshing && !refreshRequested { showsRefreshFeedback = false }
+        defer {
+            wasRunning = running
+            wasRefreshing = refreshing
+            if !refreshing { refreshRequested = false }
+            if !running { executionBase = nil }
+        }
+
+        var summary = enabled ? MenuSummary.build(plan: plan, usage: fatalIssue ? nil : usage,
+            schedule: schedule, tasks: tasks, confirmations: confirmations, now: now) : MenuSummary(headline: "已停用")
+        var capturedAt: Date?
+        var restoredCache = false
+        if enabled && !fatalIssue {
+            if let usage, usage.isFresh(at: now), let plan {
+                // Every real new reading replaces the previous display, including absent or unknown windows.
+                capturedAt = usage.capturedAt
+                cached = CachedSummary(summary: summary, capturedAt: usage.capturedAt, accountID: usage.accountID,
+                    plan: plan, tasks: selected, availableTasks: available, choices: currentChoices)
+            } else if let previous = cached {
+                let syncNotes = ["等待额度同步", "额度已过期，等待实时确认", "等待额度恢复确认", "正在同步窗口状态"]
+                let compatiblePlan = plan.map { syncNotes.contains($0.note) ||
+                    ($0.mode == previous.plan.mode && $0.date == previous.plan.date && $0.note == previous.plan.note) } ?? true
+                if compatiblePlan {
+                    summary = previous.summary; capturedAt = previous.capturedAt
+                    restoredCache = true
+                } else { cached = nil }
+            }
+            if running, !restoredCache, usage?.isFresh(at: now) != true, let previous = executionBase {
+                summary = previous.summary
+                capturedAt = previous.capturedAt
+            }
+        }
+        if enabled, summary.tasks.isEmpty, !availableTasks.isEmpty {
+            summary.tasks = availableTasks.sorted { $0.blockedAt > $1.blockedAt }.prefix(1).map(\.displayName)
+            summary.taskCount = availableTasks.count
+        }
+        if enabled {
+            if running && !wasRunning { executionBase = (summary, capturedAt, cached?.accountID ?? usage?.accountID) }
+            summary.applyIssues(usageError: usageError, sessionError: sessionError, executionFailure: executionFailure,
+                executionAction: executionMode == .resume ? "自动继续" : "保活", usageErrorIsTransient: usageErrorIsTransient,
+                executionFailureIsCurrent: executionFailureIsCurrent)
+            if plan?.note == "账户已改变" {
+                summary.headline = "账户已改变"
+                summary.isSyncing = false
+                summary.hasStatusIssue = true
+            }
+            if running {
+                if let previous = executionBase {
+                    summary.timeline = previous.summary.timeline
+                    summary.tasks = previous.summary.tasks
+                    summary.taskCount = previous.summary.taskCount
+                }
+                summary.headline = executionMode == .resume ? "正在继续" : "正在保活"
+                summary.action = ""; summary.isTime = false; summary.eyebrow = ""; summary.isSyncing = false
+                if let executionWarning {
+                    summary.warning = executionWarning
+                    summary.note = executionWarning
+                    summary.headline = "保活等待中"
+                }
+            } else {
+                summary.applyUsageRefreshState(refreshing: refreshing, error: usageError)
+            }
+        }
+        summary.applyRecoveryReminder(tasks: availableTasks, choices: choices)
+        summary.isRefreshing = refreshing
+        if let capturedAt {
+            let clock = DateFormatter()
+            clock.dateFormat = Calendar.current.isDate(capturedAt, inSameDayAs: now) ? "HH:mm:ss" : L10n.text("M月d日 HH:mm:ss")
+            summary.refreshMessage = L10n.format("上次更新 · %@", clock.string(from: capturedAt))
+        }
+        if showsRefreshFeedback && !refreshMessage.isEmpty { summary.refreshMessage = refreshMessage }
+        return summary
+    }
+}

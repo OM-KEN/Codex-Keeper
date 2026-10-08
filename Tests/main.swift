@@ -962,6 +962,7 @@ import Darwin
         expiredDisplayMenu.applyUsageRefreshState(refreshing: false, error: "暂时连接失败")
         check(!expiredDisplayMenu.isTime && expiredDisplayMenu.quotas.isEmpty && expiredDisplayMenu.statusText == "待同步",
             "expired live readings display waiting for sync without exposing stale quota or plan time")
+        checkSteadyMenuPresentation(check)
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temp) }
@@ -3013,4 +3014,227 @@ final class ReminderTestPing: PingTransport, @unchecked Sendable {
         return after
     }
     func cancel() {}
+}
+
+private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
+    let calendar = Calendar.current
+    let now = calendar.date(from: DateComponents(year: 2026, month: 10, day: 8, hour: 9, minute: 40))!
+    let schedule = ScheduleEngine(anchorMinutes: 480)
+    let start = schedule.nodes(on: now)[0]
+    let reset = start.addingTimeInterval(18000)
+    let live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 20, windowMinutes: 300, resetsAt: reset),
+        weekly: QuotaWindow(usedPercent: 40, windowMinutes: 10080, resetsAt: now.addingTimeInterval(6 * 86400)),
+        capturedAt: now, accountID: "steady-menu-account", sourceFile: "app-server")
+    let task = BlockedSession(id: "steady-task", project: "Fixture", cwd: "/fixture",
+        blockedAt: now.addingTimeInterval(-600), fiveHourResetAt: reset, weeklyResetAt: nil,
+        fileURL: URL(fileURLWithPath: "/fixture/steady-task.jsonl"), title: "仍在继续的任务")
+    let confirmed = ExecutionConfirmation(kind: .keepAlive, actionAt: start,
+        confirmedAt: start.addingTimeInterval(60), windowStart: start)
+    func render(_ presentation: inout MenuPresentation, usage: UsageSnapshot?, time: Date? = nil,
+                tasks: [BlockedSession] = [], available: [BlockedSession]? = nil, choices: ResumeChoices = ResumeChoices(),
+                enabled: Bool = true, autoResume: Bool = true, policy: String = "keepPlan", anchor: Int = 480,
+                plan override: NextAction? = nil, usageError: String? = nil, transient: Bool = false,
+                sessionError: String? = nil, running: Bool = false, mode: NextActionMode? = nil,
+                failure: String? = nil, warning: String? = nil, refreshing: Bool = false, message: String = "",
+                confirmations: [ExecutionConfirmation]? = nil) -> MenuSummary {
+        let at = time ?? now
+        let schedule = ScheduleEngine(anchorMinutes: anchor)
+        let plan = override ?? DecisionEngine(schedule: schedule).plan(now: at, enabled: enabled,
+            autoResume: autoResume, earlyRecoveryPolicy: policy, usage: usage, blocked: tasks)
+        return presentation.build(plan: plan, usage: usage, schedule: schedule, tasks: tasks,
+            availableTasks: available ?? tasks, choices: choices, enabled: enabled, autoResume: autoResume,
+            earlyRecoveryPolicy: policy, confirmations: confirmations ?? [confirmed], usageError: usageError,
+            usageErrorIsTransient: transient, sessionError: sessionError, running: running,
+            executionMode: mode, executionFailure: failure, executionWarning: warning,
+            refreshing: refreshing, refreshMessage: message, now: at)
+    }
+
+    var presentation = MenuPresentation()
+    let shown = render(&presentation, usage: live)
+    for seconds in [20.0, 61.0, 121.0, 300.0] {
+        let syncing = render(&presentation, usage: live, time: now.addingTimeInterval(seconds),
+            usageError: seconds > 60 ? "临时连接失败" : nil, transient: true, refreshing: true)
+        check(syncing.headline == shown.headline && syncing.action == shown.action && syncing.isTime,
+            "continuous background synchronization retains the last valid primary menu time past sixty seconds: \(Int(seconds))")
+        check(syncing.timeline.map(\.date) == shown.timeline.map(\.date) && syncing.quotas.count == shown.quotas.count,
+            "continuous background synchronization retains the timeline and quota blocks: \(Int(seconds))")
+        check(syncing.refreshMessage == shown.refreshMessage && syncing.statusSymbol == shown.statusSymbol,
+            "background refresh preserves the real update timestamp and primary icon: \(Int(seconds))")
+    }
+    check(!live.isFresh(at: now.addingTimeInterval(61)) &&
+        DecisionEngine(schedule: schedule).plan(now: now.addingTimeInterval(61), enabled: true, autoResume: true,
+            earlyRecoveryPolicy: "keepPlan", usage: live, blocked: []).date == nil,
+        "display continuity never extends quota freshness or supplies an executable plan")
+    var invalidated = live; invalidated.capturedAt = .distantPast
+    let afterInvalidation = render(&presentation, usage: invalidated, refreshing: true)
+    check(afterInvalidation.headline == shown.headline && afterInvalidation.timeline.map(\.date) == shown.timeline.map(\.date),
+        "environment-triggered invalidation retains the last displayed valid menu during the next read")
+    var rollout = live; rollout.sourceFile = "rollout.jsonl"; rollout.accountID = nil
+    let fallback = render(&presentation, usage: rollout, time: now.addingTimeInterval(301), usageError: "临时服务失败", transient: true)
+    let missing = render(&presentation, usage: nil, time: now.addingTimeInterval(302), usageError: "临时服务失败", transient: true)
+    check(fallback.headline == shown.headline && missing.headline == shown.headline &&
+        fallback.refreshMessage == shown.refreshMessage && missing.refreshMessage == shown.refreshMessage &&
+        missing.quotas.count == shown.quotas.count,
+        "rollout fallback or missing readings cannot erase or replace the last valid app-server display")
+    var recovered = live; recovered.capturedAt = now.addingTimeInterval(303)
+    recovered.fiveHour?.resetsAt = reset.addingTimeInterval(660); recovered.fiveHour?.usedPercent = 37
+    let updated = render(&presentation, usage: recovered, time: recovered.capturedAt)
+    check(updated.headline == "13:11" && updated.action == "额度重置" && updated.quotas.first?.remaining == 63 &&
+        updated.error.isEmpty && updated.refreshMessage != shown.refreshMessage,
+        "a new valid reading immediately replaces the retained time, quota, timestamp and temporary error")
+    var noWindows = recovered; noWindows.fiveHour = nil; noWindows.weekly = nil
+    noWindows.capturedAt.addTimeInterval(1)
+    let emptyUpdate = render(&presentation, usage: noWindows, time: noWindows.capturedAt)
+    let emptyRetry = render(&presentation, usage: nil, time: noWindows.capturedAt, usageError: "临时服务失败", transient: true)
+    check(emptyUpdate.quotas.isEmpty && emptyUpdate.timeline.isEmpty && !emptyUpdate.isTime &&
+        emptyRetry.quotas.isEmpty && emptyRetry.timeline.isEmpty,
+        "a real reading explicitly without windows replaces the old display and cannot revive it on failure")
+    var unknown = recovered; unknown.fiveHour?.usedPercent = 0; unknown.zeroUseWindowActive = nil
+    let unknownUpdate = render(&presentation, usage: unknown, time: unknown.capturedAt)
+    check(!unknownUpdate.isTime && unknownUpdate.statusText == "待同步" && unknownUpdate.timeline.isEmpty && unknownUpdate.quotas.first?.detail == "—",
+        "a meaningful new unknown-window reading replaces an old confirmed window")
+
+    var first = MenuPresentation()
+    let firstIdle = render(&first, usage: nil)
+    let firstReading = render(&first, usage: nil, refreshing: true)
+    let firstFailure = render(&first, usage: rollout, usageError: "临时连接失败", transient: true)
+    check(firstIdle.statusText == "待同步" && firstReading.statusText == "同步中" && firstFailure.quotas.isEmpty &&
+        firstFailure.timeline.isEmpty && !firstFailure.error.isEmpty,
+        "first launch without any valid display still reports idle, reading and failure states accurately")
+
+    for issue in ["账户认证失败", "接口不兼容", "无效响应"] {
+        var fatal = MenuPresentation(); _ = render(&fatal, usage: live)
+        let failed = render(&fatal, usage: live, usageError: issue)
+        let retry = render(&fatal, usage: nil, usageError: "临时连接失败", transient: true)
+        check(failed.statusSymbol == "exclamationmark.circle" && failed.quotas.isEmpty && !failed.isTime &&
+            retry.quotas.isEmpty && !retry.isTime,
+            "fatal usage errors clear old display and cannot be covered by a later transient retry: \(issue)")
+    }
+    var account = MenuPresentation(); _ = render(&account, usage: live)
+    var switched = invalidated; switched.accountID = "another-account"
+    let changed = render(&account, usage: switched, refreshing: true)
+    check(changed.quotas.isEmpty && changed.timeline.isEmpty && !changed.isTime,
+        "an observed app-server account change clears retained display even before the new account has a fresh reading")
+    var mismatch = MenuPresentation(); _ = render(&mismatch, usage: live)
+    let accountPlan = NextAction(mode: .resume, date: nil, decision: .wait(reason: "账户已改变"), note: "账户已改变")
+    let refused = render(&mismatch, usage: nil, plan: accountPlan, usageError: "临时连接失败", transient: true)
+    check(!refused.isTime && refused.quotas.isEmpty && refused.statusSymbol == "exclamationmark.circle",
+        "an account mismatch in the actual task plan cannot reuse an earlier account's display")
+    var scanner = MenuPresentation(); _ = render(&scanner, usage: live)
+    let scanFailure = render(&scanner, usage: live, sessionError: "任务扫描不兼容")
+    check(!scanFailure.isTime && scanFailure.quotas.isEmpty && scanFailure.statusSymbol == "exclamationmark.circle",
+        "fatal task scanning errors clear retained action display while exposing the current error")
+
+    var stopped = live; stopped.fiveHour?.usedPercent = 100
+    var settings = MenuPresentation(); _ = render(&settings, usage: stopped, tasks: [task])
+    let disabled = render(&settings, usage: stopped, tasks: [task], enabled: false)
+    let reopened = render(&settings, usage: nil, tasks: [task])
+    check(disabled.headline == "已停用" && disabled.quotas.isEmpty && !reopened.isTime && reopened.timeline.isEmpty,
+        "turning Keeper off and on never resurrects the previous cached plan")
+    for setting in 0..<3 {
+        var altered = MenuPresentation(); _ = render(&altered, usage: stopped, tasks: [task])
+        let next = render(&altered, usage: nil, tasks: [task], autoResume: setting != 0,
+            policy: setting == 1 ? "ask" : "keepPlan", anchor: setting == 2 ? 540 : 480)
+        check(!next.isTime && next.timeline.isEmpty && next.action.isEmpty,
+            "changed automatic continuation, policy or schedule settings discard the old action plan: \(setting)")
+    }
+    var selection = MenuPresentation(); _ = render(&selection, usage: stopped, tasks: [task])
+    var deselected = ResumeChoices(); deselected.deselectedEpisodes.insert(task.episodeKey)
+    let unselected = render(&selection, usage: nil, tasks: [], available: [task], choices: deselected)
+    check(!unselected.isTime && unselected.timeline.isEmpty && unselected.tasks == [task.displayName],
+        "changing the task selection clears the previous resume plan while showing the currently available task")
+    var cancellation = MenuPresentation(); _ = render(&cancellation, usage: stopped, tasks: [task])
+    var canceled = ResumeChoices(); canceled.useKeepAlive(for: [task])
+    let afterCancel = render(&cancellation, usage: nil, choices: canceled)
+    check(afterCancel.tasks.isEmpty && afterCancel.timeline.isEmpty && !afterCancel.isTime,
+        "canceling a stop episode cannot retain its old task bubble or continuation node")
+    var changedPlan = MenuPresentation(); _ = render(&changedPlan, usage: live)
+    let differentPlan = NextAction(mode: .keepAlive, date: reset.addingTimeInterval(18000),
+        decision: .wait(reason: "新的计划"), note: "新的计划")
+    let replanned = render(&changedPlan, usage: nil, plan: differentPlan)
+    let replannedRetry = render(&changedPlan, usage: nil)
+    check(!replanned.isTime && replanned.timeline.isEmpty && !replannedRetry.isTime,
+        "a changed meaningful plan cannot be overwritten by the previous display while quota is stale")
+    var nextDay = MenuPresentation(); _ = render(&nextDay, usage: live)
+    let overnight = render(&nextDay, usage: nil, time: now.addingTimeInterval(86400), refreshing: true)
+    check(!overnight.isTime && overnight.timeline.isEmpty && overnight.quotas.isEmpty,
+        "a new calendar day cannot reuse yesterday's today-or-tomorrow labels and action plan")
+
+    var executing = MenuPresentation()
+    let beforeExecution = render(&executing, usage: stopped, tasks: [task])
+    let began = render(&executing, usage: stopped, tasks: [task], running: true, mode: .resume)
+    check(began.headline == "正在继续" && began.timeline.map(\.date) == beforeExecution.timeline.map(\.date) &&
+        began.timeline.first?.kind == .completedKeepAlive && began.timeline.last?.kind == .resume,
+        "starting continuation retains confirmed keep-alive history without marking the running continuation complete")
+    let attempted = render(&executing, usage: invalidated, time: now.addingTimeInterval(61), tasks: [],
+        usageError: "临时连接失败", transient: true, running: true, mode: .resume, refreshing: true)
+    check(attempted.headline == "正在继续" && attempted.timeline.map(\.date) == began.timeline.map(\.date) &&
+        attempted.tasks == began.tasks && attempted.quotas.count == began.quotas.count &&
+        attempted.refreshMessage == began.refreshMessage,
+        "a persisted attempt filtering out the selected task and an invalidated reading retain the executing menu blocks past sixty seconds")
+    var runningLive = live; runningLive.capturedAt = now.addingTimeInterval(62); runningLive.fiveHour?.usedPercent = 9
+    let runningUpdate = render(&executing, usage: runningLive, time: runningLive.capturedAt, running: true, mode: .resume)
+    check(runningUpdate.quotas.first?.remaining == 91 && runningUpdate.timeline.map(\.date) == began.timeline.map(\.date) &&
+        runningUpdate.tasks == began.tasks && runningUpdate.timeline.last?.kind == .resume,
+        "new quota updates during continuation preserve the captured timeline and task without claiming completion")
+    let runningRetry = render(&executing, usage: nil, time: runningLive.capturedAt.addingTimeInterval(61),
+        usageError: "临时连接失败", transient: true, running: true, mode: .resume)
+    check(runningRetry.quotas.first?.remaining == 91 && runningRetry.timeline.map(\.date) == began.timeline.map(\.date) &&
+        runningRetry.tasks == began.tasks && runningRetry.refreshMessage.hasSuffix(String(runningUpdate.refreshMessage.suffix(8))),
+        "a later stale or failed read during execution retains the newest valid quota rather than reverting to the execution-start quota")
+    let finished = render(&executing, usage: runningLive, time: runningLive.capturedAt, mode: .resume)
+    check(finished.headline != "正在继续" && finished.isTime && finished.tasks.isEmpty &&
+        !finished.timeline.contains { $0.kind == .resume },
+        "when execution ends the display immediately returns to the current normal plan without the frozen task")
+    let continuedAt = now.addingTimeInterval(63)
+    var continued = runningLive; continued.capturedAt = continuedAt
+    continued.fiveHour?.resetsAt = continuedAt.addingTimeInterval(18000)
+    let confirmedFinish = render(&executing, usage: continued, time: continuedAt,
+        confirmations: [ExecutionConfirmation(kind: .resume, actionAt: continuedAt,
+            confirmedAt: continuedAt, windowStart: continuedAt)])
+    check(confirmedFinish.timeline.first?.kind == .completedResume && confirmedFinish.tasks.isEmpty && confirmedFinish.isTime,
+        "an actual matching confirmation updates the normal post-execution timeline to completed continuation")
+    var runningAccount = MenuPresentation()
+    _ = render(&runningAccount, usage: stopped, tasks: [task], running: true, mode: .resume)
+    _ = render(&runningAccount, usage: nil, running: true, mode: .resume)
+    let runningChanged = render(&runningAccount, usage: switched, running: true, mode: .resume)
+    check(runningChanged.timeline.isEmpty && runningChanged.quotas.isEmpty && runningChanged.tasks.isEmpty,
+        "account changes during an executing fallback also clear the captured account's timeline and task")
+    var warningState = MenuPresentation()
+    _ = render(&warningState, usage: live, running: true, mode: .keepAlive)
+    let waiting = render(&warningState, usage: nil, running: true, mode: .keepAlive, warning: "本轮仍在等待真实确认")
+    let warningCleared = render(&warningState, usage: nil, running: true, mode: .keepAlive)
+    check(waiting.headline == "保活等待中" && waiting.statusSymbol == "exclamationmark.circle" &&
+        !waiting.timeline.isEmpty && warningCleared.warning.isEmpty && warningCleared.note.isEmpty,
+        "current wait warnings overlay retained history and disappear as soon as the real warning clears")
+    var history = MenuPresentation()
+    let firstHistory = render(&history, usage: live, failure: "旧保活失败")
+    let repeatedHistory = render(&history, usage: live, time: now.addingTimeInterval(61), failure: "旧保活失败")
+    let clearedHistory = render(&history, usage: live, time: now.addingTimeInterval(62))
+    check(firstHistory.note == repeatedHistory.note && clearedHistory.note.isEmpty && clearedHistory.error.isEmpty,
+        "cached bases never accumulate old execution failures or other transient overlays")
+    var reminderState = MenuPresentation()
+    var reminderChoices = ResumeChoices(); reminderChoices.requestRecoveryDecision(for: task, now: now)
+    _ = render(&reminderState, usage: live, tasks: [task], choices: reminderChoices)
+    reminderChoices.recoveryDecisions?[task.episodeKey]?.notification = .delivered
+    let deliveredReminder = render(&reminderState, usage: nil, tasks: [task], choices: reminderChoices,
+        usageError: "临时连接失败", transient: true)
+    check(!deliveredReminder.reminderTitle.isEmpty && !deliveredReminder.quotas.isEmpty,
+        "notification delivery does not clear unchanged action context and the current recovery reminder survives sync failure")
+    let resolvedReminder = render(&reminderState, usage: live)
+    check(resolvedReminder.reminderTitle.isEmpty && resolvedReminder.reminderBody.isEmpty,
+        "resolved recovery reminders never linger in the cached base display")
+
+    var manual = MenuPresentation(); _ = render(&manual, usage: live)
+    manual.requestRefreshFeedback()
+    let clicked = render(&manual, usage: live, refreshing: true, message: "正在刷新额度…")
+    let queued = render(&manual, usage: live, refreshing: true, message: "正在同步，完成后重新读取…")
+    let clickFailure = render(&manual, usage: live, usageError: "临时失败", transient: true,
+        message: "刷新失败，请点击刷新按钮重试。")
+    check(clicked.isRefreshing && clicked.refreshMessage == "正在刷新额度…" &&
+        queued.refreshMessage == "正在同步，完成后重新读取…" && clickFailure.refreshMessage.contains("刷新失败"),
+        "explicit refresh clicks retain immediate, queued and completed feedback for the accessible production view")
+    let automatic = render(&manual, usage: live, refreshing: true, message: "刷新失败，请点击刷新按钮重试。")
+    check(automatic.refreshMessage == shown.refreshMessage && !automatic.refreshMessage.contains("刷新失败"),
+        "a later background read displays the last real update instead of inheriting a previous manual failure message")
 }

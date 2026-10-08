@@ -22,6 +22,7 @@ import UserNotifications
     private var updateScheduled = false
     private var notifiedCurrentPing = false
     private var executionFailureSeen = false
+    private var presentation = MenuPresentation()
     private var cancellables = Set<AnyCancellable>()
 
     func setup() {
@@ -36,7 +37,10 @@ import UserNotifications
             }
         }
         appState.execution.$running.removeDuplicates().sink { [weak self] running in
-            if running { self?.notifiedCurrentPing = false }
+            guard let self else { return }
+            if running { self.notifiedCurrentPing = false }
+            // Capture before persisted attempts remove the executing tasks from the available list.
+            _ = self.makeSummary(running: running)
         }.store(in: &cancellables)
         appState.execution.$lastFailure.sink { [weak self] _ in
             self?.executionFailureSeen = false
@@ -190,43 +194,20 @@ import UserNotifications
         }
     }
 
-    private func makeSummary() -> MenuSummary {
+    private func makeSummary(running: Bool? = nil) -> MenuSummary {
         let defaults = UserDefaults.standard
-        guard defaults.bool(forKey: "enabled") else {
-            var summary = MenuSummary(headline: "已停用")
-            summary.isRefreshing = appState.usage.refreshing
-            summary.refreshMessage = appState.usage.refreshMessage
-            summary.applyRecoveryReminder(tasks: appState.availableTasks, choices: appState.choices)
-            return summary
-        }
-        var summary = MenuSummary.build(plan: appState.nextAction, usage: appState.usage.snapshot,
-            schedule: appState.schedule, tasks: appState.selectedTasks, confirmations: appState.execution.confirmations)
-        if summary.tasks.isEmpty, !appState.availableTasks.isEmpty {
-            summary.tasks = Array(appState.availableTasks.sorted { $0.blockedAt > $1.blockedAt }.prefix(1).map(\.displayName))
-            summary.taskCount = appState.availableTasks.count
-        }
-        summary.applyIssues(usageError: appState.usage.lastError, sessionError: appState.sessions.detectionError,
+        return presentation.build(plan: appState.nextAction, usage: appState.usage.snapshot,
+            schedule: appState.schedule, tasks: appState.selectedTasks, availableTasks: appState.availableTasks,
+            choices: appState.choices, enabled: defaults.bool(forKey: "enabled"), autoResume: defaults.bool(forKey: "autoResume"),
+            earlyRecoveryPolicy: defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask",
+            confirmations: appState.execution.confirmations,
+            usageError: appState.usage.lastError, usageErrorIsTransient: appState.usage.lastErrorIsTransient,
+            sessionError: appState.sessions.detectionError,
+            running: running ?? appState.execution.running, executionMode: appState.execution.activeMode,
             executionFailure: appState.execution.lastFailure,
-            executionAction: appState.execution.activeMode == .resume ? "自动继续" : "保活",
-            usageErrorIsTransient: appState.usage.lastErrorIsTransient,
-            executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil)
-        if !appState.execution.running {
-            summary.applyUsageRefreshState(refreshing: appState.usage.refreshing, error: appState.usage.lastError)
-        }
-        if appState.execution.running {
-            summary.headline = appState.execution.activeMode == .resume ? "正在继续" : "正在保活"
-            summary.action = ""; summary.isTime = false
-            summary.timeline = []; summary.eyebrow = ""; summary.isSyncing = false
-            if let warning = appState.execution.warning {
-                summary.warning = warning
-                summary.note = warning
-                summary.headline = "保活等待中"
-            }
-        }
-        summary.applyRecoveryReminder(tasks: appState.availableTasks, choices: appState.choices)
-        summary.isRefreshing = appState.usage.refreshing
-        summary.refreshMessage = appState.usage.refreshMessage
-        return summary
+            executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil,
+            executionWarning: appState.execution.warning,
+            refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage)
     }
 
     @objc private func showExecutionIssue() {
@@ -264,6 +245,7 @@ import UserNotifications
         cliPathWindow?.makeKeyAndOrderFront(nil)
     }
     private func refreshUsage() {
+        presentation.requestRefreshFeedback()
         appState.refresh(manual: true, source: "button")
         rebuildMenu()
     }

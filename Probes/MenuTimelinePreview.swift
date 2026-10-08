@@ -24,7 +24,9 @@ import AppKit
         func summary(_ quota: UsageSnapshot, tasks: [BlockedSession] = [], time: Date? = nil) -> MenuSummary {
             let current = time ?? now
             let plan = DecisionEngine(schedule: schedule).plan(now: current, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: quota, blocked: tasks)
-            return MenuSummary.build(plan: plan, usage: quota, schedule: schedule, tasks: tasks, now: current)
+            var presentation = MenuPresentation()
+            return presentation.build(plan: plan, usage: quota, schedule: schedule, tasks: tasks,
+                availableTasks: tasks, choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan", now: current)
         }
         let current = task("Codex Keeper")
         let offPlan = summary(usage(at(13, 5)))
@@ -35,9 +37,56 @@ import AppKit
         let completedUsage = usage(at(13, 5))
         let completedPlan = DecisionEngine(schedule: schedule).plan(now: now, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: completedUsage, blocked: [])
         let completed = MenuSummary.build(plan: completedPlan, usage: completedUsage, schedule: schedule, tasks: [], confirmations: [ExecutionConfirmation(kind: .resume, actionAt: at(8, 5), confirmedAt: at(9), windowStart: nil)], now: now)
-        var running = stopped; running.headline = "正在继续"; running.action = ""; running.isTime = false; running.timeline = []
-        running.eyebrow = ""
-        var failed = stopped; failed.error = "连接失败，请检查 Codex 登录状态"
+        var executionPresentation = MenuPresentation()
+        let resumeQuota = usage(at(13, 5), used: 100)
+        let resumePlan = DecisionEngine(schedule: schedule).plan(now: now, enabled: true, autoResume: true,
+            earlyRecoveryPolicy: "keepPlan", usage: resumeQuota, blocked: [current])
+        let history = ExecutionConfirmation(kind: .keepAlive, actionAt: at(8, 5), confirmedAt: at(8, 6), windowStart: at(8, 5))
+        let running = executionPresentation.build(plan: resumePlan, usage: resumeQuota, schedule: schedule,
+            tasks: [current], availableTasks: [current], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan",
+            confirmations: [history], running: true, executionMode: .resume, now: now)
+        var invalidated = resumeQuota; invalidated.capturedAt = .distantPast
+        let filteredTime = now.addingTimeInterval(61)
+        let filteredPlan = DecisionEngine(schedule: schedule).plan(now: filteredTime, enabled: true, autoResume: true,
+            earlyRecoveryPolicy: "keepPlan", usage: invalidated, blocked: [])
+        let runningAfterAttempt = executionPresentation.build(plan: filteredPlan, usage: invalidated, schedule: schedule,
+            tasks: [], availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan",
+            usageError: "无法连接 Codex 服务，请检查网络或代理后重新同步。", usageErrorIsTransient: true,
+            running: true, executionMode: .resume, refreshing: true, now: filteredTime)
+        let executingQuota = usage(at(14, 41), used: 9, time: now.addingTimeInterval(62))
+        let executingPlan = DecisionEngine(schedule: schedule).plan(now: executingQuota.capturedAt, enabled: true, autoResume: true,
+            earlyRecoveryPolicy: "keepPlan", usage: executingQuota, blocked: [])
+        let runningUpdate = executionPresentation.build(plan: executingPlan, usage: executingQuota, schedule: schedule,
+            tasks: [], availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan",
+            running: true, executionMode: .resume, now: executingQuota.capturedAt)
+        let runningRetry = executionPresentation.build(plan: filteredPlan, usage: nil, schedule: schedule,
+            tasks: [], availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan",
+            usageError: "无法连接 Codex 服务，请检查网络或代理后重新同步。", usageErrorIsTransient: true,
+            running: true, executionMode: .resume, now: now.addingTimeInterval(124))
+        let finishedQuota = usage(at(14, 41), used: 5, time: now.addingTimeInterval(125))
+        let finishedPlan = DecisionEngine(schedule: schedule).plan(now: finishedQuota.capturedAt, enabled: true, autoResume: true,
+            earlyRecoveryPolicy: "keepPlan", usage: finishedQuota, blocked: [])
+        let finished = executionPresentation.build(plan: finishedPlan, usage: finishedQuota, schedule: schedule,
+            tasks: [], availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan",
+            confirmations: [ExecutionConfirmation(kind: .resume, actionAt: at(9, 41),
+                confirmedAt: finishedQuota.capturedAt, windowStart: at(9, 41))], now: finishedQuota.capturedAt)
+        var continuity = MenuPresentation()
+        let stableQuota = usage(at(13))
+        let stablePlan = DecisionEngine(schedule: schedule).plan(now: now, enabled: true, autoResume: true,
+            earlyRecoveryPolicy: "keepPlan", usage: stableQuota, blocked: [])
+        let stable = continuity.build(plan: stablePlan, usage: stableQuota, schedule: schedule, tasks: [],
+            availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan",
+            confirmations: [ExecutionConfirmation(kind: .keepAlive, actionAt: at(8), confirmedAt: at(8, 1), windowStart: at(8))], now: now)
+        let syncing = continuity.build(plan: filteredPlan, usage: stableQuota, schedule: schedule, tasks: [],
+            availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan", refreshing: true, now: filteredTime)
+        let temporaryFailure = continuity.build(plan: filteredPlan, usage: nil, schedule: schedule, tasks: [],
+            availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan",
+            usageError: "无法连接 Codex 服务，请检查网络或代理后重新同步。", usageErrorIsTransient: true, now: filteredTime)
+        continuity.requestRefreshFeedback()
+        let queued = continuity.build(plan: filteredPlan, usage: nil, schedule: schedule, tasks: [],
+            availableTasks: [], choices: ResumeChoices(), earlyRecoveryPolicy: "keepPlan", refreshing: true,
+            refreshMessage: L10n.text("正在同步，完成后重新读取…"), now: filteredTime)
+        var failed = stopped; failed.error = "无法连接 Codex 服务，请检查网络或代理后重新同步。"
         var unknown = usage(at(13, 5), used: 0); unknown.zeroUseWindowActive = nil
         let pages: [(String, [(String, MenuSummary)])] = [
             ("01-plans", [
@@ -63,6 +112,19 @@ import AppKit
                 ("已停用", MenuSummary(headline: "已停用")),
                 ("正在执行", running),
                 ("执行异常 · 才展示原因", failed)
+            ]),
+            ("04-continuity", [
+                ("上次已确认保活的正常状态", stable),
+                ("后台超过 60 秒仍在同步", syncing),
+                ("临时失败 · 保留上次信息", temporaryFailure),
+                ("执行已记录尝试 · 任务被过滤后", runningAfterAttempt),
+                ("点击刷新 · 明确排队反馈", queued),
+                ("执行结束 · 新状态立即替换", finished)
+            ]),
+            ("05-execution-updates", [
+                ("执行开始 · 原额度已耗尽", runningAfterAttempt),
+                ("执行中 · 收到新额度", runningUpdate),
+                ("再次暂时失败 · 保留最新额度", runningRetry)
             ])
         ]
         let folder = URL(fileURLWithPath: ".build/timeline-preview")
@@ -99,6 +161,6 @@ import AppKit
             host.cacheDisplay(in: host.bounds, to: bitmap)
             try bitmap.representation(using: .png, properties: [:])!.write(to: folder.appendingPathComponent(name + ".png"))
         }
-        print("Rendered 18 production-view scenarios to \(folder.path)")
+        print("Rendered \(pages.reduce(0) { $0 + $1.1.count }) production-view scenarios to \(folder.path)")
     }
 }
