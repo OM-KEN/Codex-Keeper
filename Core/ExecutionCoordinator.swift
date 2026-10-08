@@ -59,7 +59,7 @@ import Darwin
 
     func ping(schedule: ScheduleEngine, accountID: String?, ignoredEpisodes: Set<String> = [], hasPending: @escaping () -> Bool) {
         guard ledgerHealthy, defaults.bool(forKey: "enabled"),
-              !running, let node = schedule.currentNode(at: now()), let accountID else { return }
+              !running, let node = schedule.currentKeepAliveNode(at: now()), let accountID else { return }
         let key = "ping:\(accountID):\(node.timeIntervalSince1970)"
         guard !attempts.contains(key) else { return }
         let operation = generation
@@ -83,7 +83,8 @@ import Darwin
                 let blocked = try await Task.detached { try SessionWatcher.freshBlockedSessions(codexHome: self.codexHome) }.value
                 guard blocked.allSatisfy({ ignoredEpisodes.contains($0.episodeKey) }), !hasPending(), operation == generation,
                       defaults.bool(forKey: "enabled"), before.isFresh(at: now()),
-                      schedule.currentNode(at: now()) == node else { throw CodexConnectionError.server("保活条件已改变，等待重新确认") }
+                      (defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480) == schedule.anchorMinutes,
+                      schedule.currentKeepAliveNode(at: now()) == node else { throw CodexConnectionError.server("保活条件已改变，等待重新确认") }
                 attempts.insert(key)
                 try FileManager.default.createDirectory(at: ledgerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try JSONEncoder().encode(Array(attempts)).write(to: ledgerURL, options: .atomic)
@@ -95,7 +96,7 @@ import Darwin
                         try? events.record("diagnostic", kind: "ping", node: node, diagnostic: diagnostic)
                         Task { @MainActor in
                             guard self.running, self.generation == operation else { return }
-                            self.warning = diagnostic.outcome == "waiting" ? diagnostic.warning : nil
+                            self.warning = diagnostic.outcome == "waiting" && diagnostic.elapsedSeconds >= diagnostic.warningSeconds ? diagnostic.warning : nil
                         }
                     }
                 }.value

@@ -9,7 +9,7 @@ struct PingTiming {
 
 enum PingFailureReason: String, Codable {
     case unknown, requestTimeout = "request_timeout", connection, proxy, server
-    case configuration, processExit = "process_exit", quotaRead = "quota_read", cancelled
+    case configuration, processExit = "process_exit", quotaRead = "quota_read", accountChanged = "account_changed", cancelled
 }
 
 /// Only allowlisted classifications leave the in-memory runtime log reader.
@@ -47,10 +47,14 @@ struct PingDiagnostic: Codable {
     var taskCompleted = false
     var windowConfirmed = false
     var outcome = "waiting"
+    var quotaReadFailure: UsageReadDiagnostic?
 
     var warning: String {
         let prefix: String
-        if okReceived { prefix = taskCompleted ? L10n.text("已收到 OK，仍在确认 5 小时窗口") : L10n.text("已收到 OK，仍在等待任务完成") }
+        if okReceived {
+            prefix = taskCompleted ? (quotaReadFailure == nil ? L10n.text("已收到 OK，仍在确认 5 小时窗口") :
+                L10n.text("已收到 OK，额度暂时读取失败，仍在确认 5 小时窗口")) : L10n.text("已收到 OK，仍在等待任务完成")
+        }
         else {
             switch reason {
             case .requestTimeout: prefix = L10n.text("保活请求超时，Codex 正在重试")
@@ -66,7 +70,8 @@ struct PingDiagnostic: Codable {
         switch reason {
         case .configuration: return L10n.text("保活未发送：Codex 无法读取保活配置")
         case .processExit: return L10n.text("保活进程提前退出，未确认新窗口；本轮不再重试")
-        case .quotaRead: return L10n.text("保活额度读取失败，无法核实新窗口；本轮不再重试")
+        case .quotaRead: return L10n.text("保活已发送，但额度读取失败，未确认新窗口；本轮不再重试")
+        case .accountChanged: return L10n.text("保活账户已改变，停止确认新窗口；本轮不再重试")
         case .cancelled: return L10n.text("保活已停止，未确认新窗口；本轮不再重试")
         default:
             let detail = okReceived ? (taskCompleted ? L10n.text("已收到 OK，但未确认新窗口") : L10n.text("已收到 OK，但任务尚未确认完成")) :

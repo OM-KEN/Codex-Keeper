@@ -42,7 +42,8 @@ struct DecisionEngine {
         let five = usage.fiveHour
         let exhausted = [five, usage.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
         let blockingReset = exhausted.map { $0.resetsAt }.max()
-        let atNode = schedule.currentNode(at: now, calendar: calendar) != nil
+        let atNode = (target == nil ? schedule.currentKeepAliveNode(at: now, calendar: calendar) :
+            schedule.currentNode(at: now, calendar: calendar)) != nil
         let nextNode = schedule.nextNode(after: now, calendar: calendar)
         if let target {
             if target.fiveHourResetAt != nil && five == nil || target.weeklyResetAt != nil && usage.weekly == nil {
@@ -76,14 +77,14 @@ struct DecisionEngine {
         }
         if let reset = blockingReset {
             guard reset > now else { return wait("等待额度恢复确认") }
-            return wait("额度恢复后按计划保活", at: schedule.firstNode(onOrAfter: reset, calendar: calendar))
+            return wait("额度恢复后按计划保活", at: schedule.firstKeepAliveNode(onOrAfter: reset, calendar: calendar))
         }
         guard let five else { return wait("当前无需保活") }
         guard let active = usage.activeFiveHourWindow else { return wait("正在同步窗口状态") }
         if atNode && !active {
             return NextAction(mode: .keepAlive, date: now, decision: .ping(reason: "计划节点，当前无窗口"), note: "")
         }
-        let date = schedule.firstNode(onOrAfter: active ? five.resetsAt : nextNode, calendar: calendar)
+        let date = schedule.firstKeepAliveNode(onOrAfter: active ? five.resetsAt : nextNode, calendar: calendar)
         return NextAction(mode: .keepAlive, date: date,
             decision: atNode ? .skip(reason: "已有有效 5 小时窗口") : .wait(reason: "等待下一可行计划节点"), note: "")
     }

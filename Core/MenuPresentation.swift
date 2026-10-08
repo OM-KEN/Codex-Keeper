@@ -9,6 +9,7 @@ struct MenuSummary {
     var note = ""
     var error = ""
     var warning = ""
+    var hasStatusIssue = false
     var isTime = false
     var isSyncing = false
     var isRefreshing = false
@@ -30,28 +31,36 @@ struct MenuSummary {
         reminderBody = first.0.displayName + "\n" + first.1.message
     }
 
-    var statusText: String { isTime ? [statusDatePrefix, headline].filter { !$0.isEmpty }.joined(separator: " ") : headline == "等待续跑决定" ? L10n.text("待决定") : "–" }
-    mutating func applyIssues(usageError: String?, sessionError: String?, executionFailure: String?, executionAction: String) {
-        error = usageError ?? sessionError ?? ""
-        if error.isEmpty, let executionFailure {
+    var statusText: String {
+        if isTime { return [statusDatePrefix, headline].filter { !$0.isEmpty }.joined(separator: " ") }
+        if headline == "等待续跑决定" { return L10n.text("待决定") }
+        if headline == "待同步" { return L10n.text("待同步") }
+        if isSyncing { return L10n.text("同步中") }
+        return "–"
+    }
+    mutating func applyIssues(usageError: String?, sessionError: String?, executionFailure: String?, executionAction: String,
+                             usageErrorIsTransient: Bool = false, executionFailureIsCurrent: Bool = false) {
+        error = [sessionError, usageError].compactMap { $0 }.joined(separator: "\n")
+        hasStatusIssue = sessionError != nil || (usageError != nil && !usageErrorIsTransient)
+        if let executionFailure {
             let previous = L10n.format("上次%@失败：%@", L10n.text(executionAction), executionFailure)
             note = [note, previous].filter { !$0.isEmpty }.joined(separator: "\n")
-            warning = previous
+            if executionFailureIsCurrent { warning = previous }
         }
     }
     mutating func applyUsageRefreshState(refreshing: Bool, error: String?) {
-        guard isSyncing, error != nil else { return }
-        if refreshing {
-            note = "正在重新同步额度…"
-        } else {
-            headline = "同步失败"; action = ""; isSyncing = false
-            note = "网络恢复后打开菜单，或点击“重新同步”重试。"
+        guard isSyncing else { return }
+        headline = refreshing ? "正在同步" : "待同步"
+        action = ""; isSyncing = refreshing
+        if error != nil {
+            let syncNote = refreshing ? "正在重新同步额度…" : "网络恢复后打开菜单，或点击“重新同步”重试。"
+            note = [note, syncNote].filter { !$0.isEmpty }.joined(separator: "\n")
         }
     }
     var statusSymbol: String {
         if headline == "已停用" { return "pause.circle" }
-        if !error.isEmpty || !warning.isEmpty { return "exclamationmark.circle" }
-        if isSyncing { return "arrow.triangle.2.circlepath" }
+        if hasStatusIssue || !warning.isEmpty { return "exclamationmark.circle" }
+        if isSyncing || headline == "待同步" { return "arrow.triangle.2.circlepath" }
         switch action.isEmpty ? headline : action {
         case "保持活动", "正在保活": return "waveform.path.ecg"
         case "自动继续", "正在继续": return "paperplane"
@@ -129,9 +138,20 @@ extension MenuSummary {
             result.tasks = tasks.sorted { $0.blockedAt > $1.blockedAt }.prefix(1).map(\.displayName)
             result.taskCount = tasks.count
         }
+        func confirmation(for start: Date) -> ExecutionConfirmation? {
+            confirmations.filter {
+                $0.confirmedAt <= now && abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(start)) <= ScheduleEngine.alignmentTolerance
+            }.max { $0.confirmedAt < $1.confirmedAt }
+        }
         if let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now {
             let start = five.resetsAt.addingTimeInterval(-Double(five.windowMinutes) * 60)
-            result.badge = schedule.currentNode(at: start) != nil ? "计划内" : "计划外"
+            let confirmed = confirmation(for: start)
+            let confirmedOnPlan = confirmed?.kind == .keepAlive && confirmed.flatMap {
+                schedule.currentKeepAliveNode(at: $0.actionAt)
+            } != nil
+            let windowOnPlan = (confirmed?.kind ?? plan.mode) == .keepAlive ? schedule.currentKeepAliveNode(at: start) != nil :
+                schedule.currentNode(at: start) != nil
+            result.badge = windowOnPlan || confirmedOnPlan ? "计划内" : "计划外"
             if result.badge == "计划外", plan.mode != .resume {
                 result.headline = clock.string(from: five.resetsAt)
                 result.statusDatePrefix = Calendar.current.isDate(five.resetsAt, inSameDayAs: now) ? "" : dayText(five.resetsAt)
@@ -151,9 +171,7 @@ extension MenuSummary {
                 let start = five.resetsAt.addingTimeInterval(-Double(five.windowMinutes) * 60)
                 if start <= now {
                     // Only a confirmed operation matching this real window can claim completion.
-                    let confirmed = confirmations.filter {
-                        $0.confirmedAt <= now && abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(start)) <= ScheduleEngine.alignmentTolerance
-                    }.max { $0.confirmedAt < $1.confirmedAt }
+                    let confirmed = confirmation(for: start)
                     let kind: MenuTimelinePoint.Kind = confirmed.map { $0.kind == .resume ? .completedResume : .completedKeepAlive } ?? .start
                     result.timeline.append(point(start, confirmed.map { $0.kind == .resume ? "已继续" : "已保活" } ?? "开始", kind))
                     if abs(actionDate.timeIntervalSince(five.resetsAt)) < ScheduleEngine.alignmentTolerance {

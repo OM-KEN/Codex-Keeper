@@ -77,8 +77,8 @@ final class PTYPingTransport: PingTransport {
         lock.lock(); cancelled = true; let process = active; lock.unlock()
         if let process, process.isRunning {
             process.terminate()
-            let end = Date().addingTimeInterval(1)
-            while process.isRunning && Date() < end { usleep(10000) }
+            let end = ProcessInfo.processInfo.systemUptime + 1
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < end { usleep(10000) }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
     }
@@ -137,8 +137,8 @@ final class PTYPingTransport: PingTransport {
         process.standardError = terminal
         defer {
             if process.isRunning { process.terminate() }
-            let end = Date().addingTimeInterval(1)
-            while process.isRunning && Date() < end { usleep(10000) }
+            let end = ProcessInfo.processInfo.systemUptime + 1
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < end { usleep(10000) }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
             try? terminal.close()
             Darwin.close(master)
@@ -152,6 +152,7 @@ final class PTYPingTransport: PingTransport {
         var nextRead = timing.pollInterval
         var terminalOutput = Data()
         var lastWarning: String?
+        var lastReadFailure: UsageReadDiagnostic?
         var diagnostic = PingDiagnostic(elapsedSeconds: 0, warningSeconds: timing.warning, timeoutSeconds: timing.timeout)
         func refreshDiagnostic() {
             diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
@@ -177,7 +178,9 @@ final class PTYPingTransport: PingTransport {
             lock.lock(); let stopped = cancelled; lock.unlock()
             if stopped { refreshDiagnostic(); try fail(.cancelled) }
             var descriptor = pollfd(fd: master, events: Int16(POLLIN), revents: 0)
-            if poll(&descriptor, 1, 100) > 0 {
+            if !process.isRunning {
+                Thread.sleep(forTimeInterval: min(0.1, max(0, timing.timeout - (ProcessInfo.processInfo.systemUptime - startedUptime))))
+            } else if poll(&descriptor, 1, 100) > 0 {
                 var bytes = [UInt8](repeating: 0, count: 8192)
                 let count = Darwin.read(master, &bytes, bytes.count)
                 if count > 0 {
@@ -188,19 +191,34 @@ final class PTYPingTransport: PingTransport {
             }
             let elapsed = ProcessInfo.processInfo.systemUptime - startedUptime
             let exited = !process.isRunning
-            if elapsed >= nextRead || exited || (lastWarning == nil && elapsed >= timing.warning) {
+            if elapsed >= nextRead || (exited && (diagnostic.threadID == nil || !diagnostic.taskCompleted)) || (lastWarning == nil && elapsed >= timing.warning) {
                 refreshDiagnostic()
                 // Publish the warning before a potentially slow quota query.
                 if diagnostic.elapsedSeconds >= timing.warning, lastWarning != diagnostic.warning {
                     lastWarning = diagnostic.warning; progress(diagnostic)
                 }
-                if diagnostic.threadID != nil, diagnostic.taskCompleted {
-                    let after: UsageSnapshot
-                    do { after = try provider.read() }
-                    catch { try fail(.quotaRead) }
+                if diagnostic.threadID != nil, diagnostic.taskCompleted,
+                   ProcessInfo.processInfo.systemUptime - startedUptime < timing.timeout {
+                    let readStarted = ProcessInfo.processInfo.systemUptime
+                    let after: UsageSnapshot?
+                    do { after = try provider.read(); diagnostic.quotaReadFailure = nil; lastReadFailure = nil }
+                    catch {
+                        lock.lock(); let stoppedAfterError = cancelled; lock.unlock()
+                        if stoppedAfterError { refreshDiagnostic(); try fail(.cancelled) }
+                        let failure = UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - readStarted)
+                        diagnostic.quotaReadFailure = failure
+                        if failure.reason == "account_changed" { try fail(.accountChanged) }
+                        guard UsageReadFailure.canRetry(error) else { try fail(.quotaRead) }
+                        if !failure.sameFailure(as: lastReadFailure) {
+                            diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
+                            progress(diagnostic); lastReadFailure = failure
+                        }
+                        after = nil
+                    }
                     lock.lock(); let stoppedAfterRead = cancelled; lock.unlock()
                     if stoppedAfterRead { refreshDiagnostic(); try fail(.cancelled) }
-                    if PingConfirmation.accepts(before: before, after: after, now: Date()) {
+                    if let after, after.accountID != before.accountID { try fail(.accountChanged) }
+                    if let after, PingConfirmation.accepts(before: before, after: after, now: Date()) {
                         diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
                         diagnostic.windowConfirmed = true; diagnostic.outcome = "confirmed"
                         progress(diagnostic)
@@ -209,12 +227,12 @@ final class PTYPingTransport: PingTransport {
                 }
                 nextRead = ProcessInfo.processInfo.systemUptime - startedUptime + timing.pollInterval
             }
-            if exited {
+            if exited && (diagnostic.threadID == nil || !diagnostic.taskCompleted) {
                 if String(decoding: terminalOutput, as: UTF8.self).contains("Error loading config.toml") { try fail(.configuration) }
                 try fail(.processExit)
             }
         }
         refreshDiagnostic()
-        try fail()
+        try fail(diagnostic.quotaReadFailure == nil ? nil : .quotaRead)
     }
 }

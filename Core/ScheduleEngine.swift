@@ -5,8 +5,10 @@ import Foundation
 /// 节点不是瞬间：reset 漂移几十秒仍属同一轮（宽限区，§4）。
 /// 日锚点保护区 = 下一日锚点 - 5h 起（§20），防止新窗口跨过锚点。
 struct ScheduleEngine {
-    /// 节点后的三分钟仍属同一轮，容纳额度确认、发送和窗口建立的累积延迟。
+    /// 自动续跑保留节点后的三分钟宽限。
     static let alignmentTolerance: TimeInterval = 180
+    /// 保活容纳四轮窗口建立及额度核实的累计延迟；超过十分钟不补发。
+    static let keepAliveTolerance: TimeInterval = 600
     /// 5h 窗口时长
     static let windowDuration: TimeInterval = 5 * 3600
 
@@ -36,6 +38,11 @@ struct ScheduleEngine {
         return adjacentNodes(at: date, calendar: calendar).first { $0 >= date } ?? date
     }
 
+    func firstKeepAliveNode(onOrAfter date: Date, calendar: Calendar = .current) -> Date {
+        if currentKeepAliveNode(at: date, calendar: calendar) != nil { return date }
+        return adjacentNodes(at: date, calendar: calendar).first { $0 >= date } ?? date
+    }
+
     private func adjacentNodes(at now: Date, calendar: Calendar) -> [Date] {
         (-1...1).flatMap { offset in
             nodes(on: calendar.date(byAdding: .day, value: offset, to: now) ?? now, calendar: calendar)
@@ -44,8 +51,16 @@ struct ScheduleEngine {
 
     /// Grace is only after a node: never launch a request before the user's time.
     func currentNode(at now: Date = Date(), calendar: Calendar = .current) -> Date? {
+        currentNode(at: now, calendar: calendar, tolerance: Self.alignmentTolerance)
+    }
+
+    func currentKeepAliveNode(at now: Date = Date(), calendar: Calendar = .current) -> Date? {
+        currentNode(at: now, calendar: calendar, tolerance: Self.keepAliveTolerance)
+    }
+
+    private func currentNode(at now: Date, calendar: Calendar, tolerance: TimeInterval) -> Date? {
         adjacentNodes(at: now, calendar: calendar).last {
-            now >= $0 && now.timeIntervalSince($0) <= Self.alignmentTolerance
+            now >= $0 && now.timeIntervalSince($0) <= tolerance
         }
     }
 

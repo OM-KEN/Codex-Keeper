@@ -21,6 +21,7 @@ import UserNotifications
     private let updateService = AppUpdateService()
     private var updateScheduled = false
     private var notifiedCurrentPing = false
+    private var executionFailureSeen = false
     private var cancellables = Set<AnyCancellable>()
 
     func setup() {
@@ -36,6 +37,9 @@ import UserNotifications
         }
         appState.execution.$running.removeDuplicates().sink { [weak self] running in
             if running { self?.notifiedCurrentPing = false }
+        }.store(in: &cancellables)
+        appState.execution.$lastFailure.sink { [weak self] _ in
+            self?.executionFailureSeen = false
         }.store(in: &cancellables)
         appState.execution.$warning.receive(on: DispatchQueue.main).sink { [weak self] warning in
             guard let self, let warning, self.appState.execution.running,
@@ -68,7 +72,10 @@ import UserNotifications
     }
 
     // Refresh on every opening; the observation above updates the visible menu when it returns.
-    func menuNeedsUpdate(_ menu: NSMenu) { appState.refresh(manual: true, source: "menu_open"); rebuildMenu() }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        executionFailureSeen = true
+        appState.refresh(manual: true, source: "menu_open"); rebuildMenu()
+    }
     func shutdown() { updateService.stop(); appState.execution.cancelCurrent() }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -200,12 +207,11 @@ import UserNotifications
         }
         summary.applyIssues(usageError: appState.usage.lastError, sessionError: appState.sessions.detectionError,
             executionFailure: appState.execution.lastFailure,
-            executionAction: appState.execution.activeMode == .resume ? "自动继续" : "保活")
+            executionAction: appState.execution.activeMode == .resume ? "自动继续" : "保活",
+            usageErrorIsTransient: appState.usage.lastErrorIsTransient,
+            executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil)
         if !appState.execution.running {
             summary.applyUsageRefreshState(refreshing: appState.usage.refreshing, error: appState.usage.lastError)
-            if appState.usage.snapshot?.isFresh(at: Date()) != true, let error = appState.usage.lastError {
-                summary.error = error
-            }
         }
         if appState.execution.running {
             summary.headline = appState.execution.activeMode == .resume ? "正在继续" : "正在保活"

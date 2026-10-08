@@ -55,7 +55,9 @@ final class UsageObserver: ObservableObject {
     private var timer: Timer?
     private var pendingManualSource: String?
     private var requestID: String?
-    private var lastErrorReason: String?
+    private var lastReadFailure: UsageReadDiagnostic?
+
+    var lastErrorIsTransient: Bool { lastReadFailure?.isTransient == true }
 
     init(codexHome: URL = CodexEnvironment.home, provider: UsageProvider = AppServerUsageProvider(), logURL: URL? = nil) {
         self.provider = provider
@@ -108,26 +110,21 @@ final class UsageObserver: ObservableObject {
         let provider = provider
         let home = codexHome
         Task {
-            let result = await Task.detached { () -> (UsageSnapshot?, String?, String?) in
+            let result = await Task.detached { () -> (UsageSnapshot?, String?, UsageReadDiagnostic?) in
                 do { return (try (manual ? provider.readForUserRefresh() : provider.read()), nil, nil) }
                 catch {
-                    let reason: String
-                    switch error {
-                    case CodexConnectionError.timeout: reason = "request_timeout"
-                    case CodexConnectionError.ended: reason = "connection_ended"
-                    case CodexConnectionError.unavailable: reason = "cli_unavailable"
-                    case CodexConnectionError.invalidResponse: reason = "invalid_response"
-                    case CodexConnectionError.server(let message): reason = CodexConnectionError.serverFailureReason(message)
-                    default: reason = "read_failed"
-                    }
-                    return (Self.readLatestSnapshot(codexHome: home), error.localizedDescription, reason)
+                    return (Self.readLatestSnapshot(codexHome: home), error.localizedDescription,
+                        UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - started))
                 }
             }.value
-            if let reason = result.2, manual || lastErrorReason != reason || lastError != result.1 {
-                appendLogEntry(["event": "usage_read_failed", "logged_at": ISO8601DateFormatter().string(from: Date()),
-                    "reason": reason, "trigger": manual ? "manual" : "automatic"])
+            if let failure = result.2, manual || !failure.sameFailure(as: lastReadFailure) {
+                var entry: [String: Any] = ["event": "usage_read_failed", "logged_at": ISO8601DateFormatter().string(from: Date()),
+                    "reason": failure.reason, "trigger": manual ? "manual" : "automatic",
+                    "request_stage": failure.requestStage, "cooldown": failure.cooldown, "elapsed_ms": failure.elapsedMilliseconds]
+                if let attempted = failure.rpcAttempted { entry["rpc_attempted"] = attempted }
+                appendLogEntry(entry)
             }
-            if result.1 != nil, snapshot?.isFresh(at: Date()) == true {
+            if result.2?.isTransient == true, snapshot?.isFresh(at: Date()) == true {
                 // Keep the recent live reading during a transient refresh failure.
             } else if let new = result.0 {
                 if snapshot != new { appendTransitionLog(new) }
@@ -136,7 +133,7 @@ final class UsageObserver: ObservableObject {
                 snapshot = nil
             }
             lastError = result.1
-            lastErrorReason = result.2
+            lastReadFailure = result.2
             if manual || !refreshMessage.isEmpty {
                 let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
                 refreshMessage = result.1 == nil ? L10n.format("已更新 · %@", clock.string(from: Date())) : L10n.text("刷新失败，请点击刷新按钮重试。")
@@ -145,7 +142,7 @@ final class UsageObserver: ObservableObject {
                 appendLogEntry(["event": "usage_refresh_finished", "trigger": trigger,
                     "request_id": id, "logged_at": ISO8601DateFormatter().string(from: Date()),
                     "elapsed_ms": Int((ProcessInfo.processInfo.systemUptime - started) * 1000),
-                    "result": result.1 == nil ? "success" : "failed", "reason": result.2 ?? "none"])
+                    "result": result.1 == nil ? "success" : "failed", "reason": result.2?.reason ?? "none"])
             }
             refreshing = false
             requestID = nil
@@ -256,12 +253,21 @@ final class UsageObserver: ObservableObject {
         }
     }
 
-    /// 简单轮转：超过 512KB 只留后半（§55 限量精神）
+    /// Preserve complete generations: one 1 MB current log and three bounded backups.
     private func rotateIfNeeded() {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
-              let size = attrs[.size] as? Int, size > 512 * 1024,
-              let data = try? Data(contentsOf: logURL) else { return }
-        let half = data.suffix(data.count / 2)
-        try? half.write(to: logURL)
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: logURL.path),
+              let size = attrs[.size] as? Int, size > 1024 * 1024 else { return }
+        do {
+            let oldest = logURL.appendingPathExtension("3")
+            if fm.fileExists(atPath: oldest.path) { try fm.removeItem(at: oldest) }
+            for index in stride(from: 2, through: 1, by: -1) {
+                let source = logURL.appendingPathExtension(String(index))
+                if fm.fileExists(atPath: source.path) { try fm.moveItem(at: source, to: logURL.appendingPathExtension(String(index + 1))) }
+            }
+            try fm.moveItem(at: logURL, to: logURL.appendingPathExtension("1"))
+        } catch {
+            // Keep the current history when rotation cannot finish; never truncate it as fallback.
+        }
     }
 }

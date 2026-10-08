@@ -196,6 +196,67 @@ private struct CodexCapabilityError: LocalizedError {
     var errorDescription: String? { L10n.text(message) }
 }
 
+/// Describes Keeper's RPC calls, not the CLI's upstream network requests. No raw error is encoded.
+struct UsageReadDiagnostic: Codable, Equatable {
+    let requestStage: String
+    let rpcAttempted: Bool?
+    let cooldown: Bool
+    let elapsedMilliseconds: Int
+    let reason: String
+
+    var isTransient: Bool {
+        ["workspace_routing_timeout", "request_timeout", "connection_failed", "connection_ended", "service_unavailable"].contains(reason)
+    }
+
+    func sameFailure(as other: UsageReadDiagnostic?) -> Bool {
+        guard let other else { return false }
+        return requestStage == other.requestStage && rpcAttempted == other.rpcAttempted &&
+            cooldown == other.cooldown && reason == other.reason
+    }
+}
+
+struct UsageReadFailure: LocalizedError {
+    let underlying: Error
+    let diagnostic: UsageReadDiagnostic
+    var errorDescription: String? { underlying.localizedDescription }
+
+    static func describe(_ error: Error, elapsed: TimeInterval) -> UsageReadDiagnostic {
+        if let failure = error as? UsageReadFailure { return failure.diagnostic }
+        return UsageReadDiagnostic(requestStage: "provider", rpcAttempted: nil, cooldown: false,
+            elapsedMilliseconds: Int(max(0, elapsed) * 1000), reason: reason(for: error))
+    }
+
+    static func canRetry(_ error: Error) -> Bool {
+        let error = (error as? UsageReadFailure)?.underlying ?? error
+        switch error {
+        case CodexConnectionError.timeout, CodexConnectionError.ended: return true
+        case CodexConnectionError.server:
+            return describe(error, elapsed: 0).isTransient
+        default: return false
+        }
+    }
+
+    static func reason(for error: Error) -> String {
+        switch error {
+        case CodexConnectionError.timeout: return "request_timeout"
+        case CodexConnectionError.ended: return "connection_ended"
+        case CodexConnectionError.unavailable: return "cli_unavailable"
+        case CodexConnectionError.invalidResponse: return "invalid_response"
+        case CodexConnectionError.approvalRequired: return "approval_required"
+        case CodexConnectionError.server(let message):
+            if message.contains("账户在刷新期间改变") || message.contains("账户身份不一致") { return "account_changed" }
+            let text = message.lowercased()
+            if ["unauthorized", "authentication", "not logged in", "login required"].contains(where: text.contains) ||
+                text.range(of: #"(?:status(?: code)?[: ]+|http(?:/\d(?:\.\d)?)? )(?:401|403)\b"#, options: .regularExpression) != nil {
+                return "authentication_failed"
+            }
+            return CodexConnectionError.serverFailureReason(message)
+        case is CodexCapabilityError: return "capability_or_authentication"
+        default: return "read_failed"
+        }
+    }
+}
+
 final class AppServerUsageProvider: UsageProvider {
     private let lock = NSLock()
     private let makeTransport: () throws -> CodexTransport
@@ -251,18 +312,35 @@ final class AppServerUsageProvider: UsageProvider {
     func readForUserRefresh() throws -> UsageSnapshot { try read(manual: true) }
 
     private func read(manual: Bool) throws -> UsageSnapshot {
-        try withConnection(manual: manual) { client in
-            try Self.requireChatGPT(try client.request("account/read", params: ["refreshToken": false]))
-            var snapshot = try read(from: client)
-            let fileAccount = try accountIdentity()
-            if let reported = snapshot.accountID, let fileAccount, reported != fileAccount {
-                throw CodexConnectionError.server("账户身份不一致，请重新登录 Codex 后重试")
+        let started = uptime()
+        var requestStage = "connection"
+        var rpcAttempted: Bool? = false
+        do {
+            return try withConnection(manual: manual, stage: {
+                requestStage = $0
+                // The transport factory may initialize a child with RPCs; its internals are unknown here.
+                if $0 == "connection" { rpcAttempted = nil }
+            }) { client in
+                requestStage = "account_read"; rpcAttempted = true
+                try Self.requireChatGPT(try client.request("account/read", params: ["refreshToken": false]))
+                var snapshot = try read(from: client, stage: { requestStage = $0 })
+                requestStage = "account_verification"
+                let fileAccount = try accountIdentity()
+                if let reported = snapshot.accountID, let fileAccount, reported != fileAccount {
+                    throw CodexConnectionError.server("账户身份不一致，请重新登录 Codex 后重试")
+                }
+                snapshot.accountID = snapshot.accountID ?? fileAccount
+                guard snapshot.accountID != nil else {
+                    throw CodexCapabilityError(message: "无法确认 Codex 账户身份，请重新登录或更新 Codex；自动操作已暂停")
+                }
+                return snapshot
             }
-            snapshot.accountID = snapshot.accountID ?? fileAccount
-            guard snapshot.accountID != nil else {
-                throw CodexCapabilityError(message: "无法确认 Codex 账户身份，请重新登录或更新 Codex；自动操作已暂停")
-            }
-            return snapshot
+        } catch {
+            let reason = ["authentication", "account_verification"].contains(requestStage) && !(error is CodexConnectionError) && !(error is CodexCapabilityError) ?
+                "authentication_failed" : UsageReadFailure.reason(for: error)
+            throw UsageReadFailure(underlying: error, diagnostic: UsageReadDiagnostic(requestStage: requestStage,
+                rpcAttempted: rpcAttempted, cooldown: requestStage == "cooldown",
+                elapsedMilliseconds: Int(max(0, uptime() - started) * 1000), reason: reason))
         }
     }
 
@@ -313,16 +391,20 @@ final class AppServerUsageProvider: UsageProvider {
         }
     }
 
-    private func withConnection<T>(manual: Bool = false, _ operation: (CodexTransport) throws -> T) throws -> T {
+    private func withConnection<T>(manual: Bool = false, stage: ((String) -> Void)? = nil, _ operation: (CodexTransport) throws -> T) throws -> T {
         lock.lock(); defer { lock.unlock() }
         let currentFallbackPath = fallbackPath()
         if uptime() < retryAfter, let lastFailure {
             // A deliberate retry can bypass background backoff, but repeated clicks cannot spawn a storm.
-            guard manual, currentFallbackPath != lastFallbackPath || uptime() >= manualRetryAfter else { throw lastFailure }
+            guard manual, currentFallbackPath != lastFallbackPath || uptime() >= manualRetryAfter else {
+                stage?("cooldown"); throw lastFailure
+            }
         }
         lastFallbackPath = currentFallbackPath
         if manual { manualRetryAfter = uptime() + 5 }
+        var operationStarted = false
         do {
+            stage?("authentication")
             let currentIdentity = try contextIdentity()
             if transport != nil, identity != currentIdentity {
                 transport?.close()
@@ -331,10 +413,13 @@ final class AppServerUsageProvider: UsageProvider {
                 modelRetryAfter = 0
             }
             if transport == nil {
+                stage?("connection")
                 transport = try makeTransport()
                 identity = currentIdentity
             }
+            operationStarted = true
             let result = try operation(transport!)
+            stage?("authentication")
             guard try contextIdentity() == currentIdentity else {
                 throw CodexConnectionError.server("账户在刷新期间改变")
             }
@@ -343,34 +428,54 @@ final class AppServerUsageProvider: UsageProvider {
             return result
         } catch {
             if error is CodexCapabilityError { throw error }
-            transport?.close()
-            transport = nil
-            lastFailure = error
+            var failure = error
+            var retainConnection = false
+            if operationStarted, case CodexConnectionError.server = error, UsageReadFailure.canRetry(error) {
+                // A complete RPC error leaves stdio usable only within the same authentication context.
+                do { try requireSameAuthentication(); retainConnection = true }
+                catch let authenticationError {
+                    stage?("authentication")
+                    failure = authenticationError
+                }
+            }
+            if !retainConnection {
+                transport?.close()
+                transport = nil
+            }
+            lastFailure = failure
             failureCount += 1
             // Back off persistent protocol/network failures without a process every poll.
             retryAfter = uptime() + min(300, 20 * pow(2, Double(min(failureCount - 1, 4))))
-            throw error
+            throw failure
         }
     }
 
-    private func readRateLimits(from client: CodexTransport) throws -> UsageSnapshot {
+    private func requireSameAuthentication() throws {
+        guard try contextIdentity() == identity else { throw CodexConnectionError.server("账户在刷新期间改变") }
+    }
+
+    private func readRateLimits(from client: CodexTransport, stage: (String) -> Void) throws -> UsageSnapshot {
         let response: [String: Any]
         do {
             response = try client.request("account/rateLimits/read", params: [:])
-        } catch CodexConnectionError.server(let message) where CodexConnectionError.serverFailureReason(message) == "connection_failed" {
+        } catch CodexConnectionError.server(let message) where CodexConnectionError.serverFailureReason(message) == "connection_failed" && UsageReadFailure.canRetry(CodexConnectionError.server(message)) {
             // A transient network error can leave the retained app-server healthy.
+            do { try requireSameAuthentication() }
+            catch { stage("authentication"); throw error }
             response = try client.request("account/rateLimits/read", params: [:])
         }
         return try UsageDecoder.account(response, at: Date())
     }
 
-    private func read(from client: CodexTransport) throws -> UsageSnapshot {
-        let first = try readRateLimits(from: client)
+    private func read(from client: CodexTransport, stage: (String) -> Void) throws -> UsageSnapshot {
+        stage("rate_limits")
+        let first = try readRateLimits(from: client, stage: stage)
         guard let five = first.fiveHour, five.usedPercent == 0, five.resetsAt > first.capturedAt else { return first }
         // With no active window the service returns a rolling now+5h reset. A fixed
         // reset at 0% instead represents a real window whose usage rounds to zero.
         Thread.sleep(forTimeInterval: 2.2)
-        var second = try readRateLimits(from: client)
+        stage("window_verification")
+        var second = try readRateLimits(from: client, stage: stage)
         guard first.accountID == second.accountID else { throw CodexConnectionError.server("账户在刷新期间改变") }
         if let current = second.fiveHour, current.usedPercent == 0 {
             second.zeroUseWindowActive = abs(current.resetsAt.timeIntervalSince(five.resetsAt)) <= 1

@@ -41,6 +41,8 @@
 "计划" = "Planned";
 "同步失败" = "Sync Failed";
 "正在同步" = "Syncing";
+"待同步" = "Waiting to Sync";
+"同步中" = "Syncing";
 "已停用" = "Disabled";
 "无需保活" = "No Keep-alive Needed";
 "未选择会话" = "No Task Selected";
@@ -165,7 +167,9 @@
 "；继续等待至 %d 秒" = "; waiting up to %d seconds";
 "保活未发送：Codex 无法读取保活配置" = "Keep-alive was not sent: Codex could not read its configuration";
 "保活进程提前退出，未确认新窗口；本轮不再重试" = "Keep-alive process exited early. No new window was confirmed; this attempt will not be retried.";
-"保活额度读取失败，无法核实新窗口；本轮不再重试" = "Quota read failed during keep-alive. The new window could not be verified; this attempt will not be retried.";
+"已收到 OK，额度暂时读取失败，仍在确认 5 小时窗口" = "OK received; quota is temporarily unavailable. Still verifying the 5-hour window";
+"保活已发送，但额度读取失败，未确认新窗口；本轮不再重试" = "Keep-alive was sent, but quota could not be read to confirm a new window. This attempt will not be sent again.";
+"保活账户已改变，停止确认新窗口；本轮不再重试" = "The keep-alive account changed. Window verification stopped; this attempt will not be sent again.";
 "保活已停止，未确认新窗口；本轮不再重试" = "Keep-alive stopped. No new window was confirmed; this attempt will not be retried.";
 "已收到 OK，但未确认新窗口" = "Received OK, but no new window was confirmed";
 "已收到 OK，但任务尚未确认完成" = "Received OK, but task completion was not confirmed";
