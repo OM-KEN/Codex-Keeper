@@ -19,6 +19,11 @@ import Network
     private let now: () -> Date
     private var savedRuntime: Data?
     private var previousUsage: UsageSnapshot?
+    private var observedSessions: [SessionActivity] = []
+    private var observedAuthentication: AuthenticationObservation?
+    private var monitoringSettings: [String] = []
+    private var environmentDay: Date?
+    private var environmentTimeZone = Calendar.current.timeZone.identifier
     private var naturalRecoveries = Set<String>()
     private var heldForPlan = Set<String>()
     private let network = NWPathMonitor()
@@ -36,7 +41,7 @@ import Network
         self.defaults = defaults
         self.now = now
         self.runtimeURL = runtimeURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/pending-runtime.json")
-        usage = UsageObserver(codexHome: codexHome, provider: provider, logURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"))
+        usage = UsageObserver(codexHome: codexHome, provider: provider, logURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"), now: now)
         sessions = SessionWatcher(codexHome: codexHome)
         self.execution = execution ?? ExecutionCoordinator(provider: provider, defaults: defaults,
             ledgerURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), codexHome: codexHome)
@@ -51,18 +56,24 @@ import Network
         }
         usage.$snapshot.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] snapshot in self?.observeRecovery(snapshot); self?.recompute() }.store(in: &cancellables)
         sessions.$sessions.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute() }.store(in: &cancellables)
+        sessions.$detectionError.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute() }.store(in: &cancellables)
+        usage.$lastError.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute(allowExecution: false) }.store(in: &cancellables)
+        usage.$refreshing.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute(allowExecution: false) }.store(in: &cancellables)
         self.execution.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         usage.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         self.execution.$running.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] running in
-            if !running { self?.recompute(allowExecution: false) }
+            if !running, self?.execution.lastFailure == nil { self?.requestAutomaticRefresh(source: "execution_finished") }
+            self?.recompute(allowExecution: false)
         }.store(in: &cancellables)
+        monitoringSettings = settingsFingerprint()
+        environmentDay = Calendar.current.startOfDay(for: now())
         sessions.watchedIDs = Set(confirmed.keys)
         observers.append(NotificationCenter.default.addObserver(forName: CodexLocator.fallbackPathChanged, object: defaults, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.usage.refresh(manual: true, source: "cli_path") }
         })
         guard startMonitoring else { recompute(allowExecution: false); return }
         observers.append(NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.recompute() }
+            Task { @MainActor in self?.preferencesChanged() }
         })
         observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.environmentChanged() }
@@ -125,11 +136,58 @@ import Network
         usage.refresh(manual: manual, source: source); sessions.refresh(); recompute()
     }
 
-    private func environmentChanged() {
+    func environmentChanged() {
+        environmentDay = Calendar.current.startOfDay(for: now())
+        environmentTimeZone = Calendar.current.timeZone.identifier
         previousUsage = nil
         naturalRecoveries.removeAll()
         usage.invalidate()
-        refresh()
+        requestAutomaticRefresh(source: "environment")
+        sessions.refresh()
+        recompute()
+    }
+
+    private func settingsFingerprint() -> [String] {
+        ["enabled", "autoResume", "dailyAnchorMinutes", "earlyRecoveryPolicy", "resumeWorkspaceReminder",
+         ResumeMessagePreferences.modeKey, "resumeMessage"].map { defaults.object(forKey: $0).map { String(describing: $0) } ?? "" }
+    }
+
+    private func preferencesChanged() {
+        guard monitoringSettings != settingsFingerprint() else { return }
+        monitoringSettings = settingsFingerprint()
+        environmentChanged()
+    }
+
+    private func requestAutomaticRefresh(source: String, occurredAt: Date? = nil) {
+        if let occurredAt, let started = usage.lastRefreshStartedAt, occurredAt <= started { return }
+        usage.setPolling(UsagePollingPolicy(interval: UsagePollingPolicy.activeInterval, wakeAt: nil),
+            retryOpportunity: defaults.bool(forKey: "enabled") ? schedule.retryOpportunity(at: now()) : nil)
+        usage.refresh(source: source, critical: true)
+    }
+
+    private func observeSessions() {
+        let authentication = sessions.authentication
+        if let before = observedAuthentication, before != authentication {
+            previousUsage = nil
+            naturalRecoveries.removeAll()
+            usage.invalidate(clearAccount: true)
+            requestAutomaticRefresh(source: "authentication")
+        }
+        observedAuthentication = authentication
+        if let event = SessionUsageActivity.latestRefreshEvent(previous: observedSessions, current: sessions.sessions) {
+            requestAutomaticRefresh(source: "session_activity", occurredAt: event)
+        }
+        observedSessions = sessions.sessions
+    }
+
+    private func updateUsagePolling(at now: Date) {
+        let reliable = usage.hasReliableReading && usage.lastError == nil && sessions.authentication != .unreadable
+        let policy = UsagePollingPolicy.evaluate(now: now, schedule: schedule, enabled: defaults.bool(forKey: "enabled"),
+            scanned: sessions.hasScanned, scanError: sessions.detectionError, reliableUsage: reliable,
+            usage: usage.snapshot, runningTask: sessions.sessions.contains { $0.taskRunning },
+            resumeDemand: defaults.bool(forKey: "enabled") && defaults.bool(forKey: "autoResume") && !availableTasks.isEmpty,
+            executing: execution.running, criticalRefresh: usage.criticalRefreshPending)
+        usage.setPolling(policy, retryOpportunity: defaults.bool(forKey: "enabled") ? schedule.retryOpportunity(at: now) : nil)
     }
 
     private func observeRecovery(_ snapshot: UsageSnapshot?) {
@@ -169,8 +227,22 @@ import Network
 
     func recompute(allowExecution: Bool = true) {
         let now = now()
+        if sessions.hasScanned { observeSessions() }
+        let settings = settingsFingerprint()
+        let day = Calendar.current.startOfDay(for: now)
+        if monitoringSettings != settings || environmentDay != day || environmentTimeZone != Calendar.current.timeZone.identifier {
+            monitoringSettings = settings
+            environmentDay = day
+            environmentTimeZone = Calendar.current.timeZone.identifier
+            previousUsage = nil
+            naturalRecoveries.removeAll()
+            usage.invalidate()
+            requestAutomaticRefresh(source: "plan_environment")
+        }
         if !defaults.bool(forKey: "enabled") { execution.cancelCurrent() }
         schedule = ScheduleEngine(anchorMinutes: defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480)
+        schedule.accountID = usage.snapshot?.accountID
+        schedule.confirmedWindows = execution.confirmedWindows
         if sessions.hasScanned && sessions.detectionError == nil { confirmed = confirmed.filter { id, target in
             sessions.sessions.contains { $0.id == id && !$0.taskRunning && ($0.lastUserMessageAt ?? .distantPast) <= target.blockedAt && ($0.lastTaskStartedAt ?? .distantPast) <= target.blockedAt && ($0.lastAbortedAt ?? .distantPast) <= target.blockedAt && ($0.lastAssistantMessageAt ?? .distantPast) <= target.blockedAt }
         }
@@ -186,7 +258,7 @@ import Network
                 }
             }
         }
-        if let account = usage.snapshot?.accountID {
+        if !usage.criticalRefreshPending, let snapshot = usage.snapshot, snapshot.isFresh(at: now), let account = snapshot.accountID {
             for session in blockedSessions where accountBindings[session.id] == nil { accountBindings[session.id] = account }
         }
         blockedSessions = blockedSessions.map { target in
@@ -200,6 +272,7 @@ import Network
             return supported
         }
         sessions.watchedIDs = Set(blockedSessions.map { $0.id }).union(confirmed.keys)
+            .union(sessions.sessions.filter { $0.taskRunning }.map(\.id))
         if sessions.hasScanned && sessions.detectionError == nil {
             let current = Set(blockedSessions.filter { !execution.hasAttempted($0) }.map(\.episodeKey))
             choices.recoveryDecisions = choices.recoveryDecisions?.filter { current.contains($0.key) }
@@ -230,7 +303,9 @@ import Network
                 earlyRecoveryPolicy: earlyPolicy, usage: usage.snapshot, blocked: targets,
                 observedRecovery: hasConfirmedRecovery(for: targets),
                 heldForPlan: targets.contains { heldForPlan.contains($0.episodeKey) },
-                needsRecoveryDecision: targets.contains { choices.recoveryDecisions?[$0.episodeKey] != nil })
+                needsRecoveryDecision: targets.contains { choices.recoveryDecisions?[$0.episodeKey] != nil },
+                reserveIdleDate: usage.hasReliableReading && usage.lastError == nil && targets.isEmpty &&
+                    sessions.hasScanned && sessions.detectionError == nil && sessions.authentication != .unreadable)
             if defaults.bool(forKey: "enabled"), !targets.isEmpty, targets.allSatisfy({ choices.recoveryDecisions?[$0.episodeKey]?.phase == .responded }) {
                 plan = NextAction(mode: .resume, date: nil, decision: .wait(reason: "等待续跑决定"), note: "等待续跑决定", needsRecoveryDecision: true)
             }
@@ -264,7 +339,8 @@ import Network
         nextAction = plan
         decision = plan.decision
         nextNodeText = MenuSummary.build(plan: plan, usage: usage.snapshot, schedule: schedule, tasks: chosen).statusText
-        guard allowExecution else { return }
+        updateUsagePolling(at: now)
+        guard allowExecution, !usage.criticalRefreshPending else { return }
         let ignored = choices.keepAliveIgnoredEpisodes
         if canKeepAlive(ignoring: ignored), case .ping = checkedPlan(for: []).decision {
             execution.ping(schedule: schedule, accountID: usage.snapshot?.accountID, ignoredEpisodes: ignored,
@@ -280,6 +356,8 @@ import Network
 
     private func canKeepAlive(ignoring episodes: Set<String>) -> Bool {
         sessions.hasScanned && sessions.detectionError == nil &&
+            !usage.criticalRefreshPending &&
+            !sessions.sessions.contains { $0.taskRunning } &&
             choices.permitsKeepAlive(for: blockedSessions, ignoring: episodes)
     }
 

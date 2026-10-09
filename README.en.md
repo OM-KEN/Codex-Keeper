@@ -14,7 +14,7 @@ A small Codex utility in your Mac menu bar:
 
 An Apple Silicon Mac running macOS 13 or later. Install Codex and sign in with a ChatGPT account first.
 
-This is a beta for local Codex tasks. Scheduled keep-alives require access to `gpt-5.6-luna`; Keeper does not increase your quota or bypass quota limits.
+This is a beta for local Codex tasks. Scheduled keep-alives require access to `gpt-6-luna`; Keeper does not increase your quota or bypass quota limits.
 
 ## Getting started
 

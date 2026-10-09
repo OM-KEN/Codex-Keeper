@@ -29,7 +29,8 @@ struct DecisionEngine {
 
     func plan(now: Date = Date(), calendar: Calendar = .current, enabled: Bool, autoResume: Bool,
               earlyRecoveryPolicy: String, usage: UsageSnapshot?, blocked: [BlockedSession],
-              observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false) -> NextAction {
+              observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false,
+              reserveIdleDate: Bool = false) -> NextAction {
         let target = blocked.first
         let mode: NextActionMode = target != nil ? .resume : .keepAlive
         func wait(_ reason: String, at date: Date? = nil) -> NextAction {
@@ -37,14 +38,23 @@ struct DecisionEngine {
         }
         guard enabled else { return wait("已停用") }
         guard let usage, usage.fiveHour != nil || usage.weekly != nil else { return wait("等待额度同步") }
-        guard usage.isFresh(at: now) else { return wait("额度已过期，等待实时确认") }
+        guard usage.isFresh(at: now) else {
+            if reserveIdleDate, target == nil {
+                let blocked = [usage.fiveHour, usage.weekly].compactMap { $0 }.contains { $0.usedPercent >= 100 }
+                return NextAction(mode: .keepAlive,
+                    date: UsagePollingPolicy.reservedKeepAliveDate(now: now, schedule: schedule, usage: usage, calendar: calendar),
+                    decision: .wait(reason: "等待下一可行计划节点"),
+                    note: blocked ? "额度恢复后按计划保活" : usage.fiveHour == nil ? "当前无需保活" : "")
+            }
+            return wait("额度已过期，等待实时确认")
+        }
         if target != nil && !autoResume { return wait("自动续跑已关闭") }
         let five = usage.fiveHour
         let exhausted = [five, usage.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
         let blockingReset = exhausted.map { $0.resetsAt }.max()
         let atNode = (target == nil ? schedule.currentKeepAliveNode(at: now, calendar: calendar) :
             schedule.currentNode(at: now, calendar: calendar)) != nil
-        let nextNode = schedule.nextNode(after: now, calendar: calendar)
+        let nextNode = target == nil ? schedule.nextKeepAliveNode(after: now, calendar: calendar) : schedule.nextNode(after: now, calendar: calendar)
         if let target {
             if target.fiveHourResetAt != nil && five == nil || target.weeklyResetAt != nil && usage.weekly == nil {
                 return wait("等待额度恢复确认")

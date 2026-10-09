@@ -14,7 +14,7 @@
 
 Apple Silicon Mac（M 系列芯片），macOS 13 或更新版本。先安装 Codex，并登录 ChatGPT 账户。
 
-目前为测试版，适用于本机 Codex 任务。定时保活需要账户可使用 `gpt-5.6-luna`；Keeper 不会增加额度或绕过额度限制。
+目前为测试版，适用于本机 Codex 任务。定时保活需要账户可使用 `gpt-6-luna`；Keeper 不会增加额度或绕过额度限制。
 
 ## 怎么用
 

@@ -93,13 +93,18 @@ final class PTYPingTransport: PingTransport {
         // TOML strings accept JSON escapes except the optional escaped forward slash.
         let quotedWork = String(data: try JSONSerialization.data(withJSONObject: work.path, options: [.fragmentsAllowed, .withoutEscapingSlashes]), encoding: .utf8)!
         return """
-        model = "gpt-5.6-luna"
+        model = "gpt-6-luna"
+        model_provider = "keeper_http"
         \(reasoning)
         sandbox_mode = "read-only"
         approval_policy = "never"
         forced_login_method = "chatgpt"
         developer_instructions = "Reply only OK. Do not call tools or read files."
         features.daemon_auto_start = false
+        model_providers.keeper_http.name = "OpenAI"
+        model_providers.keeper_http.requires_openai_auth = true
+        model_providers.keeper_http.supports_websockets = false
+        model_providers.keeper_http.wire_api = "responses"
         [projects.\(quotedWork)]
         trust_level = "trusted"
         """
@@ -108,7 +113,7 @@ final class PTYPingTransport: PingTransport {
     func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> UsageSnapshot {
         lock.lock(); cancelled = false; lock.unlock()
         let fm = FileManager.default
-        guard model.model == "gpt-5.6-luna" else { throw CodexConnectionError.server("保活模型未经确认") }
+        guard model.model == "gpt-6-luna" else { throw CodexConnectionError.server("保活模型未经确认") }
         let root = supportRoot ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/ping")
         let home = root.appendingPathComponent("home")
         let work = root.appendingPathComponent("work")

@@ -25,7 +25,7 @@ struct CLICompatibility {
             result["codexHome"] = CodexEnvironment.home.path
             if mode == "--check" {
                 var checks: [String: String] = [:]
-                var model = PingModel(model: "gpt-5.6-luna", reasoningEffort: "low")
+                var model = PingModel(model: "gpt-6-luna", reasoningEffort: "low")
                 do {
                     let provider = AppServerUsageProvider(makeTransport: { try AppServerClient(binary: binary, usageOnly: true) })
                     defer { AppServerClient.closeAll() }
@@ -120,7 +120,7 @@ struct CLICompatibility {
             let text = String(decoding: output, as: UTF8.self).replacingOccurrences(of: #"\x1B\[[0-?]*[ -/]*[@-~]"#, with: "", options: .regularExpression)
             if text.contains("incompatible feature settings") || text.contains("Error loading config") { return false }
             let compact = text.replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
-            if compact.contains("AskCodextodoanything"), compact.contains("GPT-5.6-Luna\(model.reasoningEffort ?? "default")") {
+            if compact.contains("AskCodextodoanything"), compact.contains("GPT-6-Luna\(model.reasoningEffort ?? "default")") {
                 return shared || !fm.fileExists(atPath: home.appendingPathComponent("app-server-daemon/daemon.pid").path)
             }
         }

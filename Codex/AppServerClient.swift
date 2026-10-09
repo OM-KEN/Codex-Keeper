@@ -177,6 +177,7 @@ protocol UsageProvider {
     func read() throws -> UsageSnapshot
     func readForUserRefresh() throws -> UsageSnapshot
     func pingModel() throws -> PingModel
+    func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date)
 }
 
 struct PingModel: Equatable {
@@ -189,6 +190,7 @@ extension UsageProvider {
     func pingModel() throws -> PingModel {
         throw CodexConnectionError.server("无法确认保活模型；请更新 Codex 后重试")
     }
+    func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date) {}
 }
 
 private struct CodexCapabilityError: LocalizedError {
@@ -259,6 +261,7 @@ struct UsageReadFailure: LocalizedError {
 
 final class AppServerUsageProvider: UsageProvider {
     private let lock = NSLock()
+    private let retryOpportunityLock = NSLock()
     private let makeTransport: () throws -> CodexTransport
     private let contextIdentity: () throws -> Data?
     private let accountIdentity: () throws -> String?
@@ -271,8 +274,14 @@ final class AppServerUsageProvider: UsageProvider {
     private var manualRetryAfter: TimeInterval = 0
     private var lastFailure: Error?
     private var failureCount = 0
+    private var upstreamFailure = false
+    private var lastAutomaticAttempt: TimeInterval = -.infinity
+    private var shortRetryNode: Date?
+    private var shortRetryUntil: TimeInterval = 0
     private var modelFailure: Error?
     private var modelRetryAfter: TimeInterval = 0
+    private var cachedModel: PingModel?
+    private var cachedModelUntil: TimeInterval = 0
 
     init(makeTransport: @escaping () throws -> CodexTransport = { try AppServerClient(usageOnly: true) },
          contextIdentity: (() throws -> Data?)? = nil,
@@ -290,8 +299,7 @@ final class AppServerUsageProvider: UsageProvider {
     deinit { transport?.close() }
 
     // Hash only for local equality checks; credentials never enter logs or snapshots.
-    static func authenticationIdentity() throws -> Data? {
-        let home = CodexEnvironment.home
+    static func authenticationIdentity(home: URL = CodexEnvironment.home) throws -> Data? {
         do { return Data(SHA256.hash(data: try Data(contentsOf: home.appendingPathComponent("auth.json")))) }
         catch CocoaError.fileReadNoSuchFile { return nil }
     }
@@ -310,6 +318,15 @@ final class AppServerUsageProvider: UsageProvider {
     }
 
     func readForUserRefresh() throws -> UsageSnapshot { try read(manual: true) }
+
+    func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date) {
+        retryOpportunityLock.lock(); defer { retryOpportunityLock.unlock() }
+        guard let opportunity else { shortRetryUntil = 0; return }
+        guard opportunity.node != shortRetryNode else { return }
+        shortRetryNode = opportunity.node
+        // A fixed monotonic limit cannot be renewed by every 20-second recomputation.
+        shortRetryUntil = uptime() + min(600, max(0, opportunity.end.timeIntervalSince(now)))
+    }
 
     private func read(manual: Bool) throws -> UsageSnapshot {
         let started = uptime()
@@ -354,8 +371,19 @@ final class AppServerUsageProvider: UsageProvider {
     }
 
     func pingModel() throws -> PingModel {
-        try withConnection { client in
+        // A locally cached discovery needs no automatic RPC admission. Authentication is
+        // still checked, and the final quota/account read remains mandatory before sending.
+        lock.lock()
+        do {
+            if lastFailure != nil, let cachedModel, uptime() < cachedModelUntil, transport != nil, try contextIdentity() == identity,
+               fallbackPath() == lastFallbackPath {
+                lock.unlock(); return cachedModel
+            }
+        } catch { /* The shared connection path reports and budgets authentication failures. */ }
+        lock.unlock()
+        return try withConnection(resetFailuresOnSuccess: false) { client in
             if uptime() < modelRetryAfter, let modelFailure { throw modelFailure }
+            cachedModel = nil
             do {
                 try Self.requireChatGPT(try client.request("account/read", params: ["refreshToken": false]))
                 var cursor: String?
@@ -367,34 +395,42 @@ final class AppServerUsageProvider: UsageProvider {
                     let page = try client.request("model/list", params: params)
                     guard let models = page["data"] as? [[String: Any]] else { throw CodexConnectionError.invalidResponse }
                     if let entry = models.first(where: {
-                        ($0["model"] as? String ?? $0["id"] as? String) == "gpt-5.6-luna" && ($0["hidden"] as? Bool) != true
+                        ($0["model"] as? String ?? $0["id"] as? String) == "gpt-6-luna" && ($0["hidden"] as? Bool) != true
                     }) {
                         let efforts = (entry["supportedReasoningEfforts"] as? [[String: Any]])?.compactMap { $0["reasoningEffort"] as? String }.filter { ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].contains($0) } ?? []
                         let declared = entry["defaultReasoningEffort"] as? String
                         let effort = efforts.contains("low") ? "low" : (declared.flatMap { efforts.contains($0) ? $0 : nil })
                         modelFailure = nil
-                        return PingModel(model: "gpt-5.6-luna", reasoningEffort: effort)
+                        let model = PingModel(model: "gpt-6-luna", reasoningEffort: effort)
+                        cachedModel = model
+                        cachedModelUntil = uptime() + 300
+                        return model
                     }
                     guard let next = page["nextCursor"] as? String, !next.isEmpty else { break }
                     guard cursors.insert(next).inserted else { throw CodexConnectionError.invalidResponse }
                     cursor = next
                 }
-                throw CodexCapabilityError(message: "当前账户未提供 gpt-5.6-luna；请确认 Codex 登录和模型权限后重试，Keeper 不会自动改用其他模型")
+                throw CodexCapabilityError(message: "当前账户未提供 gpt-6-luna；请确认 Codex 登录和模型权限后重试，Keeper 不会自动改用其他模型")
             } catch {
                 let failure = CodexCapabilityError(message: L10n.format("保活模型确认失败：%@；5 分钟后可重试", error.localizedDescription))
-                modelFailure = failure
-                modelRetryAfter = uptime() + 300
                 // Capability errors leave the healthy quota connection reusable.
-                if error is CodexCapabilityError { throw failure }
+                if error is CodexCapabilityError {
+                    modelFailure = failure
+                    modelRetryAfter = uptime() + 300
+                    throw failure
+                }
                 throw error
             }
         }
     }
 
-    private func withConnection<T>(manual: Bool = false, stage: ((String) -> Void)? = nil, _ operation: (CodexTransport) throws -> T) throws -> T {
+    private func withConnection<T>(manual: Bool = false, resetFailuresOnSuccess: Bool = true,
+                                   stage: ((String) -> Void)? = nil, _ operation: (CodexTransport) throws -> T) throws -> T {
         lock.lock(); defer { lock.unlock() }
         let currentFallbackPath = fallbackPath()
-        if uptime() < retryAfter, let lastFailure {
+        retryOpportunityLock.lock(); let shortUntil = shortRetryUntil; retryOpportunityLock.unlock()
+        let automaticRetryAfter = upstreamFailure && uptime() < shortUntil ? lastAutomaticAttempt + 30 : retryAfter
+        if uptime() < automaticRetryAfter, let lastFailure {
             // A deliberate retry can bypass background backoff, but repeated clicks cannot spawn a storm.
             guard manual, currentFallbackPath != lastFallbackPath || uptime() >= manualRetryAfter else {
                 stage?("cooldown"); throw lastFailure
@@ -411,6 +447,7 @@ final class AppServerUsageProvider: UsageProvider {
                 transport = nil
                 modelFailure = nil
                 modelRetryAfter = 0
+                cachedModel = nil
             }
             if transport == nil {
                 stage?("connection")
@@ -418,13 +455,22 @@ final class AppServerUsageProvider: UsageProvider {
                 identity = currentIdentity
             }
             operationStarted = true
+            lastAutomaticAttempt = uptime()
             let result = try operation(transport!)
             stage?("authentication")
             guard try contextIdentity() == currentIdentity else {
                 throw CodexConnectionError.server("账户在刷新期间改变")
             }
-            lastFailure = nil
-            failureCount = 0
+            if resetFailuresOnSuccess {
+                lastFailure = nil
+                failureCount = 0
+                upstreamFailure = false
+                cachedModel = nil
+            } else if lastFailure != nil {
+                // Model discovery does not repay a failed quota read or permit an immediate
+                // second automatic batch. Its cached result is available at the next admission.
+                retryAfter = uptime() + min(300, 20 * pow(2, Double(min(failureCount - 1, 4))))
+            }
             return result
         } catch {
             if error is CodexCapabilityError { throw error }
@@ -441,9 +487,11 @@ final class AppServerUsageProvider: UsageProvider {
             if !retainConnection {
                 transport?.close()
                 transport = nil
+                cachedModel = nil
             }
             lastFailure = failure
             failureCount += 1
+            upstreamFailure = retainConnection && ["connection_failed", "service_unavailable"].contains(UsageReadFailure.reason(for: failure))
             // Back off persistent protocol/network failures without a process every poll.
             retryAfter = uptime() + min(300, 20 * pow(2, Double(min(failureCount - 1, 4))))
             throw failure

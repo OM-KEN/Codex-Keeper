@@ -31,6 +31,7 @@ SOURCES=(
     Core/FeedbackSupport.swift
     Core/OnboardingPreferences.swift
     Core/ScheduleEngine.swift
+    Core/UsagePollingPolicy.swift
     Core/DecisionEngine.swift
     Core/NextAction.swift
     Core/MenuPresentation.swift

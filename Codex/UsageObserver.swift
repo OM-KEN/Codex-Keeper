@@ -48,19 +48,28 @@ final class UsageObserver: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var refreshing = false
     @Published private(set) var refreshMessage = ""
+    @Published private(set) var hasReliableReading = false
+    private(set) var polling = UsagePollingPolicy(interval: UsagePollingPolicy.activeInterval, wakeAt: nil)
+    private(set) var criticalRefreshPending = false
+    private(set) var lastRefreshStartedAt: Date?
     private let provider: UsageProvider
+    private let now: () -> Date
 
     private let codexHome: URL
     private let logURL: URL
     private var timer: Timer?
     private var pendingManualSource: String?
+    private var pendingAutomaticSource: String?
+    private var monitoring = false
     private var requestID: String?
     private var lastReadFailure: UsageReadDiagnostic?
 
     var lastErrorIsTransient: Bool { lastReadFailure?.isTransient == true }
 
-    init(codexHome: URL = CodexEnvironment.home, provider: UsageProvider = AppServerUsageProvider(), logURL: URL? = nil) {
+    init(codexHome: URL = CodexEnvironment.home, provider: UsageProvider = AppServerUsageProvider(), logURL: URL? = nil,
+         now: @escaping () -> Date = Date.init) {
         self.provider = provider
+        self.now = now
         self.codexHome = codexHome
         let support = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -70,25 +79,52 @@ final class UsageObserver: ObservableObject {
     }
 
     func start(interval: TimeInterval = 20) {
+        monitoring = true
+        polling = UsagePollingPolicy(interval: interval, wakeAt: nil)
         refresh()
+    }
+
+    func stop() {
+        monitoring = false
         timer?.invalidate()
-        timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+        timer = nil
+    }
+
+    func invalidate(clearAccount: Bool = false) {
+        hasReliableReading = false
+        if var previous = snapshot {
+            previous.capturedAt = .distantPast
+            if clearAccount { previous.accountID = nil }
+            snapshot = previous
+        }
+    }
+
+    func setPolling(_ policy: UsagePollingPolicy, retryOpportunity: UsageRetryOpportunity?) {
+        provider.setRetryOpportunity(retryOpportunity, now: now())
+        guard polling != policy else { return }
+        polling = policy
+        scheduleRefresh()
+    }
+
+    var nextAutomaticRefreshAt: Date? {
+        guard let lastRefreshStartedAt else { return nil }
+        let periodic = lastRefreshStartedAt.addingTimeInterval(polling.interval)
+        return polling.wakeAt.map { min(periodic, $0) } ?? periodic
+    }
+
+    private func scheduleRefresh() {
+        timer?.invalidate(); timer = nil
+        guard monitoring, !refreshing, let deadline = nextAutomaticRefreshAt else { return }
+        // A slow completed request must not create an immediate timer loop.
+        timer = Timer(timeInterval: max(1, deadline.timeIntervalSince(now())), repeats: false) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
 
-    func stop() {
-        timer?.invalidate()
-        timer = nil
-    }
-
-    func invalidate() {
-        if var previous = snapshot { previous.capturedAt = .distantPast; snapshot = previous }
-    }
-
-    func refresh(manual: Bool = false, source: String = "manual") {
-        let trigger = manual ? source : "automatic"
+    func refresh(manual: Bool = false, source: String = "manual", critical: Bool = false) {
+        let trigger = manual || critical ? source : "automatic"
+        if critical { criticalRefreshPending = true }
         guard !refreshing else {
             if manual {
                 pendingManualSource = source
@@ -96,8 +132,11 @@ final class UsageObserver: ObservableObject {
                 appendLogEntry(["event": "usage_refresh_queued", "trigger": trigger,
                     "request_id": requestID ?? "", "logged_at": ISO8601DateFormatter().string(from: Date())])
             }
+            if critical { pendingAutomaticSource = source }
             return
         }
+        timer?.invalidate(); timer = nil
+        lastRefreshStartedAt = now()
         let id = UUID().uuidString
         requestID = id
         let started = ProcessInfo.processInfo.systemUptime
@@ -124,7 +163,8 @@ final class UsageObserver: ObservableObject {
                 if let attempted = failure.rpcAttempted { entry["rpc_attempted"] = attempted }
                 appendLogEntry(entry)
             }
-            if result.2?.isTransient == true, snapshot?.isFresh(at: Date()) == true {
+            hasReliableReading = result.1 == nil && result.0?.isFresh(at: now()) == true && result.0?.accountID?.isEmpty == false
+            if result.2?.isTransient == true, snapshot?.isFresh(at: now()) == true {
                 // Keep the recent live reading during a transient refresh failure.
             } else if let new = result.0 {
                 if snapshot != new { appendTransitionLog(new) }
@@ -147,8 +187,13 @@ final class UsageObserver: ObservableObject {
             refreshing = false
             requestID = nil
             let pendingSource = pendingManualSource
+            let pendingAutomatic = pendingAutomaticSource
             pendingManualSource = nil
-            if let pendingSource { refresh(manual: true, source: pendingSource) }
+            pendingAutomaticSource = nil
+            criticalRefreshPending = pendingAutomatic != nil
+            if let pendingSource { refresh(manual: true, source: pendingSource, critical: pendingAutomatic != nil) }
+            else if let pendingAutomatic { refresh(source: pendingAutomatic, critical: true) }
+            else { scheduleRefresh() }
         }
     }
 

@@ -797,22 +797,22 @@ import Darwin
         var compatibilityClock: TimeInterval = 0
         let catalogTransport = CompatibilityTransport()
         catalogTransport.pages = [["data": [["model": "other"]], "nextCursor": "page-2"],
-            ["data": [["id": "gpt-5.6-luna", "supportedReasoningEfforts": [["reasoningEffort": "low"]]]]]]
+            ["data": [["id": "gpt-6-luna", "supportedReasoningEfforts": [["reasoningEffort": "low"]]]]]]
         var catalogConnections = 0
         let catalogProvider = AppServerUsageProvider(makeTransport: { catalogConnections += 1; return catalogTransport },
             contextIdentity: { nil }, uptime: { compatibilityClock })
         _ = try catalogProvider.read()
         let liveModel = try catalogProvider.pingModel()
         _ = try catalogProvider.read()
-        check(liveModel == PingModel(model: "gpt-5.6-luna", reasoningEffort: "low") && catalogConnections == 1,
+        check(liveModel == PingModel(model: "gpt-6-luna", reasoningEffort: "low") && catalogConnections == 1,
             "online paginated Luna discovery reuses the quota connection without model cache")
         check(catalogTransport.modelParams.count == 2 && catalogTransport.modelParams[1]["cursor"] as? String == "page-2" &&
             catalogTransport.modelParams[0]["includeHidden"] as? Bool == false, "model pagination sends official fields")
-        catalogTransport.pages = [["data": [["model": "gpt-5.6-luna", "supportedReasoningEfforts": [["reasoningEffort": "medium"]], "defaultReasoningEffort": "medium"]]]]
+        catalogTransport.pages = [["data": [["model": "gpt-6-luna", "supportedReasoningEfforts": [["reasoningEffort": "medium"]], "defaultReasoningEffort": "medium"]]]]
         check(try catalogProvider.pingModel().reasoningEffort == "medium", "unsupported low effort uses declared supported default")
-        catalogTransport.pages = [["data": [["model": "gpt-5.6-luna"]]]]
+        catalogTransport.pages = [["data": [["model": "gpt-6-luna"]]]]
         check(try catalogProvider.pingModel().reasoningEffort == nil, "missing capability leaves reasoning to model default")
-        catalogTransport.pages = [["data": [["model": "gpt-5.6-luna", "supportedReasoningEfforts": [["reasoningEffort": "invalid\"value"]], "defaultReasoningEffort": "invalid\"value"]]]]
+        catalogTransport.pages = [["data": [["model": "gpt-6-luna", "supportedReasoningEfforts": [["reasoningEffort": "invalid\"value"]], "defaultReasoningEffort": "invalid\"value"]]]]
         check(try catalogProvider.pingModel().reasoningEffort == nil, "unknown reasoning value cannot enter generated TOML")
         catalogTransport.pages = [["data": [["model": "expensive-alternative"]]]]
         check((try? catalogProvider.pingModel()) == nil, "missing Luna never substitutes another model")
@@ -822,7 +822,7 @@ import Darwin
         check(catalogTransport.modelParams.count == modelCallsAtFailure && catalogConnections == 1 && catalogTransport.closes == 0,
             "missing model cooldown keeps healthy quota reads and prevents process/RPC storms")
         compatibilityClock += 300
-        catalogTransport.pages = [["data": [["model": "gpt-5.6-luna"]]]]
+        catalogTransport.pages = [["data": [["model": "gpt-6-luna"]]]]
         check((try? catalogProvider.pingModel()) != nil, "model discovery recovers after bounded cooldown")
         let loopTransport = CompatibilityTransport()
         loopTransport.pages = [["data": [], "nextCursor": "same"]]
@@ -1797,7 +1797,7 @@ import Darwin
         var pingBefore = beforePing; pingBefore.capturedAt = Date(); pingBefore.fiveHour?.resetsAt = Date().addingTimeInterval(-10)
         let pingResult = try PTYPingTransport(codexHome: fakeHome, supportRoot: pingRoot, binary: fakeTUI,
             timing: PingTiming(warning: 0.2, timeout: 1.5, pollInterval: 0.05))
-            .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!))
+            .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!))
         check(pingResult.fiveHour != nil, "PTY ping runs independently of incompatible shared daemon and confirms live window")
         let receiptHome = pingRoot.appendingPathComponent("home")
         check(PingReceipt.completed(home: receiptHome, excluding: []), "own new OK completion proves ping was sent")
@@ -1811,7 +1811,7 @@ import Darwin
         try "#!/bin/sh\nprintf 'Error loading config.toml: invalid escape\\n'\nexit 1\n".write(to: fakeTUI, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeTUI.path)
         do {
-            _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: pingRoot, binary: fakeTUI).ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!))
+            _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: pingRoot, binary: fakeTUI).ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!))
             check(false, "config startup failure cannot report quota confirmation timeout")
         } catch {
             check(error.localizedDescription.contains("无法读取保活配置"), "config startup failure cannot report quota confirmation timeout")
@@ -1880,7 +1880,7 @@ import Darwin
         let testTiming = PingTiming(warning: 0.2, timeout: 1.5, pollInterval: 0.05)
         var progressEvents: [PingDiagnostic] = []
         let slowTransport = PTYPingTransport(codexHome: fakeHome, supportRoot: slowRoot, binary: slowTUI, timing: testTiming)
-        _ = try slowTransport.ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!)) { progressEvents.append($0) }
+        _ = try slowTransport.ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!)) { progressEvents.append($0) }
         check(progressEvents.first?.outcome == "waiting" && progressEvents.first!.elapsedSeconds >= testTiming.warning && progressEvents.last?.outcome == "confirmed",
             "warning does not terminate PTY; delayed valid receipt still confirms within same attempt")
         check(try String(contentsOf: slowRoot.appendingPathComponent("home/launch-count"), encoding: .utf8) == "1", "warning never launches a duplicate ping")
@@ -1897,7 +1897,7 @@ import Darwin
         var recoveryProgress: [PingDiagnostic] = []
         do {
             _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: recoveringRoot, binary: completedTUI, timing: testTiming)
-                .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: recoveringUsage) { recoveryProgress.append($0) }
+                .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: recoveringUsage) { recoveryProgress.append($0) }
             check(recoveringUsage.calls == 3 && recoveryProgress.last?.windowConfirmed == true,
                 "completed ping survives temporary quota errors and PTY exit until the live window confirms")
         } catch {
@@ -1916,7 +1916,7 @@ import Darwin
         var providerPingBefore = pingBefore; providerPingBefore.accountID = "usage-test"
         var cooledProgress: [PingDiagnostic] = []
         _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: cooledRoot, binary: completedTUI, timing: testTiming)
-            .ping(before: providerPingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: cooledProvider) { cooledProgress.append($0) }
+            .ping(before: providerPingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: cooledProvider) { cooledProgress.append($0) }
         _ = try cooledProvider.read()
         check(cooledConnections == 2 && cooledFailure.calls == 1 && cooledRecovery.calls == 2 && cooledRecovery.closes == 0,
             "read-only ping verification respects production provider cooldown and reuses the recovered connection")
@@ -1931,7 +1931,7 @@ import Darwin
         let verificationTiming = PingTiming(warning: 0.2, timeout: 0.7, pollInterval: 0.05)
         do {
             _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: persistentRoot, binary: completedTUI, timing: verificationTiming)
-                .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: persistentUsage) { persistentProgress.append($0) }
+                .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: persistentUsage) { persistentProgress.append($0) }
             check(false, "persistent quota failure cannot confirm a completed ping")
         } catch let failure as PingFailure {
             check(failure.diagnostic.elapsedSeconds >= verificationTiming.timeout && failure.diagnostic.okReceived &&
@@ -1949,7 +1949,7 @@ import Darwin
         let changedUsage = ConfirmationTestUsage { _ in try FakePingUsage(account: "other-confirmation-account").read() }
         do {
             _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: changedRoot, binary: completedTUI, timing: testTiming)
-                .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: changedUsage)
+                .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: changedUsage)
             check(false, "another account cannot confirm a sent keep-alive")
         } catch let failure as PingFailure {
             check(failure.diagnostic.reason == .accountChanged && changedUsage.calls == 1 && failure.diagnostic.elapsedSeconds < testTiming.timeout,
@@ -1963,7 +1963,7 @@ import Darwin
             let fatalUsage = ConfirmationTestUsage { _ in throw error }
             do {
                 _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: root, binary: completedTUI, timing: testTiming)
-                    .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: fatalUsage)
+                    .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: fatalUsage)
                 check(false, "terminal \(name) error must stop verification")
             } catch let failure as PingFailure {
                 check(fatalUsage.calls == 1 && failure.diagnostic.elapsedSeconds < testTiming.timeout && failure.diagnostic.reason == .quotaRead,
@@ -1980,7 +1980,7 @@ import Darwin
         do {
             _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: temp.appendingPathComponent("unsupported-confirmation-ping"),
                 binary: completedTUI, timing: testTiming)
-                .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: unsupportedProvider)
+                .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: unsupportedProvider)
             check(false, "unsupported account capability cannot verify keep-alive")
         } catch let failure as PingFailure {
             check(failure.diagnostic.quotaReadFailure?.reason == "capability_or_authentication" &&
@@ -1991,7 +1991,7 @@ import Darwin
         let cancelQuotaTransport = PTYPingTransport(codexHome: fakeHome, supportRoot: cancelQuotaRoot, binary: completedTUI, timing: testTiming)
         let cancelQuotaUsage = ConfirmationTestUsage { _ in cancelQuotaTransport.cancel(); throw CodexConnectionError.timeout }
         do {
-            _ = try cancelQuotaTransport.ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: cancelQuotaUsage)
+            _ = try cancelQuotaTransport.ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: cancelQuotaUsage)
             check(false, "cancellation during quota verification must stop")
         } catch let failure as PingFailure {
             check(failure.diagnostic.outcome == "cancelled" && cancelQuotaUsage.calls == 1 && !failure.diagnostic.windowConfirmed,
@@ -2004,7 +2004,7 @@ import Darwin
         do {
             _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: temp.appendingPathComponent("late-quota-ping"),
                 binary: completedTUI, timing: lateQuotaTiming)
-                .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: lateQuotaUsage)
+                .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: lateQuotaUsage)
             check(false, "a failed in-flight query cannot confirm past deadline")
         } catch let failure as PingFailure {
             check(lateQuotaUsage.calls == 1 && failure.diagnostic.elapsedSeconds >= lateQuotaTiming.timeout,
@@ -2016,7 +2016,7 @@ import Darwin
         let timeoutTiming = PingTiming(warning: 0.2, timeout: 0.7, pollInterval: 0.05)
         do {
             _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: temp.appendingPathComponent("timeout-ping"), binary: slowTUI, timing: timeoutTiming)
-                .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!)) { timedOutProgress.append($0) }
+                .ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!)) { timedOutProgress.append($0) }
             check(false, "no reply must reach final timeout")
         } catch let failure as PingFailure {
             check(timedOutProgress.first?.outcome == "waiting" && failure.diagnostic.elapsedSeconds >= timeoutTiming.timeout && failure.diagnostic.reason == .unknown,
@@ -2024,7 +2024,7 @@ import Darwin
         }
         let cancelledTransport = PTYPingTransport(codexHome: fakeHome, supportRoot: temp.appendingPathComponent("cancelled-ping"), binary: slowTUI, timing: testTiming)
         do {
-            _ = try cancelledTransport.ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!)) { progress in
+            _ = try cancelledTransport.ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!)) { progress in
                 if progress.outcome == "waiting" { cancelledTransport.cancel() }
             }
             check(false, "cancel after warning must stop without success")
@@ -2769,25 +2769,30 @@ import Darwin
             func readyForRace() async throws {
                 prefs.set(false, forKey: "enabled")
                 try await reload(snapshot(at: pingNow))
+                let models = provider.modelReadCount
+                provider.pauseModel()
                 prefs.set(true, forKey: "enabled")
-                provider.pause()
                 state.recompute()
-                try await Task.sleep(nanoseconds: 50_000_000)
+                for _ in 0..<300 {
+                    if execution.running && provider.modelReadCount > models { break }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                guard execution.running, provider.modelReadCount > models else { throw CodexConnectionError.timeout }
             }
             try await readyForRace()
             var switched = snapshot(at: pingNow); switched.accountID = "different-account"
-            provider.set(switched); provider.release(); try await settle()
+            provider.set(switched); provider.releaseModel(); try await settle()
             check(pings.count == 4 && execution.lastFailure != nil,
                 "changing the actual ping account during preflight still blocks every send")
             try await readyForRace()
             unavailable = snapshot(at: pingNow); unavailable.zeroUseWindowActive = true
-            provider.set(unavailable); provider.release(); try await settle()
+            provider.set(unavailable); provider.releaseModel(); try await settle()
             check(pings.count == 4, "a window that becomes active during ping preflight is not opened again")
             try await readyForRace()
             let surprisePath = traces.appendingPathComponent("rollout-\(childID).jsonl")
             try (metadata(childID, at: pingNow.addingTimeInterval(-60)) + event("error", pingNow.addingTimeInterval(-1), ["message": "usage_limit_reached"]))
                 .write(to: surprisePath, atomically: true, encoding: .utf8)
-            provider.release(); try await settle()
+            provider.releaseModel(); try await settle()
             check(pings.count == 4 && execution.lastFailure != nil,
                 "the final fresh task scan rejects a newly paused episode outside the frozen ignored set")
             try FileManager.default.removeItem(at: surprisePath)
@@ -2795,7 +2800,7 @@ import Darwin
             let originalTrace = try String(contentsOf: path, encoding: .utf8)
             try (originalTrace + event("user_message", pingNow)).write(to: path, atomically: true, encoding: .utf8)
             state.sessions.refresh(); try await settle()
-            provider.release(); try await settle()
+            provider.releaseModel(); try await settle()
             check(pings.count == 4 && state.choices.recoveryDecisions?[target.episodeKey] == nil,
                 "a changed task that revokes the frozen ignored state aborts the pending keep-alive")
             check(resumes.count == 0 && !execution.hasAttempted(target),
@@ -2803,6 +2808,7 @@ import Darwin
             state.usage.stop(); state.sessions.stop()
         }
 
+        try await checkUsagePollingAndDrift(check, root: temp.appendingPathComponent("polling-regression"))
         print("\(count - failed)/\(count) regression checks passed")
         if failed > 0 { exit(1) }
     }
@@ -2850,7 +2856,7 @@ final class UnnotifiedExitProcess: Process, @unchecked Sendable {
 
 struct FakePingUsage: UsageProvider {
     let account: String
-    func pingModel() throws -> PingModel { PingModel(model: "gpt-5.6-luna", reasoningEffort: "low") }
+    func pingModel() throws -> PingModel { PingModel(model: "gpt-6-luna", reasoningEffort: "low") }
     func read() throws -> UsageSnapshot {
         let now = Date()
         return UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: now.addingTimeInterval(5 * 3600)), weekly: nil, capturedAt: now, accountID: account, sourceFile: "app-server", zeroUseWindowActive: true)
@@ -2990,9 +2996,20 @@ final class RecoveryTestUsage: UsageProvider, @unchecked Sendable {
     private var failing = false
     private var paused = false
     private var reads = 0
+    private var modelPaused = false
+    private var models = 0
     init(snapshot: UsageSnapshot) { self.snapshot = snapshot }
     var readCount: Int { condition.lock(); defer { condition.unlock() }; return reads }
-    func pingModel() throws -> PingModel { PingModel(model: "gpt-5.6-luna", reasoningEffort: "low") }
+    var modelReadCount: Int { condition.lock(); defer { condition.unlock() }; return models }
+    func pingModel() throws -> PingModel {
+        condition.lock(); defer { condition.unlock() }
+        models += 1
+        let limit = Date().addingTimeInterval(3)
+        while modelPaused { if !condition.wait(until: limit) { throw CodexConnectionError.timeout } }
+        return PingModel(model: "gpt-6-luna", reasoningEffort: "low")
+    }
+    func pauseModel() { condition.lock(); modelPaused = true; condition.unlock() }
+    func releaseModel() { condition.lock(); modelPaused = false; condition.broadcast(); condition.unlock() }
     func set(_ value: UsageSnapshot, failing: Bool = false) {
         condition.lock(); defer { condition.unlock() }
         snapshot = value; self.failing = failing

@@ -9,6 +9,8 @@ import Darwin
     @Published private(set) var warning: String?
     @Published private(set) var activeMode: NextActionMode?
     @Published private(set) var status = L10n.text("等待计划")
+    @Published private(set) var confirmations: [ExecutionConfirmation] = []
+    private(set) var confirmedWindows: [KeepAliveWindowEvidence] = []
     private var attempts: Set<String>
     private let ledgerURL: URL
     private let events: ExecutionEventLog
@@ -32,6 +34,8 @@ import Darwin
         self.defaults = defaults
         self.ledgerURL = ledgerURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/resume-attempts.json")
         self.events = ExecutionEventLog(url: self.ledgerURL.deletingLastPathComponent().appendingPathComponent("execution-events.jsonl"))
+        confirmations = events.confirmations()
+        confirmedWindows = events.keepAliveWindows()
         if FileManager.default.fileExists(atPath: self.ledgerURL.path) {
             if let data = try? Data(contentsOf: self.ledgerURL), let saved = try? JSONDecoder().decode([String].self, from: data) { attempts = Set(saved) }
             else { attempts = []; ledgerHealthy = false; status = L10n.text("执行记录无法读取，已暂停自动操作") }
@@ -83,6 +87,7 @@ import Darwin
                 let blocked = try await Task.detached { try SessionWatcher.freshBlockedSessions(codexHome: self.codexHome) }.value
                 guard blocked.allSatisfy({ ignoredEpisodes.contains($0.episodeKey) }), !hasPending(), operation == generation,
                       defaults.bool(forKey: "enabled"), before.isFresh(at: now()),
+                      Calendar.current.timeZone.identifier == schedule.timeZoneID,
                       (defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480) == schedule.anchorMinutes,
                       schedule.currentKeepAliveNode(at: now()) == node else { throw CodexConnectionError.server("保活条件已改变，等待重新确认") }
                 attempts.insert(key)
@@ -100,7 +105,11 @@ import Darwin
                         }
                     }
                 }.value
-                try events.record("confirmed", kind: "ping", node: node, before: before, after: after)
+                guard PingConfirmation.accepts(before: before, after: after, now: now()) else {
+                    throw CodexConnectionError.server("保活已发送，但未确认新窗口；本轮不再重试")
+                }
+                try events.record("confirmed", kind: "ping", node: node, before: before, after: after, schedule: schedule)
+                reloadConfirmations()
                 status = L10n.text("已确认新的 5 小时窗口")
             } catch {
                 status = error.localizedDescription; lastFailure = status
@@ -111,7 +120,10 @@ import Darwin
         }
     }
 
-    var confirmations: [ExecutionConfirmation] { events.confirmations() }
+    private func reloadConfirmations() {
+        confirmedWindows = events.keepAliveWindows()
+        confirmations = events.confirmations()
+    }
 
     func hasAttempted(_ target: BlockedSession) -> Bool { attempts.contains(target.episodeKey) }
 
@@ -191,6 +203,7 @@ import Darwin
             try events.record("started", kind: "resume", node: nil, threadID: target.id)
             let receipt = try await Task.detached { try transport.resume(target, prompt: prompt) }.value
             try events.record("confirmed", kind: "resume", node: nil, threadID: target.id, turnID: receipt.turnID)
+            reloadConfirmations()
             return nil
         } catch {
             try? events.record("failed", kind: "resume", node: nil, error: error.localizedDescription, threadID: target.id)

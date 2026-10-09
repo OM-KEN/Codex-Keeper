@@ -13,6 +13,11 @@ struct UserUsageEvidence: Equatable {
     }
 }
 
+enum AuthenticationObservation: Equatable {
+    case known(Data?)
+    case unreadable
+}
+
 /// 单个 Codex session 的活动概况
 struct SessionActivity: Equatable {
     let id: String
@@ -47,6 +52,7 @@ final class SessionWatcher: ObservableObject {
     @Published private(set) var sessions: [SessionActivity] = []
 
     @Published private(set) var detectionError: String?
+    @Published private(set) var authentication: AuthenticationObservation = .unreadable
     private let worker: SessionScanWorker
     private var timer: Timer?
     private var refreshing = false
@@ -70,10 +76,17 @@ final class SessionWatcher: ObservableObject {
         let worker = worker
         let ids = watchedIDs
         Task {
-            let result = await Task.detached { worker.read(watchedIDs: ids) }.value
+            let result = await Task.detached { () -> ([SessionActivity], String?, AuthenticationObservation) in
+                let sessions = worker.read(watchedIDs: ids)
+                let auth: AuthenticationObservation
+                do { auth = .known(try AppServerUsageProvider.authenticationIdentity(home: worker.codexHome)) }
+                catch { auth = .unreadable }
+                return (sessions.0, sessions.1, auth)
+            }.value
+            authentication = result.2
             hasScanned = true
-            sessions = result.0
             detectionError = result.1
+            sessions = result.0
             refreshing = false
         }
     }
@@ -251,7 +264,8 @@ private final class SessionScanWorker {
             // A new installation with no sessions has no candidates to resume.
             if !all.isEmpty || !watchedIDs.isEmpty { errorMessage = error.localizedDescription }
         }
-        let ids = watchedIDs.union(stops.keys)
+        let runningIDs = Set(cache.values.filter { $0.activity.taskRunning }.map { $0.activity.id })
+        let ids = watchedIDs.union(stops.keys).union(runningIDs)
         let recent = Set(all.prefix(20).map { $0.url })
         let files = all.filter { file in recent.contains(file.url) || ids.contains { file.url.deletingPathExtension().lastPathComponent.hasSuffix($0) } }
         var titles: [String: String] = [:]
@@ -269,6 +283,12 @@ private final class SessionScanWorker {
             if let cached = cache[file.url], cached.mtime == file.mtime { activity = cached.activity }
             else if let parsed = SessionWatcher.parse(url: file.url, mtime: file.mtime) {
                 cache[file.url] = (file.mtime, parsed); activity = parsed
+            } else {
+                let name = file.url.deletingPathExtension().lastPathComponent
+                if cache[file.url] != nil || name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) != nil {
+                    errorMessage = L10n.text("无法读取 Codex 本地暂停记录")
+                }
+                activity = cache[file.url]?.activity
             }
             guard var activity else { continue }
             activity.title = titles[activity.id]
@@ -285,7 +305,11 @@ private final class SessionScanWorker {
             activities.append(activity)
         }
         let existing = Set(all.map { $0.url })
-        cache = cache.filter { existing.contains($0.key) }
+        if cache.contains(where: { !existing.contains($0.key) && $0.value.activity.taskRunning }) {
+            errorMessage = L10n.text("无法读取 Codex 本地暂停记录")
+            activities += cache.filter { !existing.contains($0.key) && $0.value.activity.taskRunning }.map { $0.value.activity }
+        }
+        cache = cache.filter { existing.contains($0.key) || $0.value.activity.taskRunning }
         return (activities.sorted { $0.lastActivityAt > $1.lastActivityAt }, errorMessage)
     }
 }
