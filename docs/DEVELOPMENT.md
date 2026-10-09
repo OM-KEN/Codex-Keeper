@@ -23,7 +23,7 @@ open .build/CodexKeeper.app
 ## 适用范围与兼容性
 
 - **平台**：Apple Silicon、macOS 13+。部署下限与验证机器上官方 Codex 应用声明的 13.0 一致；已通过该目标编译，尚未在 macOS 13 真机验证。macOS 13 使用原生编辑器样式，14+ 使用 plain 样式。
-- **已核验客户端**：2026-09-27，本机 Codex 26.924.22138，内置 CLI 0.158.0-alpha.2.1；已确认 CLI 定位和只读额度查询。此前 2026-09-16 核验过 Codex 26.908.70816（9275）及 CLI 0.154.0-alpha.6.2。两个版本的官方应用包名均为 ChatGPT.app，bundle ID 为 com.openai.codex。
+- **已核验客户端**：2026-10-09，本机 Codex 26.1002.52244（13536），内置 CLI 0.162.0-alpha.2；已确认 CLI 定位、只读查询、无提示词启动及计划保活的真实完成。此前核验过 Codex 26.924.22138 / CLI 0.158.0-alpha.2.1 和 Codex 26.908.70816（9275）/ CLI 0.154.0-alpha.6.2。官方应用包名为 ChatGPT.app，bundle ID 为 com.openai.codex。
 - **账户**：ChatGPT 登录；API key 和其他登录方式不支持。账户 ID 优先使用额度响应，缺失时核对本地认证文件的稳定 account_id；冲突、缺失或读中变化均暂停自动操作，不以邮箱代替身份。
 - **安装路径**：优先运行中的官方 Codex 应用，其次系统及用户 Applications 中的 Codex.app / ChatGPT.app，再检查绝对 PATH 和常用 Homebrew 路径。每个应用包先查新版内置 CLI `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`，再兼容旧版 `Contents/Resources/codex`；标准安装位置不依赖 shell PATH，无须另装 CLI。
 - **手动兜底**：正常设置页不显示备用路径。找不到可用的 Codex CLI 时，点击菜单中的错误提示打开独立的路径窗口，可输入或选择文件，保存后立即重试。保存前去除首尾空白并展开 `~/`，要求绝对路径指向存在且可执行的普通文件，支持文件符号链接及路径中的空格；空白输入不能提交，不执行 shell 展开或 `--version` 探测。已保存路径仍仅在自动候选不可用时使用。额度查询、保活及独立 app-server 续跑共用 `CodexLocator`，直接将路径传给进程。
@@ -34,6 +34,20 @@ open .build/CodexKeeper.app
 官方接口用于账户、额度、模型发现和独立 app-server 续跑。桌面 IPC、rollout、日志数据库、认证和草稿文件仍含非公开兼容层，因此不能承诺支持 Codex 的所有历史与未来版本。升级 Codex 后应重新核验；无法可靠确认时停止并显示错误。
 
 资料：[官方 App Server 文档](https://learn.chatgpt.com/docs/app-server)、[Codex 模型](https://learn.chatgpt.com/docs/models)、[Codex 应用](https://learn.chatgpt.com/docs/app)。应用网页确认 Apple Silicon 支持，macOS 13 下限来自上述安装包的 Info.plist。
+
+### 本机 CLI 更新监测
+
+2026-10-09 按用户要求改为本机脚本 `Scripts/check_codex_updates.py`，由用户 LaunchAgent `com.codexkeeper.update-reminder` 每天本机时间 09:00 运行。已有基线时，09:00 前登录只等待计划时间；09:00 后登录可补当天检查，完成后同日不重复。首次安装的 09:00 前基线不占用当天定时检查。任务配置位于 `~/Library/LaunchAgents/com.codexkeeper.update-reminder.plist`，引用当前项目的绝对路径；搬迁项目后需要更新该路径。这是本机工具，不随 Keeper 安装包分发。
+
+脚本只调用 `./Probes/check-cli-compatibility.sh --identity`，按生产定位规则及 Keeper 备用路径读取 CLI 路径、版本和 SHA-256，并读取所在桌面应用的版本/构建；不执行 `--check`、账户/额度查询、测试、修复或应用替换，不调用模型，也不向 Codex 聊天发送消息。原每 15 分钟运行的 Codex 自动化「监测 CLI 更新并修复 Keeper 兼容性」（`cli-keeper`）已于 2026-10-09 按用户要求删除。
+
+官方来源为 [openai/codex Releases Atom](https://github.com/openai/codex/releases.atom)，支持 ETag 条件请求。curl 优先沿用显式代理环境变量；后台没有这些变量时读取 macOS 系统 HTTPS 代理，不修改系统或 Keeper 网络设置。首次运行只建立基线；之后本机 CLI 或桌面应用变化、官方发布说明新增/修改且包含服务通信、额度、账户认证、模型、任务记录、配置权限或交互启动相关关键词时，合并为一次 macOS 通知（由“脚本编辑器”通知来源显示），同一变化不重复提醒。空白预发布说明和未命中关键词的说明保持安静；这只是关键词筛选，不能判定实际兼容性，也不能覆盖未公开或已退出订阅源的变更。兼容性由用户自行检查。
+
+脚本状态、日志和最近完整提醒分别位于 `~/Library/Application Support/CodexKeeper/update-reminder/state.json`、该目录的 `launchd.log` / `launchd-error.log` 和 `last-change.md`。状态原子保存，读取失败保留上次基线；官方订阅源暂时不可用时留待次日，不把网络错误当作更新。本机 CLI 原先可读而后来读取失败时提醒一次，持续相同失败不重复提醒。旧 `cli-compatibility-monitor.json` 及真实执行历史保留。脚本回归：`/usr/bin/python3 -B -m unittest discover -s Tests -p test_update_reminder.py`。
+
+需要人工验证时，`./Probes/check-cli-compatibility.sh --check` 可检查账户/额度/模型及无提示词 TUI 启动；配置生成函数由生产保活与探针共用，覆盖全新目录与旧后台服务路径。启动通过不等于保活成功，完整结果仍从计划操作的真实日志确认。提交、推送及发布仍需维护者明确同意。
+
+2026-10-09 本机验证：14 项脚本回归通过；09:32:59 的后台检查成功读取本机 CLI 和官方订阅源，并对相关发布说明请求系统通知。通知请求成功不等于已目视确认横幅。
 
 ## 安装包与发布
 
@@ -107,7 +121,7 @@ PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 
 同日保活启动兼容修复在本地完成：619/619 项回归、macOS 13 arm64 构建和严格临时签名通过。CLI 0.158.0-alpha.2.1 与 0.162.0-alpha.2 的真实无提示词启动通过；新版遇到旧后台服务时进入 TUI，全新隔离目录未启动常驻服务。23:44 更新本机应用（版本号 0.1.7），23:45:05 确认真实额度读取；执行日志、尝试记录、暂停任务状态和偏好保持原样。当时未额外发送保活或续跑，真实新窗口确认留待下一计划节点；未提交、推送或发布。证据与原应用 ZIP 位于 `.build/verification/ping-daemon-20261008/`。
 
-2026-10-09：08:06:25 开始的计划保活于 08:07:13（北京时间）记录 `confirmed`，诊断同时确认隔离任务完成及同一账户真实新五小时窗口。此保活启动兼容修复纳入 v0.1.8，发布验证记录位于 `.build/release-v0.1.8/`；长期稳定性、其他 Mac 与 macOS 13 真机仍待核验。
+2026-10-09：08:06:25 开始的计划保活于 08:07:13（北京时间）记录 `confirmed`，诊断同时确认隔离任务完成及同一账户真实新五小时窗口。此保活启动兼容修复已随 v0.1.8 正式发布：619/619 项回归、macOS 13 arm64 构建和严格临时签名通过；已核对远端提交与 tag、稳定版 Latest、唯一 DMG 的 Finder 布局及下载大小和 SHA-256。本机正在运行 v0.1.8，二进制与发布包一致且签名有效。发布验证记录位于 `.build/release-v0.1.8/`；长期稳定性、其他 Mac 与 macOS 13 真机仍待核验。
 
 ## 现役行为
 

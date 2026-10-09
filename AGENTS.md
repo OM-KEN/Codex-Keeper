@@ -11,6 +11,7 @@
 - 修改额度读取时保留连接复用和用途隔离；专用查询的配置覆盖不能影响续跑，机制与流量验证边界见 `docs/DEVELOPMENT.md`。
 - 确认执行结果必须检查真实日志；不能将 started、进程退出成功或普通 OK 回复当作保活成功。
 - 运行数据位于 `~/Library/Application Support/CodexKeeper/`，不要清空尝试记录或挪动用户任务历史。
+- 本机 CLI 更新提醒每天 09:00 由 `Scripts/check_codex_updates.py` 运行，只读指纹和官方更新说明，不调用模型；配置与边界见 `docs/DEVELOPMENT.md`，不要恢复高频 Codex 自动化。
 - 替换或重启应用前先检查是否有正在执行的 Keeper 操作，避免丢失确认记录。
 - `.build/` 是本地构建与隔离验证输出；旧副本不是现役源码或指令。
 - 精准修改；UI 保持主次清晰，不把后台边缘逻辑堆成用户选项。
