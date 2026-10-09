@@ -87,11 +87,28 @@ final class PTYPingTransport: PingTransport {
         try ping(before: before, model: model, provider: provider, progress: { _ in })
     }
 
+    static func configuration(work: URL, model: PingModel) throws -> String {
+        let reasoning = model.reasoningEffort.map { "model_reasoning_effort = \"\($0)\"" } ?? ""
+        // This is Keeper's own empty directory, not an approval of a user project or a tool request.
+        // TOML strings accept JSON escapes except the optional escaped forward slash.
+        let quotedWork = String(data: try JSONSerialization.data(withJSONObject: work.path, options: [.fragmentsAllowed, .withoutEscapingSlashes]), encoding: .utf8)!
+        return """
+        model = "gpt-5.6-luna"
+        \(reasoning)
+        sandbox_mode = "read-only"
+        approval_policy = "never"
+        forced_login_method = "chatgpt"
+        developer_instructions = "Reply only OK. Do not call tools or read files."
+        features.daemon_auto_start = false
+        [projects.\(quotedWork)]
+        trust_level = "trusted"
+        """
+    }
+
     func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> UsageSnapshot {
         lock.lock(); cancelled = false; lock.unlock()
         let fm = FileManager.default
         guard model.model == "gpt-5.6-luna" else { throw CodexConnectionError.server("保活模型未经确认") }
-        let reasoning = model.reasoningEffort.map { "model_reasoning_effort = \"\($0)\"" } ?? ""
         let root = supportRoot ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/ping")
         let home = root.appendingPathComponent("home")
         let work = root.appendingPathComponent("work")
@@ -101,19 +118,7 @@ final class PTYPingTransport: PingTransport {
         let authURL = home.appendingPathComponent("auth.json")
         try auth.write(to: authURL, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authURL.path)
-        // This is Keeper's own empty directory, not an approval of a user project or a tool request.
-        // TOML strings accept JSON escapes except the optional escaped forward slash.
-        let quotedWork = String(data: try JSONSerialization.data(withJSONObject: work.path, options: [.fragmentsAllowed, .withoutEscapingSlashes]), encoding: .utf8)!
-        let config = """
-        model = "gpt-5.6-luna"
-        \(reasoning)
-        sandbox_mode = "read-only"
-        approval_policy = "never"
-        forced_login_method = "chatgpt"
-        developer_instructions = "Reply only OK. Do not call tools or read files."
-        [projects.\(quotedWork)]
-        trust_level = "trusted"
-        """
+        let config = try Self.configuration(work: work, model: model)
         try config.write(to: home.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
         let binary = try executable ?? CodexLocator.binary()
         var master: Int32 = -1

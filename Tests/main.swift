@@ -1780,7 +1780,12 @@ import Darwin
         assert sys.argv[-1]=='ok'
         assert os.environ['CODEX_HOME'] != '\(fakeHome.path)'
         assert not os.environ.get('OPENAI_API_KEY')
-        directory=pathlib.Path(os.environ['CODEX_HOME'])/'sessions'
+        root=pathlib.Path(os.environ['CODEX_HOME'])
+        if 'features.daemon_auto_start = false' not in (root/'config.toml').read_text():
+            print('Background server has incompatible feature settings',flush=True)
+            time.sleep(25)
+            sys.exit(1)
+        directory=root/'sessions'
         directory.mkdir(parents=True,exist_ok=True)
         rows=[{'type':'session_meta','payload':{'id':'11111111-1111-1111-1111-111111111111'}},{'payload':{'type':'task_started','turn_id':'22222222-2222-2222-2222-222222222222'}},{'payload':{'role':'assistant','content':[{'text':'OK'}]}},{'payload':{'type':'task_complete','turn_id':'22222222-2222-2222-2222-222222222222'}}]
         (directory/'rollout-fake.jsonl').write_text(chr(10).join(json.dumps(x) for x in rows))
@@ -1790,8 +1795,10 @@ import Darwin
         try ttyScript.write(to: fakeTUI, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeTUI.path)
         var pingBefore = beforePing; pingBefore.capturedAt = Date(); pingBefore.fiveHour?.resetsAt = Date().addingTimeInterval(-10)
-        let pingResult = try PTYPingTransport(codexHome: fakeHome, supportRoot: pingRoot, binary: fakeTUI).ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!))
-        check(pingResult.fiveHour != nil, "PTY smoke test uses actual terminal and confirms live window")
+        let pingResult = try PTYPingTransport(codexHome: fakeHome, supportRoot: pingRoot, binary: fakeTUI,
+            timing: PingTiming(warning: 0.2, timeout: 1.5, pollInterval: 0.05))
+            .ping(before: pingBefore, model: PingModel(model: "gpt-5.6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!))
+        check(pingResult.fiveHour != nil, "PTY ping runs independently of incompatible shared daemon and confirms live window")
         let receiptHome = pingRoot.appendingPathComponent("home")
         check(PingReceipt.completed(home: receiptHome, excluding: []), "own new OK completion proves ping was sent")
         let previousReceipts = Set(SessionWatcher.recentRollouts(codexHome: receiptHome, limit: 20).map(\.url))
