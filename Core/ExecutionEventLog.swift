@@ -33,7 +33,8 @@ struct ExecutionEventLog {
             let reset = (row["after_reset"] as? String).flatMap(iso.date(from:))
             return ExecutionConfirmation(kind: kind == "ping" ? .keepAlive : .resume,
                 actionAt: starts[key] ?? at, confirmedAt: at,
-                windowStart: reset?.addingTimeInterval(-ScheduleEngine.windowDuration))
+                windowStart: reset?.addingTimeInterval(-ScheduleEngine.windowDuration),
+                accountID: (row["account_id"] as? String).flatMap { $0.isEmpty ? nil : $0 })
         }
     }
 
@@ -64,12 +65,13 @@ struct ExecutionEventLog {
         }
     }
 
-    func record(_ event: String, kind: String, node: Date?, before: UsageSnapshot? = nil, after: UsageSnapshot? = nil, error: String? = nil, threadID: String? = nil, turnID: String? = nil, diagnostic: PingDiagnostic? = nil, schedule: ScheduleEngine? = nil) throws {
+    func record(_ event: String, kind: String, node: Date?, before: UsageSnapshot? = nil, after: UsageSnapshot? = nil, error: String? = nil, threadID: String? = nil, turnID: String? = nil, diagnostic: PingDiagnostic? = nil, schedule: ScheduleEngine? = nil, accountID: String? = nil) throws {
         let iso = ISO8601DateFormatter()
         var row: [String: Any] = ["event": event, "kind": kind, "at": iso.string(from: Date())]
         if let node { row["node"] = iso.string(from: node) }
         if let reset = before?.fiveHour?.resetsAt { row["before_reset"] = iso.string(from: reset) }
         if let reset = after?.fiveHour?.resetsAt { row["after_reset"] = iso.string(from: reset) }
+        if let accountID, !accountID.isEmpty { row["account_id"] = accountID }
         if event == "confirmed", kind == "ping", let before, let after, let schedule,
            PingConfirmation.accepts(before: before, after: after, now: Date()) {
             row["window_evidence_version"] = 1
@@ -99,4 +101,5 @@ struct ExecutionConfirmation {
     let actionAt: Date
     let confirmedAt: Date
     let windowStart: Date?
+    var accountID: String? = nil
 }

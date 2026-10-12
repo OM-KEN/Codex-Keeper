@@ -8,7 +8,7 @@ import UserNotifications
     private let menu = NSMenu()
     private var summaryHost: NSHostingView<MenuSummaryView>?
     private let summaryItem = NSMenuItem()
-    private var quotaHost: NSHostingView<MenuQuotaView>?
+    private var quotaHost: MenuQuotaHostView?
     private let quotaItem = NSMenuItem()
     private let quotaSeparator = NSMenuItem.separator()
     private var cancelResumeItem: NSMenuItem?
@@ -80,6 +80,8 @@ import UserNotifications
         executionFailureSeen = true
         appState.refresh(manual: true, source: "menu_open"); rebuildMenu()
     }
+    func menuWillOpen(_ menu: NSMenu) { quotaHost?.menuWillOpen() }
+    func menuDidClose(_ menu: NSMenu) { quotaHost?.menuDidClose() }
     func shutdown() { updateService.stop(); appState.execution.cancelCurrent() }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -158,7 +160,7 @@ import UserNotifications
             menu.addItem(summaryItem)
             menu.addItem(quotaSeparator)
             cancelResumeItem = row(L10n.text("取消下一次自动继续"), action: #selector(useKeepAlive))
-            let quotaHost = NSHostingView(rootView: MenuQuotaView(quotas: summary.quotas))
+            let quotaHost = MenuQuotaHostView(quotas: summary.quotas, accountID: summary.quotaAccountID)
             self.quotaHost = quotaHost
             quotaItem.view = quotaHost
             menu.addItem(quotaItem)
@@ -172,11 +174,7 @@ import UserNotifications
         cancelResumeItem?.title = L10n.text(appState.nextAction?.needsRecoveryDecision == true ? "选择续跑方式…" : "取消下一次自动继续")
         cancelResumeItem?.isHidden = !enabled || appState.selectedTasks.isEmpty
         cancelResumeItem?.isEnabled = !appState.execution.running
-        quotaHost?.rootView = MenuQuotaView(quotas: summary.quotas)
-        quotaHost?.layoutSubtreeIfNeeded()
-        if let quotaHost {
-            quotaHost.frame.size = NSSize(width: 304, height: quotaHost.fittingSize.height)
-        }
+        quotaHost?.update(quotas: summary.quotas, accountID: summary.quotaAccountID)
         quotaItem.isHidden = summary.quotas.isEmpty
         quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
         let hasUpdate = updateService.showsMenuUpdateIndicator

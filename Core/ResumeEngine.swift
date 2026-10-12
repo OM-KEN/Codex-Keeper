@@ -109,7 +109,7 @@ final class AppServerResumeTransport: ResumeTransport {
         lock.lock(); activeClient = client; lock.unlock()
         defer { client.close(); lock.lock(); activeClient = nil; lock.unlock() }
         // No cwd/model/approval/sandbox overrides: retain the original session configuration.
-        let resumed = try client.request("thread/resume", params: ["threadId": target.id])
+        let resumed = try client.request("thread/resume", params: ["threadId": target.id, "excludeTurns": true])
         guard let thread = resumed["thread"] as? [String: Any], thread["id"] as? String == target.id,
               resumed["cwd"] as? String == target.cwd else { throw CodexConnectionError.server("恢复的会话或工作目录与原任务不一致") }
         if let status = thread["status"] as? [String: Any], status["type"] as? String == "active" {

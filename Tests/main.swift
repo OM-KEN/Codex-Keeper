@@ -10,6 +10,18 @@ import Darwin
             count += 1
             if !value { failed += 1; print("FAIL: \(name)") }
         }
+        try checkMenuTimelineHistory(check)
+        if CommandLine.arguments.contains("--timeline-history-only") {
+            print("\(count - failed)/\(count) timeline history checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
+        checkMenuQuotaPresentation(check)
+        if CommandLine.arguments.contains("--quota-display-only") {
+            print("\(count - failed)/\(count) quota display checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
         do {
             let updateSuite = "keeper.updates.tests." + UUID().uuidString
             let updateDefaults = UserDefaults(suiteName: updateSuite)!
@@ -301,8 +313,9 @@ import Darwin
             let menuPlan = planner.plan(now: menuUsage.capturedAt, enabled: true, autoResume: false,
                 earlyRecoveryPolicy: "ask", usage: menuUsage, blocked: [])
             let menu = MenuSummary.build(plan: menuPlan, usage: menuUsage, schedule: schedule, tasks: [], now: menuUsage.capturedAt)
-            check(menu.badge == "计划内" && menu.action == "保持活动" && menu.timeline.first?.date == windowStart,
-                "a 13:03:08 keep-alive window is shown on plan at its real start time")
+            check(menu.badge == "计划内" && menu.action == "保持活动" && menu.timeline.first?.date == windowStart &&
+                menu.timeline.first?.kind == .keepAliveNotNeeded && menu.timeline.first?.label == "无需保活",
+                "an unconfirmed 13:03:08 active window is shown on plan without claiming Keeper kept it alive")
             let lateStart = menuNode.addingTimeInterval(608)
             menuUsage.capturedAt = lateStart.addingTimeInterval(30); menuUsage.fiveHour?.resetsAt = lateStart.addingTimeInterval(18000)
             let latePlan = planner.plan(now: menuUsage.capturedAt, enabled: true, autoResume: false,
@@ -320,7 +333,7 @@ import Darwin
             let gapPlan = planner.plan(now: menuUsage.capturedAt, enabled: true, autoResume: false,
                 earlyRecoveryPolicy: "ask", usage: menuUsage, blocked: [])
             let gapMenu = MenuSummary.build(plan: gapPlan, usage: menuUsage, schedule: schedule, tasks: [], now: menuUsage.capturedAt)
-            check(gapMenu.timeline.map(\.kind) == [.start, .reset, .keepAlive] && gapMenu.timeline[1].date == gapReset &&
+            check(gapMenu.timeline.map(\.kind) == [.keepAliveNotNeeded, .reset, .keepAlive] && gapMenu.timeline[1].date == gapReset &&
                 gapMenu.timeline.last?.solidBefore == false,
                 "12:55 expiry and 13:00 keep-alive retain the real five-minute timeline gap")
         }
@@ -848,6 +861,9 @@ import Darwin
         let displayQuota = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 20, windowMinutes: 300, resetsAt: localNode.addingTimeInterval(660)), weekly: nil, capturedAt: localNode, sourceFile: "app-server")
         let displayPlan = engine.plan(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: displayQuota, blocked: [])
         let display = MenuSummary.build(plan: displayPlan, usage: displayQuota, schedule: schedule, tasks: [], now: localNode)
+        check(display.timeline.first?.kind == .keepAliveNotNeeded && display.timeline.first?.label == "无需保活" &&
+            display.timeline.first?.symbol == "circle.fill" && display.timeline.first?.isAction == false,
+            "an active off-plan window needs no keep-alive without claiming a successful execution")
         check(display.headline == "13:11" && display.action == "额度重置" && display.badge == "计划外", "off-plan menu highlights real reset without promising scheduled ping")
         check(display.note.isEmpty && display.timeline.map(\.time) == ["08:11", "13:11", "18:00"], "off-plan timeline replaces conditional paragraph with real window and plan")
         check(display.timeline.map(\.solidBefore) == [false, true, false], "actual window uses solid line and waiting uses dotted line")
@@ -858,6 +874,8 @@ import Darwin
         let stoppedMenu = MenuSummary.build(plan: stoppedPlan, usage: stoppedUsage, schedule: schedule, tasks: [stoppedTask], now: localNode)
         check(stoppedPlan.mode == .resume && stoppedPlan.date == displayQuota.fiveHour?.resetsAt, "quota-stop changes next action from 18:00 ping to 13:11 resume")
         check(stoppedMenu.timeline.map(\.time) == ["08:11", "13:11"] && stoppedMenu.timeline.last?.kind == .resume, "resume merges reset and continue into one point without 18:00 ping")
+        check(stoppedMenu.timeline.first?.kind == .start && stoppedMenu.timeline.first?.label == "开始",
+            "continuation plans retain the start state instead of a keep-alive status")
         check(stoppedMenu.badge == "计划外" && stoppedMenu.taskCount == 1, "pending task does not replace plan status badge")
         check(display.timeline.map(\.symbol) == ["circle.fill", "arrow.clockwise.circle.fill", "waveform.path.ecg"], "off-plan timeline uses requested native symbols")
         check(stoppedMenu.timeline.last?.symbol == "paperplane", "resume action uses paperplane without enclosing circle")
@@ -865,7 +883,7 @@ import Darwin
         let completedMenu = MenuSummary.build(plan: displayPlan, usage: displayQuota, schedule: schedule, tasks: [], confirmations: [confirmation], now: localNode)
         check(completedMenu.timeline.first?.symbol == "checkmark.circle.fill", "confirmed off-plan resume marks actual start complete")
         let unrelatedConfirmation = ExecutionConfirmation(kind: .keepAlive, actionAt: localNode.addingTimeInterval(-18000), confirmedAt: localNode, windowStart: nil)
-        check(MenuSummary.build(plan: displayPlan, usage: displayQuota, schedule: schedule, tasks: [], confirmations: [unrelatedConfirmation], now: localNode).timeline.first?.kind == .start, "unrelated successful operation cannot mark current window as Keeper controlled")
+        check(MenuSummary.build(plan: displayPlan, usage: displayQuota, schedule: schedule, tasks: [], confirmations: [unrelatedConfirmation], now: localNode).timeline.first?.kind == .keepAliveNotNeeded, "unrelated successful operation cannot mark current window as Keeper controlled")
         let recoveredAt = localNode.addingTimeInterval(670)
         let recoveredUsage = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: recoveredAt.addingTimeInterval(18000)), weekly: nil, capturedAt: recoveredAt, sourceFile: "app-server", zeroUseWindowActive: false)
         let recoveredPlan = engine.plan(now: recoveredAt, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: recoveredUsage, blocked: [stoppedTask], observedRecovery: true)
@@ -1221,6 +1239,7 @@ import Darwin
         let receipt = try AppServerResumeTransport(makeTransport: { fake }).resume(pending, prompt: "继续")
         check(receipt.turnID == "turn-1" && fake.closed, "resume observes matching completion")
         check(fake.calls.map { $0.0 } == ["thread/resume", "turn/start"], "resume never creates new thread")
+        check(fake.calls.first?.1["excludeTurns"] as? Bool == true, "resume requests metadata without historical turn payloads")
         check(fake.calls.allSatisfy { $0.1["approvalPolicy"] == nil && $0.1["sandboxPolicy"] == nil && $0.1["sandbox"] == nil }, "resume does not override user permissions")
         let ownerConnection = FakeDesktopConnection()
         ownerConnection.onStart = {
@@ -1263,6 +1282,8 @@ import Darwin
         import sys,json,os,time
         initialized=False
         quotaFailures=0
+        resumeTarget={}
+        turnStarts=0
         for line in sys.stdin:
             request=json.loads(line)
             method=request['method']
@@ -1271,6 +1292,19 @@ import Darwin
                 assert os.environ.get('CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED') == '1'
                 result={'userAgent':'fake'}
             elif method=='account/read': result={'account':{'type':'chatgpt'}}
+            elif method=='configure-resume': resumeTarget=request['params']; result={}
+            elif method=='thread/resume':
+                result={'cwd':resumeTarget['cwd'],'thread':{'id':resumeTarget['threadId'],'status':{'type':'idle'},'turns':[]}}
+                if not request['params'].get('excludeTurns'):
+                    result['thread']['turns']=[{'padding':'x'*(8*1024*1024+1)}]
+            elif method=='turn/start':
+                assert request['params']['threadId']==resumeTarget['threadId']
+                assert request['params']['input'][0]['text']=='继续'
+                assert turnStarts==0
+                turnStarts+=1
+                result={'turn':{'id':'large-history-turn'}}
+            elif method=='oversized-response': result={'padding':'x'*(8*1024*1024+1)}
+            elif method=='invalid-response': result=[]
             elif method=='fail-upstream-rate-limits': quotaFailures=2; result={}
             elif method=='account/rateLimits/read' and quotaFailures:
                 quotaFailures-=1
@@ -1280,6 +1314,8 @@ import Darwin
             else: result={'pid':os.getpid(),'arguments':sys.argv[1:]}
             if method=='close-input': os.close(0)
             print(json.dumps({'id':request['id'],'result':result}),flush=True)
+            if method=='turn/start':
+                print(json.dumps({'method':'turn/completed','params':{'threadId':resumeTarget['threadId'],'turn':{'id':'large-history-turn','status':'completed'}}}),flush=True)
             if method=='close-input': time.sleep(10); break
             if method=='exit': break
         """
@@ -1295,6 +1331,29 @@ import Darwin
         let pluginFreeUsage = try UsageDecoder.account(usageProcessClient.request("account/rateLimits/read", params: [:]), at: now)
         check(pluginFreeUsage.fiveHour?.usedPercent == 1, "usage-only child keeps quota RPC handshake working")
         usageProcessClient.close()
+        let largeHistoryClient = try AppServerClient(binary: executable)
+        _ = try largeHistoryClient.request("configure-resume", params: ["threadId": pending.id, "cwd": pending.cwd])
+        do {
+            let receipt = try AppServerResumeTransport(makeTransport: { largeHistoryClient }).resume(pending, prompt: "继续")
+            check(receipt.turnID == "large-history-turn", "real JSONL resume avoids oversized history and confirms its single matching turn")
+        } catch { check(false, "real JSONL resume avoids oversized history: \(error.localizedDescription)") }
+        let oversizedClient = try AppServerClient(binary: executable)
+        do {
+            _ = try oversizedClient.request("oversized-response", params: [:])
+            check(false, "oversized JSONL response must stop at the existing buffer limit")
+        } catch {
+            check(error.localizedDescription == L10n.text("Codex 返回的数据超过读取上限，已停止本次操作"), "buffer overflow reports response size rather than invalid format")
+            check(UsageReadFailure.reason(for: error) == "response_too_large" && !UsageReadFailure.canRetry(error), "oversized responses have a distinct non-retryable diagnostic")
+        }
+        oversizedClient.close()
+        let invalidClient = try AppServerClient(binary: executable)
+        do {
+            _ = try invalidClient.request("invalid-response", params: [:])
+            check(false, "invalid JSONL result shape must fail")
+        } catch {
+            check(UsageReadFailure.reason(for: error) == "invalid_response", "invalid result shape remains distinct from response size")
+        }
+        invalidClient.close()
         let healthyErrorClient = try AppServerClient(binary: executable, usageOnly: true)
         let healthyErrorPID = try healthyErrorClient.request("arguments", params: [:])["pid"] as? Int
         _ = try healthyErrorClient.request("fail-upstream-rate-limits", params: [:])
@@ -2814,6 +2873,192 @@ import Darwin
     }
 }
 
+private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
+    let calendar = Calendar.current
+    let day = calendar.date(from: DateComponents(year: 2026, month: 10, day: 12))!
+    func at(_ hour: Int, _ minute: Int = 0, _ second: Int = 0, days: Int = 0) -> Date {
+        calendar.date(byAdding: .day, value: days, to: day)!.addingTimeInterval(Double(hour * 3600 + minute * 60 + second))
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-timeline-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let log = ExecutionEventLog(url: directory.appendingPathComponent("events.jsonl"))
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let iso = ISO8601DateFormatter()
+    var records = Data()
+    for start in [at(8, 1), at(13, 1), at(18, 1)] {
+        let row: [String: Any] = ["kind": "ping", "event": "confirmed", "at": iso.string(from: start.addingTimeInterval(30)),
+            "after_reset": iso.string(from: start.addingTimeInterval(18000)), "account_id": "timeline-account"]
+        records.append(try JSONSerialization.data(withJSONObject: row)); records.append(10)
+    }
+    try records.write(to: log.url)
+    func reading(_ start: Date, at now: Date, account: String? = "timeline-account") -> UsageSnapshot {
+        UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 12, windowMinutes: 300, resetsAt: start.addingTimeInterval(18000)),
+            weekly: nil, capturedAt: now, accountID: account, sourceFile: "app-server")
+    }
+    func completed(_ kind: NextActionMode, _ start: Date, account: String? = "timeline-account",
+                   windowStart: Date? = nil) -> ExecutionConfirmation {
+        ExecutionConfirmation(kind: kind, actionAt: start, confirmedAt: start.addingTimeInterval(30),
+            windowStart: windowStart ?? (kind == .keepAlive ? start : nil), accountID: account)
+    }
+    func render(_ presentation: inout MenuPresentation, _ usage: UsageSnapshot?, at now: Date,
+                confirmations: [ExecutionConfirmation] = [], anchor: Int = 480, enabled: Bool = true,
+                autoResume: Bool = true, policy: String = "keepPlan", plan override: NextAction? = nil,
+                error: String? = nil, transient: Bool = false, sessionError: String? = nil,
+                running: Bool = false) -> MenuSummary {
+        let schedule = ScheduleEngine(anchorMinutes: anchor)
+        let plan = override ?? DecisionEngine(schedule: schedule).plan(now: now, enabled: enabled, autoResume: autoResume,
+            earlyRecoveryPolicy: policy, usage: usage, blocked: [])
+        return presentation.build(plan: plan, usage: usage, schedule: schedule, tasks: [], availableTasks: [],
+            choices: ResumeChoices(), enabled: enabled, autoResume: autoResume, earlyRecoveryPolicy: policy,
+            confirmations: confirmations, usageError: error, usageErrorIsTransient: transient, sessionError: sessionError,
+            running: running, executionMode: running ? .keepAlive : nil, now: now)
+    }
+    let now = at(19)
+    let usage = reading(at(18, 1), at: now)
+    let confirmations = log.confirmations()
+    var presentation = MenuPresentation()
+    let summary = render(&presentation, usage, at: now, confirmations: confirmations)
+    check(summary.timeline.map(\.date) == [at(13, 1), at(18, 1), at(23, 1)] &&
+        summary.timeline.map(\.kind) == [.completedKeepAlive, .completedKeepAlive, .keepAlive],
+        "18:01 confirmed window and 23:01 keep-alive prepend only the nearest same-account success")
+    check(confirmations.allSatisfy { $0.accountID == "timeline-account" }, "confirmed log account metadata survives decoding")
+    check(ExecutionConfirmation(kind: .resume, actionAt: at(13), confirmedAt: at(13, 1), windowStart: nil).accountID == nil,
+        "old confirmation construction remains compatible without assuming an account")
+    try log.record("confirmed", kind: "resume", node: nil, threadID: "verified-resume", accountID: "verified-account")
+    check(log.confirmations().last?.accountID == "verified-account", "future resume confirmation persists its verified account")
+
+    for (start, time, count) in [(at(8, 1), at(9), 4), (at(13, 1), at(15), 3)] {
+        var state = MenuPresentation()
+        let shown = render(&state, reading(start, at: time), at: time, confirmations: confirmations)
+        check(shown.timeline.count == count && shown.timeline.first?.date == start,
+            "an existing \(count)-point timeline never grows when older history is available")
+    }
+    var firstOpen = MenuPresentation()
+    let late = render(&firstOpen, reading(at(17, 59), at: at(21)), at: at(21))
+    check(late.timeline.map(\.date) == [at(17, 59), at(23)],
+        "first opening at 21:00 without reliable history keeps the actual 17:59 window and next action")
+    var onlyMorning = MenuPresentation()
+    let morningHistory = render(&onlyMorning, usage, at: now, confirmations: [completed(.keepAlive, at(8, 1))])
+    check(morningHistory.timeline.count == 3 && morningHistory.timeline.first?.date == at(8, 1),
+        "a real same-account morning ping remains usable in the evening window")
+    var resumed = MenuPresentation()
+    check(render(&resumed, usage, at: now, confirmations: [completed(.resume, at(13, 1))]).timeline.first?.kind == .completedResume,
+        "confirmed continuation history uses the existing completed label and icon")
+    for record in [completed(.keepAlive, at(13), account: "other-account"), completed(.resume, at(13), account: nil),
+                   completed(.keepAlive, at(23, days: -1)), completed(.keepAlive, at(20))] {
+        var state = MenuPresentation()
+        check(render(&state, usage, at: now, confirmations: [record]).timeline.count == 2,
+            "foreign, unscoped, prior-cycle or future confirmations never fill history: \(record.actionAt)")
+    }
+    var unscoped = MenuPresentation()
+    check(render(&unscoped, reading(at(18, 1), at: now, account: nil), at: now, confirmations: confirmations).timeline.count == 2,
+        "an unknown current account cannot borrow scoped confirmation history")
+    var failedRows = Data()
+    for event in ["started", "failed"] {
+        let row: [String: Any] = ["kind": "ping", "event": event, "at": iso.string(from: at(13)), "account_id": "timeline-account"]
+        failedRows.append(try JSONSerialization.data(withJSONObject: row)); failedRows.append(10)
+    }
+    try failedRows.write(to: log.url)
+    var failed = MenuPresentation()
+    check(render(&failed, usage, at: now, confirmations: log.confirmations()).timeline.count == 2,
+        "failed or merely started log records never produce completed historical nodes")
+
+    var inactive = usage; inactive.fiveHour?.usedPercent = 0; inactive.zeroUseWindowActive = false
+    let oneAction = NextAction(mode: .resume, date: at(23), decision: .wait(reason: "等待计划"), note: "等待计划")
+    var deduplicated = MenuPresentation()
+    let repeated = [completed(.keepAlive, at(8, 1)), completed(.resume, at(13, 1)),
+        completed(.resume, at(13, 1, 20)), completed(.keepAlive, at(13, 2), windowStart: at(13, 1))]
+    let distinct = render(&deduplicated, inactive, at: now, confirmations: repeated, plan: oneAction)
+    check(distinct.timeline.map(\.date) == [at(8, 1), at(13, 1, 20), at(23)],
+        "the most recent confirmation in one window occupies one slot while the older distinct success fills the other")
+    var noPlan = MenuPresentation()
+    let waiting = NextAction(mode: .keepAlive, date: nil, decision: .wait(reason: "等待额度恢复确认"), note: "等待额度恢复确认")
+    check(render(&noPlan, usage, at: now, confirmations: confirmations, plan: waiting).timeline.isEmpty,
+        "historical successes do not invent a timeline without any current next action")
+    var unknown = usage; unknown.fiveHour?.usedPercent = 0; unknown.zeroUseWindowActive = nil
+    var unknownState = MenuPresentation()
+    check(render(&unknownState, unknown, at: now).timeline.isEmpty,
+        "unknown window state without usable history cannot invent a window origin")
+
+    var observed = MenuPresentation()
+    _ = render(&observed, reading(at(8, 11), at: at(9)), at: at(9))
+    let later = render(&observed, reading(at(18, 1, 13), at: now), at: now)
+    check(later.timeline.count == 3 && later.timeline.first?.date == at(13, 11) && later.timeline.first?.kind == .reset,
+        "a later fresh active window verifies the old 13:11 reset and selects it before the older observed origin")
+    var nearReset = MenuPresentation()
+    _ = render(&nearReset, reading(at(13, 1), at: at(15)), at: at(15))
+    let joined = render(&nearReset, reading(at(18, 1, 13), at: now), at: now)
+    check(joined.timeline.map(\.date) == [at(13, 1), at(18, 1, 13), at(23, 1, 13)] &&
+        joined.timeline.first?.kind == .keepAliveNotNeeded && joined.timeline.first?.label == "无需保活",
+        "the verified old 18:01 reset merges with the 18:01:13 current origin and falls back to the observed 13:01 origin")
+    var elapsed = MenuPresentation()
+    _ = render(&elapsed, reading(at(13, 1), at: at(15)), at: at(15))
+    let elapsedReading = reading(at(13, 1), at: now)
+    let unverified = render(&elapsed, elapsedReading, at: now, plan: oneAction)
+    check(unverified.timeline.map(\.date) == [at(13, 1), at(23)] && !unverified.timeline.contains { $0.kind == .reset },
+        "passing an observed reset deadline alone cannot turn its predicted reset into a real historical event")
+    var stale = MenuPresentation()
+    var old = reading(at(13, 1), at: at(14)); old.sourceFile = "rollout.jsonl"
+    _ = render(&stale, old, at: at(15))
+    check(render(&stale, usage, at: now).timeline.count == 2,
+        "rollout or stale readings cannot create observed-window history")
+    var switched = MenuPresentation()
+    _ = render(&switched, reading(at(13, 1), at: at(15)), at: at(15))
+    check(render(&switched, reading(at(18, 1), at: now, account: "other-account"), at: now).timeline.count == 2,
+        "changing the account clears in-memory observed origins and resets")
+    for setting in 0..<3 {
+        var changed = MenuPresentation()
+        _ = render(&changed, reading(at(13, 1), at: at(15)), at: at(15))
+        let after = render(&changed, usage, at: now, anchor: setting == 0 ? 481 : 480,
+            autoResume: setting != 1, policy: setting == 2 ? "ask" : "keepPlan")
+        check(after.timeline.count == 2, "schedule or recovery configuration clears observed history: \(setting)")
+    }
+    for issue in 0..<2 {
+        var broken = MenuPresentation()
+        _ = render(&broken, reading(at(13, 1), at: at(15)), at: at(15))
+        _ = render(&broken, usage, at: now, error: issue == 0 ? "认证失败" : nil, sessionError: issue == 1 ? "扫描失败" : nil)
+        check(render(&broken, usage, at: now).timeline.count == 2,
+            "fatal authentication or task synchronization clears observed history: \(issue)")
+    }
+    var disabled = MenuPresentation()
+    _ = render(&disabled, reading(at(13, 1), at: at(15)), at: at(15))
+    _ = render(&disabled, nil, at: now, enabled: false)
+    check(render(&disabled, usage, at: now).timeline.count == 2, "disabling Keeper clears observed historical display state")
+
+    var nextCycle = MenuPresentation()
+    _ = render(&nextCycle, reading(at(13, 1), at: at(15)), at: at(15))
+    let tomorrow = at(19, days: 1)
+    check(render(&nextCycle, reading(at(18, 1, days: 1), at: tomorrow), at: tomorrow, confirmations: confirmations).timeline.count == 2,
+        "the next daily anchor cycle excludes old confirmations and observed windows")
+    var lateAnchor = MenuPresentation()
+    _ = render(&lateAnchor, reading(at(20, 1), at: at(21)), at: at(21), anchor: 1200)
+    let nextMorning = at(7, days: 1)
+    let lateResume = NextAction(mode: .resume, date: at(11, 1, days: 1), decision: .wait(reason: "等待计划"), note: "等待计划")
+    let crossMidnight = render(&lateAnchor, reading(at(6, 1, days: 1), at: nextMorning), at: nextMorning,
+        anchor: 1200, plan: lateResume)
+    check(crossMidnight.timeline.map(\.date) == [at(1, 1, days: 1), at(6, 1, days: 1), at(11, 1, days: 1)] &&
+        crossMidnight.timeline.first?.kind == .reset,
+        "a 20:00 anchor keeps verified observation history across midnight until its next anchor")
+    var lateConfirmation = MenuPresentation()
+    let afterMidnight = render(&lateConfirmation, reading(at(6, 1, days: 1), at: nextMorning), at: nextMorning,
+        confirmations: [completed(.keepAlive, at(20, 1))], anchor: 1200, plan: lateResume)
+    check(afterMidnight.timeline.first?.date == at(20, 1) && afterMidnight.timeline.count == 3,
+        "a confirmed prior calendar-day action remains in the active evening-anchor cycle")
+
+    var continuity = MenuPresentation()
+    let before = render(&continuity, usage, at: now, confirmations: confirmations)
+    let retry = render(&continuity, nil, at: now.addingTimeInterval(61), error: "临时失败", transient: true)
+    check(retry.timeline.map(\.date) == before.timeline.map(\.date) && retry.refreshMessage == before.refreshMessage,
+        "temporary synchronization failure retains the supplemented timeline and its original capture time")
+    let frozen = render(&continuity, usage, at: now, confirmations: confirmations, running: true)
+    let progressed = reading(at(23, 1), at: at(23, 2))
+    let running = render(&continuity, progressed, at: progressed.capturedAt, running: true)
+    check(running.timeline.map(\.date) == frozen.timeline.map(\.date) && running.timeline.map(\.kind) == frozen.timeline.map(\.kind),
+        "new actual quota readings during execution never rewrite the captured historical timeline")
+    let finished = render(&continuity, progressed, at: progressed.capturedAt)
+    check(finished.timeline.map(\.date) != frozen.timeline.map(\.date), "finishing execution restores the current timeline immediately")
+}
+
 final class FakeTransport: CodexTransport {
     let threadID: String
     let cwd: String
@@ -3038,6 +3283,81 @@ final class ReminderTestPing: PingTransport, @unchecked Sendable {
         return after
     }
     func cancel() {}
+}
+
+private func checkMenuQuotaPresentation(_ check: (Bool, String) -> Void) {
+    func quotas(_ five: Double, _ weekly: Double = 70) -> [MenuQuota] {
+        [MenuQuota(name: "5小时", remaining: five, detail: "今天 13:00"),
+         MenuQuota(name: "1周", remaining: weekly, detail: "明天 08:00")]
+    }
+    var first = MenuQuotaPresentation()
+    first.update(quotas: quotas(30), accountID: "account-a")
+    first.update(quotas: quotas(25), accountID: "account-a")
+    first.menuWillOpen()
+    check(first.displayedRemaining["5小时"] == 25 && !first.animatesChanges,
+        "the first menu opening starts at the latest quota without an entrance animation")
+    first.menuBecameVisible()
+    check(first.displayedRemaining["5小时"] == 25 && !first.animatesChanges,
+        "the first visible frame does not animate from an unseen background reading")
+
+    var display = MenuQuotaPresentation()
+    display.update(quotas: quotas(30), accountID: "account-a")
+    display.menuWillOpen(); display.menuBecameVisible(); display.menuDidClose()
+    for value in [29.0, 27.0, 25.0] { display.update(quotas: quotas(value, 55), accountID: "account-a") }
+    check(display.quotas.first?.remaining == 25 && display.quotas.last?.remaining == 55,
+        "closed-menu background updates immediately retain the latest percentage labels")
+    check(display.displayedRemaining["5小时"] == 30 && display.displayedRemaining["1周"] == 70 && !display.animatesChanges,
+        "closed-menu background updates preserve each bar's last visible length")
+    display.menuWillOpen()
+    check(display.displayedRemaining["5小时"] == 30 && !display.animatesChanges,
+        "reopening holds the last visible length until the menu has actually appeared")
+    display.update(quotas: quotas(23, 55), accountID: "account-a")
+    check(display.displayedRemaining["5小时"] == 30 && display.quotas.first?.remaining == 23,
+        "a reading received while the menu is opening updates labels while retaining the initial bar frame")
+    display.menuDidClose(); display.menuBecameVisible()
+    check(display.displayedRemaining["5小时"] == 30 && !display.animatesChanges,
+        "a delayed visibility callback after closing cannot consume the unseen bar change")
+    display.menuWillOpen(); display.menuBecameVisible()
+    check(display.displayedRemaining["5小时"] == 23 && display.displayedRemaining["1周"] == 55 && display.animatesChanges,
+        "reopening animates directly from the last seen bars to the latest of multiple background readings")
+    display.update(quotas: quotas(21, 55), accountID: "account-a")
+    check(display.displayedRemaining["5小时"] == 21 && display.displayedRemaining["1周"] == 55 && display.animatesChanges,
+        "new readings while visible animate only the changed bar without replaying the other quota")
+    display.menuDidClose(); display.menuWillOpen(); display.menuBecameVisible()
+    check(display.displayedRemaining["5小时"] == 21 && !display.animatesChanges,
+        "reopening unchanged quotas does not replay an animation")
+    display.menuDidClose()
+    display.update(quotas: quotas(45, 90), accountID: "account-b")
+    check(display.displayedRemaining["5小时"] == 45 && display.displayedRemaining["1周"] == 90,
+        "an account change discards bar lengths from the previous account")
+    display.menuWillOpen(); display.menuBecameVisible()
+    check(!display.animatesChanges, "the first opening for another account shows its current bars directly")
+    display.update(quotas: [quotas(10, 85)[1]], accountID: "account-b")
+    display.menuDidClose()
+    display.update(quotas: quotas(10, 80), accountID: "account-b")
+    check(display.displayedRemaining["5小时"] == 10 && display.displayedRemaining["1周"] == 85,
+        "a disappeared quota row loses its history while the other row keeps its own visible length")
+    display.update(quotas: [], accountID: nil)
+    display.update(quotas: quotas(5), accountID: "account-b")
+    check(display.displayedRemaining["5小时"] == 5 && display.displayedRemaining["1周"] == 70,
+        "removing the quota block clears all old bar lengths before it returns")
+    check(quotas(0.49)[0].barRemaining == 0 && quotas(-5)[0].barRemaining == 0 && quotas(120)[0].barRemaining == 100,
+        "animated bar targets preserve rounded-zero emptiness and clamp quota bounds")
+
+    let now = Date()
+    let usage = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 75, windowMinutes: 300,
+        resetsAt: now.addingTimeInterval(18000)), weekly: nil, capturedAt: now,
+        accountID: "quota-display-account", sourceFile: "app-server")
+    let schedule = ScheduleEngine(anchorMinutes: 480)
+    let plan = DecisionEngine(schedule: schedule).plan(now: now, enabled: true, autoResume: true,
+        earlyRecoveryPolicy: "keepPlan", usage: usage, blocked: [])
+    var presentation = MenuPresentation()
+    let live = presentation.build(plan: plan, usage: usage, schedule: schedule,
+        tasks: [], availableTasks: [], choices: ResumeChoices(), now: now)
+    let cached = presentation.build(plan: plan, usage: nil, schedule: schedule,
+        tasks: [], availableTasks: [], choices: ResumeChoices(), now: now.addingTimeInterval(61))
+    check(live.quotaAccountID == usage.accountID && cached.quotaAccountID == usage.accountID,
+        "live and retained quota displays carry their own account identity for bar history isolation")
 }
 
 private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
