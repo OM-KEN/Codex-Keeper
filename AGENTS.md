@@ -6,6 +6,7 @@
 - 当前行为与限制读 `docs/DEVELOPMENT.md`；原始方案归档于 `docs/archive/design-v1.md`。
 - 构建：`./build.sh`；回归：`./run-tests.sh`；启动：`open .build/CodexKeeper.app`。
 - 版本每段限 0–9，超出时向前进位（如 0.1.9 → 0.2.0）；发布约定见 `docs/DEVELOPMENT.md`。
+- Release Notes 简短、准确地描述用户可感知的变化，避免含糊措辞和不必要的细节；文案约定见 `docs/DEVELOPMENT.md`。
 - 没有 xcodeproj；新增 Swift 源文件须更新 build.sh 的 SOURCES。
 - App、Core、Codex、UI 分别放生命周期、业务、Codex 接入和界面；Tests 与 Probes 用于验证。
 - 真实保活与续跑已接入；修改调度或通信时保留账户、额度、任务状态、重复发送和工作区检查。
