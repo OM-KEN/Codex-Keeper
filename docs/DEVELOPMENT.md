@@ -61,7 +61,7 @@ PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 
 输出为 `.build/CodexKeeper-<VERSION>.dmg`。默认以临时签名分发，不要求 Developer ID 或公证，也不自动使用本机个人开发者证书。`--release` 可用于发布构建，与默认构建使用同一签名策略；设置 `CODE_SIGN_IDENTITY` 可显式选择证书签名。
 
-公开仓库为 [OM-KEN/Codex-Keeper](https://github.com/OM-KEN/Codex-Keeper)。版本来自 `VERSION`；普通修复和现有交互的局部改善发布 patch，有明显新使用场景时发布 minor，不兼容变化发布 major。发布 tag 为 `v<VERSION>`，标题为 `Codex Keeper v<VERSION> (macOS)`，仅上传 `CodexKeeper-<VERSION>.dmg`。正文面向普通用户，描述实际使用变化，避免协议、认证和日志等实现术语；按 What's New、Fixes、新功能、修复排列，同类英中内容对应，无该类变化时省略。项目采用根目录 `LICENSE` 中的 MIT 许可；`assets/NOTICE.md` 保留所复用背景和布局的许可。构建时将两者一并放入应用资源。
+公开仓库为 [OM-KEN/Codex-Keeper](https://github.com/OM-KEN/Codex-Keeper)。版本来自 `VERSION`；普通修复和现有交互的局部改善发布 patch，有明显新使用场景时发布 minor，不兼容变化发布 major。各段限单个数字 0–9，超出时向前进位并将后续段归零，如 `0.1.9 → 0.2.0`、`0.9.9 → 1.0.0`；`build.sh` 拒绝多位数字。发布 tag 为 `v<VERSION>`，标题为 `Codex Keeper v<VERSION> (macOS)`，仅上传 `CodexKeeper-<VERSION>.dmg`。正文面向普通用户，描述实际使用变化，避免协议、认证和日志等实现术语；按 What's New、Fixes、新功能、修复排列，同类英中内容对应，无该类变化时省略。项目采用根目录 `LICENSE` 中的 MIT 许可；`assets/NOTICE.md` 保留所复用背景和布局的许可。构建时将两者一并放入应用资源。
 
 发布前运行回归、构建及 DMG 校验，挂载检查 Finder 背景、图标布局、App 和 Applications 链接，并记录大小及 SHA-256；发布后核对远端提交、tag、稳定版与 Latest 状态，以及唯一 DMG 资产的下载、大小和校验和。提交、推送及发布仍需维护者明确同意。另一台 Mac 的首次安装、登录读取、登录项、保活及续跑验收，以及 macOS 13 真机验证仍待完成。
 
@@ -129,7 +129,7 @@ PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 
 2026-10-12：本机 v0.1.9 已包含任务恢复修复及菜单额度、状态和时间线的本地修改，完整回归 754/754、macOS 13 arm64 构建和严格临时签名检查通过。中英文浅色／深色原生菜单预览已核验，时间线独立验收 15/15；15:46 更新本机应用后，真实 app-server 额度读取正常，执行事件与续跑尝试记录保持完整。这些本地修改尚未纳入公开的 v0.1.9 安装包，不能只凭版本号判断两者相同。候选、回滚 ZIP、源码差异及验证证据位于 `.build/verification/menu-timeline-history-20261012/`；现役机制以下文为准，其他 Mac、macOS 13 真机及长期稳定性仍待核验。
 
-同日 v0.1.10 发行构建完成：754/754 项回归、macOS 13 arm64 构建与严格临时签名检查通过，DMG 镜像、挂载应用、Applications 链接、背景源图和 Finder 精确布局数据均已核验。本轮长会话续跑及菜单额度、状态和时间线修复纳入此版本；本轮未取得 Finder 原生截图，其他 Mac、macOS 13 真机及长期稳定性仍沿用既有待验证边界。发行构建与验证记录位于 `.build/release-v0.1.10/`。
+同日 v0.2.0 发行构建完成：754/754 项回归、macOS 13 arm64 构建与严格临时签名检查通过，DMG 镜像、挂载应用、Applications 链接、背景源图和 Finder 精确布局数据均已核验。本轮长会话续跑及菜单额度、状态和时间线修复纳入此版本；版本按单段最大 9 的规则由 v0.1.9 进位，未增加其他使用场景。本轮未取得 Finder 原生截图，其他 Mac、macOS 13 真机及长期稳定性仍沿用既有待验证边界。发行构建与验证记录位于 `.build/release-v0.2.0/`。
 
 ## 现役行为
 

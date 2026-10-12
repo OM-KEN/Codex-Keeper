@@ -17,8 +17,8 @@ FINGERPRINT="$BUILD_DIR/.source_fingerprint"
 VERSION_FILE="VERSION"
 VERSION=$(tr -d '[:space:]' < "$VERSION_FILE")
 
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "❌ VERSION must use MAJOR.MINOR.PATCH (found: $VERSION)" >&2
+if [[ ! "$VERSION" =~ ^[0-9]\.[0-9]\.[0-9]$ ]]; then
+    echo "❌ VERSION must use MAJOR.MINOR.PATCH with one digit (0–9) per part (found: $VERSION)" >&2
     exit 1
 fi
 
