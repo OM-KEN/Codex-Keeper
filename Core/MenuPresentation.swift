@@ -288,12 +288,20 @@ extension MenuSummary {
 
 /// Display continuity only. Cached summaries never supply quota or plans to the executor.
 struct MenuPresentation {
-    private struct Configuration: Equatable {
+    private struct Configuration: Codable, Equatable {
         let anchorMinutes: Int
         let autoResume: Bool
         let earlyRecoveryPolicy: String
         let choices: ResumeChoices
         let timeZone: String
+    }
+    private struct ObservedHistory: Codable, Equatable {
+        let version: Int
+        let configuration: Configuration
+        let cycle: Date
+        let accountID: String
+        let windows: [QuotaWindow]
+        let resets: [Date]
     }
     private struct CachedSummary {
         let summary: MenuSummary
@@ -316,6 +324,42 @@ struct MenuPresentation {
     private var wasRefreshing = false
     private var refreshRequested = false
     private var showsRefreshFeedback = false
+    private let historyURL: URL?
+    private var savedHistory: ObservedHistory?
+
+    init(historyURL: URL? = nil) {
+        self.historyURL = historyURL
+        if let historyURL, let data = try? Data(contentsOf: historyURL),
+           let history = try? JSONDecoder().decode(ObservedHistory.self, from: data), history.version == 1 {
+            configuration = history.configuration
+            observedCycle = history.cycle
+            observedAccountID = history.accountID
+            observedWindows = history.windows
+            observedResets = history.resets
+            savedHistory = history
+        }
+    }
+
+    private mutating func persistObservedHistory() {
+        guard let historyURL else { return }
+        let history: ObservedHistory?
+        if let configuration, let observedCycle, let observedAccountID {
+            history = ObservedHistory(version: 1, configuration: configuration, cycle: observedCycle,
+                accountID: observedAccountID, windows: observedWindows, resets: observedResets)
+        } else { history = nil }
+        guard history != savedHistory else { return }
+        do {
+            if let history {
+                try FileManager.default.createDirectory(at: historyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(history).write(to: historyURL, options: .atomic)
+            } else if FileManager.default.fileExists(atPath: historyURL.path) {
+                try FileManager.default.removeItem(at: historyURL)
+            }
+            savedHistory = history
+        } catch {
+            // Optional display history never blocks fresh quota or execution checks.
+        }
+    }
 
     mutating func requestRefreshFeedback() {
         refreshRequested = true
@@ -386,6 +430,7 @@ struct MenuPresentation {
                 }
             }
         }
+        persistObservedHistory()
         var summary = enabled ? MenuSummary.build(plan: plan, usage: fatalIssue ? nil : usage,
             schedule: schedule, tasks: tasks, confirmations: confirmations,
             observedWindows: observedWindows, observedResets: observedResets, now: now) : MenuSummary(headline: "已停用")

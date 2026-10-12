@@ -2,7 +2,7 @@ import Foundation
 import Combine
 
 /// 单个限额窗口快照
-struct QuotaWindow: Equatable {
+struct QuotaWindow: Codable, Equatable {
     var usedPercent: Double
     var windowMinutes: Int
     var resetsAt: Date

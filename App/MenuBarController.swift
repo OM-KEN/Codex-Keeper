@@ -22,7 +22,9 @@ import UserNotifications
     private var updateScheduled = false
     private var notifiedCurrentPing = false
     private var executionFailureSeen = false
-    private var presentation = MenuPresentation()
+    private var presentation = MenuPresentation(historyURL: FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("CodexKeeper/menu-history.json"))
     private var cancellables = Set<AnyCancellable>()
 
     func setup() {

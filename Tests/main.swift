@@ -2902,6 +2902,7 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     }
     func render(_ presentation: inout MenuPresentation, _ usage: UsageSnapshot?, at now: Date,
                 confirmations: [ExecutionConfirmation] = [], anchor: Int = 480, enabled: Bool = true,
+                choices: ResumeChoices = ResumeChoices(),
                 autoResume: Bool = true, policy: String = "keepPlan", plan override: NextAction? = nil,
                 error: String? = nil, transient: Bool = false, sessionError: String? = nil,
                 running: Bool = false) -> MenuSummary {
@@ -2909,7 +2910,7 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
         let plan = override ?? DecisionEngine(schedule: schedule).plan(now: now, enabled: enabled, autoResume: autoResume,
             earlyRecoveryPolicy: policy, usage: usage, blocked: [])
         return presentation.build(plan: plan, usage: usage, schedule: schedule, tasks: [], availableTasks: [],
-            choices: ResumeChoices(), enabled: enabled, autoResume: autoResume, earlyRecoveryPolicy: policy,
+            choices: choices, enabled: enabled, autoResume: autoResume, earlyRecoveryPolicy: policy,
             confirmations: confirmations, usageError: error, usageErrorIsTransient: transient, sessionError: sessionError,
             running: running, executionMode: running ? .keepAlive : nil, now: now)
     }
@@ -2991,6 +2992,94 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     check(joined.timeline.map(\.date) == [at(13, 1), at(18, 1, 13), at(23, 1, 13)] &&
         joined.timeline.first?.kind == .keepAliveNotNeeded && joined.timeline.first?.label == "无需保活",
         "the verified old 18:01 reset merges with the 18:01:13 current origin and falls back to the observed 13:01 origin")
+    let historyURL = directory.appendingPathComponent("menu-history.json")
+    var beforeRestart = MenuPresentation(historyURL: historyURL)
+    _ = render(&beforeRestart, reading(at(13, 1), at: at(15)), at: at(15))
+    let savedHistory = try Data(contentsOf: historyURL)
+    var afterRestart = MenuPresentation(historyURL: historyURL)
+    let restored = render(&afterRestart, reading(at(18, 1, 13), at: now), at: now,
+        confirmations: [completed(.keepAlive, at(8))])
+    check(restored.timeline.map(\.date) == [at(13, 1), at(18, 1, 13), at(23, 1, 13)] &&
+        restored.timeline.first?.kind == .keepAliveNotNeeded && restored.timeline.first?.label == "无需保活",
+        "restarting Keeper restores the nearer observed 13:01 window instead of the 08:00 completed ping")
+    func storedHistory(_ name: String) throws -> URL {
+        let url = directory.appendingPathComponent(name + ".json")
+        try savedHistory.write(to: url)
+        return url
+    }
+    let startupURL = try storedHistory("startup")
+    var startup = MenuPresentation(historyURL: startupURL)
+    let synchronizing = render(&startup, nil, at: now, error: "临时失败", transient: true)
+    let startupHistory = try Data(contentsOf: startupURL)
+    check(synchronizing.timeline.isEmpty && synchronizing.quotas.isEmpty &&
+        startupHistory == savedHistory,
+        "persisted observations survive initial transient synchronization without supplying stale live quota")
+    check(render(&startup, reading(at(18, 1, 13), at: now), at: now).timeline.first?.date == at(13, 1),
+        "initial synchronization cannot erase restored observation history before the first fresh reading")
+    let accountURL = try storedHistory("account")
+    var anotherAccount = MenuPresentation(historyURL: accountURL)
+    check(render(&anotherAccount, reading(at(18, 1), at: now, account: "other-account"), at: now).timeline.count == 2,
+        "persisted observations from another account cannot fill the current timeline")
+    var returnedAccount = MenuPresentation(historyURL: accountURL)
+    check(render(&returnedAccount, usage, at: now).timeline.count == 2,
+        "restarting after an account switch cannot resurrect discarded observations")
+    for setting in 0..<3 {
+        let url = try storedHistory("setting-\(setting)")
+        var changed = MenuPresentation(historyURL: url)
+        check(render(&changed, usage, at: now, anchor: setting == 0 ? 481 : 480,
+            autoResume: setting != 1, policy: setting == 2 ? "ask" : "keepPlan").timeline.count == 2,
+            "restored observations require the same schedule and recovery configuration: \(setting)")
+        var reopened = MenuPresentation(historyURL: url)
+        check(render(&reopened, usage, at: now).timeline.count == 2,
+            "restarting again cannot resurrect observations invalidated by changed settings: \(setting)")
+    }
+    for issue in 0..<3 {
+        let url = try storedHistory("issue-\(issue)")
+        var broken = MenuPresentation(historyURL: url)
+        _ = render(&broken, usage, at: now, enabled: issue != 2,
+            error: issue == 0 ? "认证失败" : nil, sessionError: issue == 1 ? "扫描失败" : nil)
+        check(!FileManager.default.fileExists(atPath: url.path),
+            "fatal synchronization errors and disabling Keeper remove persisted observation history: \(issue)")
+        var reopened = MenuPresentation(historyURL: url)
+        check(render(&reopened, usage, at: now).timeline.count == 2,
+            "restarting cannot resurrect history cleared by a fatal issue or disabled Keeper: \(issue)")
+    }
+    var changedChoices = ResumeChoices(); changedChoices.messages["task"] = "custom prompt"
+    var choicesHistory = MenuPresentation(historyURL: try storedHistory("choices"))
+    check(render(&choicesHistory, usage, at: now, choices: changedChoices).timeline.count == 2,
+        "changed task choices invalidate restored observation history")
+    for key in ["version", "timeZone"] {
+        let url = try storedHistory(key)
+        var contents = try JSONSerialization.jsonObject(with: savedHistory) as! [String: Any]
+        if key == "version" { contents[key] = 2 }
+        else {
+            var configuration = contents["configuration"] as! [String: Any]
+            configuration[key] = "different-time-zone"
+            contents["configuration"] = configuration
+        }
+        try JSONSerialization.data(withJSONObject: contents).write(to: url)
+        var mismatched = MenuPresentation(historyURL: url)
+        check(render(&mismatched, usage, at: now).timeline.count == 2,
+            "unsupported history versions and changed time zones cannot restore observation history: \(key)")
+    }
+    var nextStoredCycle = MenuPresentation(historyURL: try storedHistory("cycle"))
+    let followingEvening = at(19, days: 1)
+    check(render(&nextStoredCycle, reading(at(18, 1, days: 1), at: followingEvening), at: followingEvening).timeline.count == 2,
+        "persisted observations expire at the next daily anchor cycle")
+    var confirmedHistory = MenuPresentation(historyURL: try storedHistory("confirmed"))
+    check(render(&confirmedHistory, usage, at: now, confirmations: [completed(.keepAlive, at(13, 1))])
+        .timeline.first?.kind == .completedKeepAlive,
+        "an actual confirmation takes precedence over a restored observation of the same window")
+    let corruptURL = directory.appendingPathComponent("corrupt.json")
+    try Data("not valid JSON".utf8).write(to: corruptURL)
+    var corrupt = MenuPresentation(historyURL: corruptURL)
+    check(render(&corrupt, usage, at: now).timeline.count == 2,
+        "unreadable persisted history never invents older timeline points")
+    let unwritableURL = corruptURL.appendingPathComponent("history.json")
+    var unwritable = MenuPresentation(historyURL: unwritableURL)
+    _ = render(&unwritable, reading(at(13, 1), at: at(15)), at: at(15))
+    check(render(&unwritable, usage, at: now).timeline.first?.date == at(13, 1),
+        "optional history storage failure preserves fresh rendering and in-memory observations")
     var elapsed = MenuPresentation()
     _ = render(&elapsed, reading(at(13, 1), at: at(15)), at: at(15))
     let elapsedReading = reading(at(13, 1), at: now)
@@ -3030,15 +3119,17 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     let tomorrow = at(19, days: 1)
     check(render(&nextCycle, reading(at(18, 1, days: 1), at: tomorrow), at: tomorrow, confirmations: confirmations).timeline.count == 2,
         "the next daily anchor cycle excludes old confirmations and observed windows")
-    var lateAnchor = MenuPresentation()
+    let lateAnchorURL = directory.appendingPathComponent("late-anchor.json")
+    var lateAnchor = MenuPresentation(historyURL: lateAnchorURL)
     _ = render(&lateAnchor, reading(at(20, 1), at: at(21)), at: at(21), anchor: 1200)
+    lateAnchor = MenuPresentation(historyURL: lateAnchorURL)
     let nextMorning = at(7, days: 1)
     let lateResume = NextAction(mode: .resume, date: at(11, 1, days: 1), decision: .wait(reason: "等待计划"), note: "等待计划")
     let crossMidnight = render(&lateAnchor, reading(at(6, 1, days: 1), at: nextMorning), at: nextMorning,
         anchor: 1200, plan: lateResume)
     check(crossMidnight.timeline.map(\.date) == [at(1, 1, days: 1), at(6, 1, days: 1), at(11, 1, days: 1)] &&
         crossMidnight.timeline.first?.kind == .reset,
-        "a 20:00 anchor keeps verified observation history across midnight until its next anchor")
+        "a 20:00 anchor restores verified observation history across midnight until its next anchor")
     var lateConfirmation = MenuPresentation()
     let afterMidnight = render(&lateConfirmation, reading(at(6, 1, days: 1), at: nextMorning), at: nextMorning,
         confirmations: [completed(.keepAlive, at(20, 1))], anchor: 1200, plan: lateResume)
