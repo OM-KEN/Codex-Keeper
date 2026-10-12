@@ -35,19 +35,11 @@ open .build/CodexKeeper.app
 
 资料：[官方 App Server 文档](https://learn.chatgpt.com/docs/app-server)、[Codex 模型](https://learn.chatgpt.com/docs/models)、[Codex 应用](https://learn.chatgpt.com/docs/app)。应用网页确认 Apple Silicon 支持，macOS 13 下限来自上述安装包的 Info.plist。
 
-### 本机 CLI 更新监测
+### CLI 兼容性验证
 
-2026-10-09 按用户要求改为本机脚本 `Scripts/check_codex_updates.py`，由用户 LaunchAgent `com.codexkeeper.update-reminder` 每天本机时间 09:00 运行。已有基线时，09:00 前登录只等待计划时间；09:00 后登录可补当天检查，完成后同日不重复。首次安装的 09:00 前基线不占用当天定时检查。任务配置位于 `~/Library/LaunchAgents/com.codexkeeper.update-reminder.plist`，引用当前项目的绝对路径；搬迁项目后需要更新该路径。这是本机工具，不随 Keeper 安装包分发。
+人工验证可运行 `./Probes/check-cli-compatibility.sh --identity` 核对 CLI 路径、版本和 SHA-256，或使用 `--check` 检查账户/额度/模型及无提示词 TUI 启动；配置生成函数由生产保活与探针共用，覆盖全新目录与旧后台服务路径。启动通过不等于保活成功，完整结果仍从计划操作的真实日志确认。提交、推送及发布仍需维护者明确同意。
 
-脚本只调用 `./Probes/check-cli-compatibility.sh --identity`，按生产定位规则及 Keeper 备用路径读取 CLI 路径、版本和 SHA-256，并读取所在桌面应用的版本/构建；不执行 `--check`、账户/额度查询、测试、修复或应用替换，不调用模型，也不向 Codex 聊天发送消息。原每 15 分钟运行的 Codex 自动化「监测 CLI 更新并修复 Keeper 兼容性」（`cli-keeper`）已于 2026-10-09 按用户要求删除。
-
-官方来源为 [openai/codex Releases Atom](https://github.com/openai/codex/releases.atom)，支持 ETag 条件请求。curl 优先沿用显式代理环境变量；后台没有这些变量时读取 macOS 系统 HTTPS 代理，不修改系统或 Keeper 网络设置。首次运行只建立基线；之后本机 CLI 或桌面应用变化、官方发布说明新增/修改且包含服务通信、额度、账户认证、模型、任务记录、配置权限或交互启动相关关键词时，合并为一次 macOS 通知（由“脚本编辑器”通知来源显示），同一变化不重复提醒。空白预发布说明和未命中关键词的说明保持安静；这只是关键词筛选，不能判定实际兼容性，也不能覆盖未公开或已退出订阅源的变更。兼容性由用户自行检查。
-
-脚本状态、日志和最近完整提醒分别位于 `~/Library/Application Support/CodexKeeper/update-reminder/state.json`、该目录的 `launchd.log` / `launchd-error.log` 和 `last-change.md`。状态原子保存，读取失败保留上次基线；官方订阅源暂时不可用时留待次日，不把网络错误当作更新。本机 CLI 原先可读而后来读取失败时提醒一次，持续相同失败不重复提醒。旧 `cli-compatibility-monitor.json` 及真实执行历史保留。脚本回归：`/usr/bin/python3 -B -m unittest discover -s Tests -p test_update_reminder.py`。
-
-需要人工验证时，`./Probes/check-cli-compatibility.sh --check` 可检查账户/额度/模型及无提示词 TUI 启动；配置生成函数由生产保活与探针共用，覆盖全新目录与旧后台服务路径。启动通过不等于保活成功，完整结果仍从计划操作的真实日志确认。提交、推送及发布仍需维护者明确同意。
-
-2026-10-09 本机验证：14 项脚本回归通过；09:32:59 的后台检查成功读取本机 CLI 和官方订阅源，并对相关发布说明请求系统通知。通知请求成功不等于已目视确认横幅。
+OM 的每日 Codex 更新提醒属于本机个人工具，源码和测试已于 2026-10-12 迁至仓库外；启动配置及运行数据也保存在仓库外，不纳入 Git 或 Keeper 安装包。本机位置为 `~/Library/Application Support/CodexKeeper/update-reminder/tool/`，维护说明见该目录的 `README.md`；每天 09:00 由用户 LaunchAgent 运行，不调用模型或发送 Codex 聊天消息。原高频 Codex 自动化不恢复。
 
 ## 安装包与发布
 
