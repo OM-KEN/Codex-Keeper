@@ -150,26 +150,86 @@ private struct MenuTaskBubble: Shape {
     }
 }
 
+@MainActor final class MenuQuotaHostView: NSHostingView<MenuQuotaView> {
+    private var presentation = MenuQuotaPresentation()
+    private var openingTimer: Timer?
+    private var hasVisibleFrame = false
+
+    init(quotas: [MenuQuota] = [], accountID: String? = nil) {
+        super.init(rootView: MenuQuotaView(quotas: []))
+        update(quotas: quotas, accountID: accountID)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    @available(*, unavailable)
+    required init(rootView: MenuQuotaView) { fatalError() }
+
+    func update(quotas: [MenuQuota], accountID: String?) {
+        presentation.update(quotas: quotas, accountID: accountID)
+        render()
+    }
+
+    func menuWillOpen() {
+        openingTimer?.invalidate()
+        presentation.menuWillOpen()
+        hasVisibleFrame = false
+        render()
+        let timer = Timer(timeInterval: 1.0 / 60, target: self,
+            selector: #selector(revealQuotaIfVisible(_:)), userInfo: nil, repeats: true)
+        openingTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func revealQuotaIfVisible(_ timer: Timer) {
+        guard openingTimer === timer else { return }
+        guard window?.isVisible == true, !isHiddenOrHasHiddenAncestor, !visibleRect.isEmpty else {
+            hasVisibleFrame = false
+            return
+        }
+        // NSMenu's window can appear after menuWillOpen. Display the old length for one frame first.
+        if !hasVisibleFrame {
+            displayIfNeeded()
+            hasVisibleFrame = true
+            return
+        }
+        timer.invalidate()
+        openingTimer = nil
+        presentation.menuBecameVisible()
+        render()
+    }
+
+    func menuDidClose() {
+        openingTimer?.invalidate()
+        openingTimer = nil
+        presentation.menuDidClose()
+        render()
+    }
+
+    private func render() {
+        rootView = MenuQuotaView(quotas: presentation.quotas,
+            displayedRemaining: presentation.displayedRemaining, animatesChanges: presentation.animatesChanges)
+        layoutSubtreeIfNeeded()
+        frame.size = NSSize(width: 304, height: fittingSize.height)
+    }
+}
+
 struct MenuQuotaView: View {
     let quotas: [MenuQuota]
+    var displayedRemaining: [String: Double] = [:]
+    var animatesChanges = true
 
     var body: some View {
         VStack(spacing: 10) {
             ForEach(quotas) { quota in
                 HStack(spacing: 6) {
                     Text(L10n.text(quota.name)).foregroundStyle(.secondary).frame(width: 31, alignment: .leading)
-                    if quota.remaining.rounded() <= 0 {
-                        // Native ProgressView keeps a minimum fill even at zero.
-                        Capsule().fill(Color.primary.opacity(0.05))
-                            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.05)))
-                            .frame(height: 8)
-                            .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
-                            .accessibilityValue("0%")
-                    } else {
-                        ProgressView(value: max(0, min(100, quota.remaining)), total: 100)
-                            .progressViewStyle(.linear).tint(.accentColor)
-                            .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
-                    }
+                    // Keep a value displayed as zero visibly empty without replacing the animated meter.
+                    ProgressView(value: displayedRemaining[quota.id] ?? quota.barRemaining, total: 100)
+                        .progressViewStyle(MenuQuotaProgressStyle(animatesChanges: animatesChanges))
+                        .accessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
+                        .accessibilityValue("\(Int(max(0, min(100, quota.remaining)).rounded()))%")
                     Text("\(Int(max(0, min(100, quota.remaining)).rounded()))%")
                         .monospacedDigit().frame(width: 32, alignment: .trailing)
                     Text(L10n.text(quota.detail)).foregroundStyle(.secondary)
@@ -180,6 +240,27 @@ struct MenuQuotaView: View {
         .padding(EdgeInsets(top: 10, leading: 16, bottom: 14, trailing: 16))
         .frame(width: 304, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct MenuQuotaProgressStyle: ProgressViewStyle {
+    let animatesChanges: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        // NSMenu's inactive appearance must not desaturate this read-only meter.
+        GeometryReader { geometry in
+            let fraction = configuration.fractionCompleted ?? 0
+            // Keep a tiny nonzero fill circular instead of turning it into a thin vertical bar.
+            let fillWidth = fraction > 0 ? max(geometry.size.height, geometry.size.width * fraction) : 0
+            Capsule().fill(Color.primary.opacity(0.05))
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.05)))
+                .overlay(alignment: .leading) {
+                    Capsule().fill(Color.accentColor)
+                        .frame(width: fillWidth)
+                        .animation(reduceMotion || !animatesChanges ? nil : .easeOut(duration: 0.5), value: configuration.fractionCompleted)
+                }
+        }.frame(height: 8).frame(height: configuration.fractionCompleted == 0 ? 8 : 20)
     }
 }
 

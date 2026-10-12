@@ -185,6 +185,7 @@
 "Codex 连接超时，未自动重试" = "Codex connection timed out; it was not retried automatically";
 "Codex 连接已结束" = "Codex connection ended";
 "Codex 返回了无法识别的数据" = "Codex returned unrecognized data";
+"Codex 返回的数据超过读取上限，已停止本次操作" = "Codex returned data exceeding the read limit; this operation was stopped";
 "Codex 服务连接超时，请检查网络或代理后重新同步。" = "Codex service connection timed out. Check your network or proxy, then refresh.";
 "无法连接 Codex 服务，请检查网络或代理后重新同步。" = "Could not connect to the Codex service. Check your network or proxy, then refresh.";
 "Codex 服务暂时不可用，请稍后重新同步。" = "Codex service is temporarily unavailable. Refresh again later.";

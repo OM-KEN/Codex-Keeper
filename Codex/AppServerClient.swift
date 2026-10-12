@@ -11,13 +11,14 @@ protocol CodexTransport: AnyObject {
 }
 
 enum CodexConnectionError: LocalizedError {
-    case unavailable, timeout, ended, invalidResponse, server(String), localizedMessage(String), approvalRequired
+    case unavailable, timeout, ended, invalidResponse, responseTooLarge, server(String), localizedMessage(String), approvalRequired
     var errorDescription: String? {
         switch self {
         case .unavailable: return L10n.text("找不到官方 Codex CLI")
         case .timeout: return L10n.text("Codex 连接超时，未自动重试")
         case .ended: return L10n.text("Codex 连接已结束")
         case .invalidResponse: return L10n.text("Codex 返回了无法识别的数据")
+        case .responseTooLarge: return L10n.text("Codex 返回的数据超过读取上限，已停止本次操作")
         case .server(let message):
             switch Self.serverFailureReason(message) {
             case "workspace_routing_timeout", "request_timeout": return L10n.text("Codex 服务连接超时，请检查网络或代理后重新同步。")
@@ -130,13 +131,15 @@ final class AppServerClient: CodexTransport {
 
     private func readMessage(timeout: TimeInterval) throws -> [String: Any] {
         let deadline = Date().addingTimeInterval(timeout)
+        var searchStart = buffer.startIndex
         while true {
-            if let newline = buffer.firstIndex(of: 10) {
+            if let newline = buffer[searchStart...].firstIndex(of: 10) {
                 let line = buffer.prefix(upTo: newline)
                 buffer.removeSubrange(...newline)
                 guard let message = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { throw CodexConnectionError.invalidResponse }
                 return message
             }
+            searchStart = buffer.endIndex
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { throw CodexConnectionError.timeout }
             stateLock.lock()
@@ -150,7 +153,7 @@ final class AppServerClient: CodexTransport {
             let count = Darwin.read(descriptor.fd, &bytes, bytes.count)
             guard count > 0 else { throw CodexConnectionError.ended }
             buffer.append(contentsOf: bytes.prefix(count))
-            guard buffer.count <= 8 * 1024 * 1024 else { throw CodexConnectionError.invalidResponse }
+            guard buffer.count <= 8 * 1024 * 1024 else { throw CodexConnectionError.responseTooLarge }
         }
     }
 
@@ -244,6 +247,7 @@ struct UsageReadFailure: LocalizedError {
         case CodexConnectionError.ended: return "connection_ended"
         case CodexConnectionError.unavailable: return "cli_unavailable"
         case CodexConnectionError.invalidResponse: return "invalid_response"
+        case CodexConnectionError.responseTooLarge: return "response_too_large"
         case CodexConnectionError.approvalRequired: return "approval_required"
         case CodexConnectionError.server(let message):
             if message.contains("账户在刷新期间改变") || message.contains("账户身份不一致") { return "account_changed" }

@@ -202,7 +202,7 @@ import Darwin
             defer { activeTransports.removeValue(forKey: key) }
             try events.record("started", kind: "resume", node: nil, threadID: target.id)
             let receipt = try await Task.detached { try transport.resume(target, prompt: prompt) }.value
-            try events.record("confirmed", kind: "resume", node: nil, threadID: target.id, turnID: receipt.turnID)
+            try events.record("confirmed", kind: "resume", node: nil, threadID: target.id, turnID: receipt.turnID, accountID: account)
             reloadConfirmations()
             return nil
         } catch {
