@@ -3,6 +3,7 @@ import SwiftUI
 struct MenuSummaryView: View {
     let summary: MenuSummary
     var openTasks: () -> Void = {}
+    var openHistory: (MenuTimelinePoint) -> Void = { _ in }
     var showError: () -> Void = {}
     var refresh: () -> Void = {}
     @State private var tasksHovered = false
@@ -83,10 +84,8 @@ struct MenuSummaryView: View {
                         HStack(spacing: 5) {
                             Image(systemName: summary.taskCount > 1 ? "bubble.left.and.text.bubble.right" : "text.bubble")
                             Text(title).lineLimit(2).truncationMode(.tail)
-                            if summary.taskCount > 1 {
-                                Text(L10n.format("等%d个会话", summary.taskCount)).foregroundStyle(.primary).fixedSize()
-                            }
                             Spacer(minLength: 0)
+                            if !summary.taskProgress.isEmpty { Text(summary.taskProgress).monospacedDigit().fixedSize() }
                             Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
                         }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
                         .foregroundStyle(tasksHovered ? Color.accentColor : Color.primary)
@@ -105,8 +104,8 @@ struct MenuSummaryView: View {
                     }.buttonStyle(.plain).padding(.top, 6).help(title + "\n" + L10n.text("选择会话和续跑方式"))
                         .onHover { tasksHovered = $0 }
                 }
-                if summary.timeline.count > 1 {
-                    MenuTimelineView(points: summary.timeline).padding(.top, 10)
+                if summary.timeline.count > 1 || summary.timeline.contains(where: \.isHistory) {
+                    MenuTimelineView(points: summary.timeline, openHistory: openHistory).padding(.top, 10)
                 }
                 if !summary.note.isEmpty {
                     Text(L10n.text(summary.note)).font(.system(size: 11)).foregroundStyle(.secondary)
@@ -273,18 +272,25 @@ private extension VerticalAlignment {
 
 private struct MenuTimelineView: View {
     let points: [MenuTimelinePoint]
+    let openHistory: (MenuTimelinePoint) -> Void
+    @State private var hoveredDate: Date?
+    @State private var selectedDate: Date?
     var body: some View {
         HStack(alignment: .timelineSymbol, spacing: 6) {
             ForEach(Array(points.enumerated()), id: \.offset) { index, point in
                 VStack(spacing: 5) {
                     Text(point.timeLabel).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(point.isHistory && (hoveredDate == point.date || selectedDate == point.date) ? Color.accentColor : Color.primary)
                         .lineLimit(1).minimumScaleFactor(0.75)
                     Image(systemName: point.symbol).font(.system(size: 13, weight: .medium))
                         .foregroundStyle(point.isAction ? Color.accentColor : Color.secondary)
                         .frame(width: 16, height: 16)
                         .alignmentGuide(.timelineSymbol) { $0[VerticalAlignment.center] }
-                    Text(L10n.text(point.label)).font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(L10n.text(point.label)).font(.system(size: 10)).foregroundStyle(point.isHistory && (hoveredDate == point.date || selectedDate == point.date) ? Color.accentColor : Color.secondary)
                 }
+                .contentShape(Rectangle())
+                .onTapGesture { if point.isHistory { selectedDate = point.date; openHistory(point) } }
+                .onHover { hoveredDate = $0 && point.isHistory ? point.date : nil }
                 .layoutPriority(1)
                 .help(L10n.text(point.kind == .keepAlive || point.kind == .scheduled ? "计划节点；已有有效额度窗口时跳过" : point.label))
                 .accessibilityElement(children: .ignore)

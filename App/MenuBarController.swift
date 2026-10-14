@@ -5,6 +5,7 @@ import UserNotifications
 
 @MainActor final class MenuBarController: NSObject, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let statusQuotaView = MenuBarQuotaView()
     private let menu = NSMenu()
     private var summaryHost: NSHostingView<MenuSummaryView>?
     private let summaryItem = NSMenuItem()
@@ -31,6 +32,7 @@ import UserNotifications
         menu.delegate = self
         menu.autoenablesItems = false
         statusItem.menu = menu
+        if let button = statusItem.button { statusQuotaView.attach(to: button) }
         let notifications = UNUserNotificationCenter.current()
         notifications.delegate = self
         notifications.getNotificationSettings { settings in
@@ -82,9 +84,20 @@ import UserNotifications
         executionFailureSeen = true
         appState.refresh(manual: true, source: "menu_open"); rebuildMenu()
     }
-    func menuWillOpen(_ menu: NSMenu) { quotaHost?.menuWillOpen() }
-    func menuDidClose(_ menu: NSMenu) { quotaHost?.menuDidClose() }
-    func shutdown() { updateService.stop(); appState.execution.cancelCurrent() }
+    func menuWillOpen(_ menu: NSMenu) { statusQuotaView.setHighlighted(true); quotaHost?.menuWillOpen() }
+    func menuDidClose(_ menu: NSMenu) { statusQuotaView.setHighlighted(false); quotaHost?.menuDidClose() }
+    func shutdown() { updateService.stop(); appState.execution.stopOwnedTasks() }
+    func confirmQuit() -> Bool {
+        let names = appState.execution.independentTaskNames
+        guard !names.isEmpty else { return true }
+        let alert = NSAlert(); alert.alertStyle = .informational
+        alert.messageText = L10n.format("退出会停止 %d 个任务", names.count)
+        alert.informativeText = names.joined(separator: "\n")
+        alert.addButton(withTitle: L10n.text("暂不退出"))
+        alert.addButton(withTitle: L10n.text("退出并停止任务"))
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
+    }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
@@ -143,12 +156,19 @@ import UserNotifications
         let summary = makeSummary()
         let statusText = appState.execution.running ? L10n.text(summary.headline) : summary.statusText
         let action = summary.action.isEmpty ? summary.headline : summary.action
-        statusItem.button?.title = enabled ? " " + statusText : ""
-        statusItem.button?.image = NSImage(systemSymbolName: summary.statusSymbol, accessibilityDescription: L10n.text(action))
-        statusItem.button?.image?.isTemplate = true
-        statusItem.button?.toolTip = "Codex Keeper · " + L10n.text(action) + (summary.isTime ? " · " + summary.statusText : "") + (summary.warning.isEmpty ? "" : " · " + summary.warning)
+        let statusQuota = enabled ? summary.statusQuota : nil
+        statusQuotaView.update(statusQuota, title: enabled ? " " + statusText : "",
+            image: NSImage(systemSymbolName: summary.statusSymbol, accessibilityDescription: L10n.text(action)))
+        let quotaText = statusQuota.map {
+            L10n.format("%@剩余额度", L10n.text($0.name)) + " \(Int(max(0, min(100, $0.remaining)).rounded()))%"
+        }
+        let statusDescription = "Codex Keeper · " + L10n.text(action) + (summary.isTime ? " · " + summary.statusText : "") +
+            (quotaText.map { " · " + $0 } ?? "") + (summary.warning.isEmpty ? "" : " · " + summary.warning)
+        statusItem.button?.toolTip = statusDescription
+        statusItem.button?.setAccessibilityLabel(statusDescription)
         let view = MenuSummaryView(summary: summary,
             openTasks: { [weak self] in self?.menu.cancelTracking(); self?.openTasks() },
+            openHistory: { [weak self] point in self?.menu.cancelTracking(); self?.openTasks(history: point) },
             showError: { [weak self] in self?.menu.cancelTracking(); self?.showExecutionIssue() },
             refresh: { [weak self] in self?.refreshUsage() })
         let host: NSHostingView<MenuSummaryView>
@@ -175,7 +195,7 @@ import UserNotifications
         host.frame.size = NSSize(width: 304, height: host.fittingSize.height)
         cancelResumeItem?.title = L10n.text(appState.nextAction?.needsRecoveryDecision == true ? "选择续跑方式…" : "取消下一次自动继续")
         cancelResumeItem?.isHidden = !enabled || appState.selectedTasks.isEmpty
-        cancelResumeItem?.isEnabled = !appState.execution.running
+        cancelResumeItem?.isEnabled = !appState.selectedTasks.allSatisfy { appState.execution.isContentLocked($0, accountID: appState.displayAccountID) }
         quotaHost?.update(quotas: summary.quotas, accountID: summary.quotaAccountID)
         quotaItem.isHidden = summary.quotas.isEmpty
         quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
@@ -196,7 +216,7 @@ import UserNotifications
 
     private func makeSummary(running: Bool? = nil) -> MenuSummary {
         let defaults = UserDefaults.standard
-        return presentation.build(plan: appState.nextAction, usage: appState.usage.snapshot,
+        var summary = presentation.build(plan: appState.nextAction, usage: appState.usage.snapshot,
             schedule: appState.schedule, tasks: appState.selectedTasks, availableTasks: appState.availableTasks,
             choices: appState.choices, enabled: defaults.bool(forKey: "enabled"), autoResume: defaults.bool(forKey: "autoResume"),
             earlyRecoveryPolicy: defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask",
@@ -204,10 +224,17 @@ import UserNotifications
             usageError: appState.usage.lastError, usageErrorIsTransient: appState.usage.lastErrorIsTransient,
             sessionError: appState.sessions.detectionError,
             running: running ?? appState.execution.running, executionMode: appState.execution.activeMode,
-            executionFailure: appState.execution.lastFailure,
+            executionFailure: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.lastFailure,
             executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil,
             executionWarning: appState.execution.warning,
             refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage)
+        if let failure = appState.execution.recordingFailure {
+            summary.error = [summary.error, failure].filter { !$0.isEmpty }.joined(separator: "\n")
+            summary.hasStatusIssue = true
+        }
+        summary.applyResumeTasks(operations: appState.currentOperations, pending: appState.availableTasks, choices: appState.choices)
+        summary.applyResumeHistory(appState.visibleOperations, accountID: appState.displayAccountID, confirmations: appState.execution.confirmations)
+        return summary
     }
 
     @objc private func showExecutionIssue() {
@@ -275,15 +302,17 @@ import UserNotifications
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn { appState.useKeepAlive(for: tasks) }
     }
-    @objc private func openTasks() {
+    @objc private func openTasks() { openTasks(history: nil) }
+    private func openTasks(history: MenuTimelinePoint?) {
         if tasksWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 500), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = L10n.text("自动继续任务")
-            window.contentView = NSHostingView(rootView: ResumeTasksView(state: appState))
             window.center(); window.isReleasedWhenClosed = false
             tasksWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)
+        tasksWindow?.contentView = NSHostingView(rootView: ResumeTasksView(state: appState,
+            historyIDs: history?.operationIDs, historyAccountID: appState.displayAccountID, historyLabel: history.map { $0.timeLabel + " · " + L10n.text($0.label) }))
         tasksWindow?.makeKeyAndOrderFront(nil)
     }
     @objc func openKeeperSettings() {

@@ -42,6 +42,10 @@ struct SessionActivity: Equatable {
     var createdAt: Date? = nil
     // Time of a real desktop user request whose subsequent token usage demonstrably increased.
     var userUsage: UserUsageEvidence? = nil
+    var currentTurnID: String? = nil
+    var quotaTurnID: String? = nil
+    var turns: [String: SessionTurnEvidence] = [:]
+    var lastRetryingErrorAt: Date? = nil
 }
 
 /// 监听 ~/.codex/sessions 的 rollout 变化（方案 §27）。
@@ -57,6 +61,8 @@ final class SessionWatcher: ObservableObject {
     private var timer: Timer?
     private var refreshing = false
     var watchedIDs: Set<String> = []
+    var watchedPaths: [URL] = []
+    @Published private(set) var scannedAt: Date?
 
     init(codexHome: URL = CodexEnvironment.home) {
         worker = SessionScanWorker(codexHome: codexHome)
@@ -75,15 +81,17 @@ final class SessionWatcher: ObservableObject {
         refreshing = true
         let worker = worker
         let ids = watchedIDs
+        let paths = watchedPaths
         Task {
             let result = await Task.detached { () -> ([SessionActivity], String?, AuthenticationObservation) in
-                let sessions = worker.read(watchedIDs: ids)
+                let sessions = worker.read(watchedIDs: ids, watchedPaths: paths)
                 let auth: AuthenticationObservation
                 do { auth = .known(try AppServerUsageProvider.authenticationIdentity(home: worker.codexHome)) }
                 catch { auth = .unreadable }
                 return (sessions.0, sessions.1, auth)
             }.value
             authentication = result.2
+            scannedAt = Date()
             hasScanned = true
             detectionError = result.1
             sessions = result.0
@@ -145,6 +153,10 @@ final class SessionWatcher: ObservableObject {
         var completedAt: Date?
         var blockedFive: Date?
         var blockedWeekly: Date?
+        var currentTurn: String?
+        var quotaTurn: String?
+        var turns: [String: SessionTurnEvidence] = [:]
+        var retryingErrorAt: Date?
         for line in content.split(separator: "\n") {
             guard let data = line.data(using: .utf8), let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let payload = entry["payload"] as? [String: Any] else { continue }
@@ -169,11 +181,33 @@ final class SessionWatcher: ObservableObject {
             if let threadID = (payload["thread_id"] ?? payload["threadId"]) as? String, threadID != id { continue }
             activity = timestamp
             let type = payload["type"] as? String ?? ""
+            let explicitTurn = (payload["turn_id"] ?? payload["turnId"]) as? String
+            if type == "task_started" { currentTurn = explicitTurn }
+            else if entry["type"] as? String == "turn_context", let explicitTurn { currentTurn = explicitTurn }
+            let eventTurn = explicitTurn ?? currentTurn
+            if let turn = eventTurn, let at = UsageDecoder.timestamp(entry["timestamp"] as? String) {
+                var evidence = turns[turn] ?? SessionTurnEvidence()
+                if type == "task_started" { evidence.startedAt = at }
+                if ResumeModelActivity.rollout(entry), evidence.startedAt != nil, evidence.responseAt == nil { evidence.responseAt = at }
+                if type == "task_complete" || type == "turn_aborted" {
+                    if type == "turn_aborted" { evidence.endedAt = at; evidence.terminal = .aborted }
+                    else { evidence.endedAt = evidence.endedAt ?? at; evidence.terminal = evidence.terminal ?? .completed }
+                    if let error = payload["error"] {
+                        let text = String(describing: error)
+                        evidence.terminal = ResumeModelActivity.quotaError(text) ? .quotaStopped : .failed
+                    }
+                }
+                if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool != true {
+                    evidence.endedAt = at
+                    evidence.terminal = ResumeModelActivity.quotaError(String(describing: payload)) ? .quotaStopped : .failed
+                }
+                turns[turn] = evidence
+            }
             if let limits = payload["rate_limits"] as? [String: Any],
                (limits["limit_id"] as? String ?? limits["limitId"] as? String ?? "codex") == "codex" {
                 (five, weekly) = UsageDecoder.windows(limits)
                 if let reached = (limits["rate_limit_reached_type"] ?? limits["rateLimitReachedType"]) as? String, !reached.isEmpty {
-                    blockedAt = timestamp; running = false
+                    blockedAt = timestamp; quotaTurn = eventTurn; running = false
                     blockedFive = five?.usedPercent ?? 0 >= 100 ? five?.resetsAt : nil
                     blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
                 }
@@ -201,7 +235,9 @@ final class SessionWatcher: ObservableObject {
                let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
                 tokenTotal = total
             }
-            if type == "task_started" { running = true; startedAt = timestamp; blockedAt = nil }
+            if ResumeModelActivity.rollout(entry) { assistantAt = timestamp; blockedAt = nil }
+            if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool == true { retryingErrorAt = timestamp; running = true; blockedAt = nil; quotaTurn = nil }
+            if type == "task_started" { running = true; startedAt = timestamp; blockedAt = nil; quotaTurn = nil }
             if type == "task_complete" || type == "turn_aborted" {
                 running = false; completedAt = timestamp
                 usagePromptAt = nil
@@ -221,18 +257,21 @@ final class SessionWatcher: ObservableObject {
                 assistantAt = timestamp; blockedAt = nil
             }
             if type == "turn_aborted" { blockedAt = nil; abortedAt = timestamp }
-            if type == "error" || type == "turn_failed" {
+            if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool != true {
                 sawError = true
                 running = false
                 usagePromptAt = nil
                 let text = String(data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), encoding: .utf8)?.lowercased() ?? ""
                 let quota = ["usage_limit_reached", "usage_limit_exceeded", "quota_exhausted", "insufficient_quota", "you’ve hit your usage limit", "you've hit your usage limit"].contains { text.contains($0) }
                 if quota {
-                    blockedAt = timestamp
+                    blockedAt = timestamp; quotaTurn = eventTurn
                     blockedFive = five?.usedPercent ?? 0 >= 100 ? five?.resetsAt : nil
                     blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
                 }
             }
+        }
+        if let turn = currentTurn, let evidence = turns[turn], evidence.terminal == .quotaStopped, let at = evidence.endedAt {
+            blockedAt = at; quotaTurn = turn; running = false
         }
         if id.isEmpty {
             let name = url.deletingPathExtension().lastPathComponent
@@ -242,7 +281,7 @@ final class SessionWatcher: ObservableObject {
         return SessionActivity(id: id, project: cwd.isEmpty ? L10n.text("未知项目") : URL(fileURLWithPath: cwd).lastPathComponent,
             cwd: cwd, fileURL: url, lastActivityAt: activity, fiveHour: five, weekly: weekly,
             sawErrorEvent: sawError, taskRunning: running, lastUserMessageAt: userAt, quotaBlockedAt: blockedAt,
-            lastCompletedAt: completedAt, blockingFiveReset: blockedFive, blockingWeeklyReset: blockedWeekly, lastAssistantMessageAt: assistantAt, lastTaskStartedAt: startedAt, lastAbortedAt: abortedAt, isSubagent: isSubagent, createdAt: createdAt, userUsage: userUsage)
+            lastCompletedAt: completedAt, blockingFiveReset: blockedFive, blockingWeeklyReset: blockedWeekly, lastAssistantMessageAt: assistantAt, lastTaskStartedAt: startedAt, lastAbortedAt: abortedAt, isSubagent: isSubagent, createdAt: createdAt, userUsage: userUsage, currentTurnID: currentTurn, quotaTurnID: quotaTurn, turns: turns, lastRetryingErrorAt: retryingErrorAt)
     }
 }
 
@@ -255,10 +294,14 @@ private final class SessionScanWorker {
         self.codexHome = codexHome
         quotaLogs = QuotaErrorLogProvider(codexHome: codexHome)
     }
-    func read(watchedIDs: Set<String>) -> ([SessionActivity], String?) {
+    func read(watchedIDs: Set<String>, watchedPaths: [URL] = []) -> ([SessionActivity], String?) {
         var stops: [String: QuotaStop] = [:]
         var errorMessage: String?
-        let all = SessionWatcher.recentRollouts(codexHome: codexHome, limit: Int.max)
+        var all = SessionWatcher.recentRollouts(codexHome: codexHome, limit: Int.max)
+        for path in watchedPaths where !all.contains(where: { $0.url == path }) {
+            if let values = try? path.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]), values.isRegularFile == true,
+               let mtime = values.contentModificationDate { all.append((path, mtime)) }
+        }
         do { stops = try quotaLogs.read() }
         catch {
             // A new installation with no sessions has no candidates to resume.
@@ -297,8 +340,16 @@ private final class SessionScanWorker {
                (activity.lastUserMessageAt ?? .distantPast) <= stop.at,
                (activity.lastAssistantMessageAt ?? .distantPast) <= stop.at,
                (activity.lastTaskStartedAt ?? .distantPast) <= stop.at,
-               (activity.lastAbortedAt ?? .distantPast) <= stop.at {
-                activity.quotaBlockedAt = stop.at; activity.taskRunning = false
+               (activity.lastAbortedAt ?? .distantPast) <= stop.at,
+               (stop.turnID == nil || activity.currentTurnID == nil || stop.turnID == activity.currentTurnID),
+               activity.quotaBlockedAt == nil,
+               (activity.lastRetryingErrorAt ?? .distantPast) < stop.at {
+                activity.quotaBlockedAt = stop.at; activity.quotaTurnID = stop.turnID ?? activity.currentTurnID; activity.taskRunning = false
+                if let turn = activity.quotaTurnID {
+                    var evidence = activity.turns[turn] ?? SessionTurnEvidence()
+                    evidence.endedAt = stop.at; evidence.terminal = .quotaStopped
+                    activity.turns[turn] = evidence
+                }
                 activity.blockingFiveReset = activity.fiveHour?.usedPercent ?? 0 >= 100 ? activity.fiveHour?.resetsAt : nil
                 activity.blockingWeeklyReset = activity.weekly?.usedPercent ?? 0 >= 100 ? activity.weekly?.resetsAt : nil
             }

@@ -48,7 +48,7 @@
 "未选择会话" = "No Task Selected";
 "尚未开启窗口" = "No Active Window";
 "正在重新同步额度…" = "Syncing quota again…";
-"网络恢复后打开菜单，或点击“重新同步”重试。" = "Open the menu when your network recovers, or click Refresh to try again.";
+"正在自动重试额度读取。" = "Retrying quota reads automatically.";
 "正在同步；点击可在完成后重新读取" = "Syncing; click to read again afterward";
 "重新同步额度" = "Refresh Quota";
 "正在同步额度" = "Syncing Quota";
@@ -271,3 +271,74 @@
 "无法打开 GitHub，请稍后重试。" = "Could not open GitHub. Try again later.";
 "Codex Keeper 问题反馈" = "Codex Keeper Feedback";
 "应用版本：%@\nmacOS：%@\n芯片：%@\n\n问题描述：\n\n复现步骤：\n1. " = "App version: %@\nmacOS: %@\nChip: %@\n\nIssue description:\n\nSteps to reproduce:\n1. ";
+
+"已接收" = "Received";
+
+"确认中" = "Confirming";
+
+"正在发送" = "Sending";
+
+"等待重试" = "Waiting to retry";
+
+"发送失败，请到 Codex 手动继续" = "Sending failed. Continue manually in Codex.";
+
+"%@ · 已继续" = "%@ · Continued";
+
+"%@ · 已继续，请到 Codex 手动继续" = "%@ · Continued. Continue manually in Codex.";
+
+"未发送，%@" = "Not sent: %@";
+
+"已暂停，等待自动继续" = "Paused, waiting to continue automatically";
+
+"已暂停，Keeper 已停用" = "Paused, Keeper is disabled";
+
+"已暂停，自动续跑已关闭" = "Paused, automatic continuation is off";
+
+"条件恢复后自动重试" = "Automatically retries when conditions recover";
+
+"立即重试" = "Retry now";
+
+"自动继续此任务" = "Continue this task automatically";
+
+"忽略本轮" = "Ignore this pause";
+
+"忽略本轮续跑？" = "Ignore this continuation?";
+
+"仅跳过“%@”这次续跑；之后再次暂停仍正常处理。Codex 任务和已有记录会保留。" = "Skip only this continuation for “%@”. A later pause will be handled normally. The Codex task and existing records are kept.";
+
+"暂无可显示的任务" = "No tasks to display";
+
+"打开 Codex" = "Open Codex";
+
+"无法打开 Codex，请手动打开应用。" = "Could not open Codex. Open the app manually.";
+
+"执行记录无法保存，暂停新的自动操作" = "Execution records could not be saved. New automatic actions are paused.";
+
+"需要手动继续" = "Manual continuation needed";
+
+"退出会停止 %d 个任务" = "Quitting will stop %d tasks";
+
+"暂不退出" = "Keep running";
+
+"退出并停止任务" = "Quit and stop tasks";
+
+"%d 个任务正在发送" = "%d tasks sending";
+
+"%d 个任务确认中" = "%d tasks confirming";
+
+"%d 个任务发送失败" = "%d tasks failed to send";
+
+"%d 个任务需到 Codex 手动继续" = "%d tasks need manual continuation in Codex";
+
+"%d 个任务待选择" = "%d tasks awaiting a choice";
+
+"%d 个任务等待自动继续" = "%d tasks waiting to continue automatically";
+
+"续跑记录" = "Continuation record";
+
+"%d 个任务续跑已停止" = "%d continuations stopped";
+
+"本次启动未确认，原任务已有新进展" = "Startup was not confirmed; the original task has newer activity.";
+"正在保活，完成后可选择现在继续" = "Keeping alive; you can continue now when it finishes";
+"正在保活，完成后可立即重试" = "Keeping alive; you can retry when it finishes";
+"额度提前恢复，可选择现在继续；确认正常恢复后会自动继续。" = "Quota recovered early. You can continue now; automatic continuation resumes when the scheduled recovery is confirmed.";

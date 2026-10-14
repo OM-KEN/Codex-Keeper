@@ -52,7 +52,7 @@ struct RecoveryDecision: Codable, Equatable {
     var message: String {
         switch phase {
         case .waitingForActivity, .waitingForChoice:
-            return L10n.text("未选择时，提醒会一直保留，任务不会自动继续。")
+            return L10n.text("额度提前恢复，可选择现在继续；确认正常恢复后会自动继续。")
         case .responded:
             return L10n.text("你已选择「现在继续」。若执行失败，请查看提示后重试。")
         }
@@ -83,6 +83,9 @@ struct ResumeChoices: Codable, Equatable {
         return true
     }
 
+    var ignoredEpisodes: Set<String>? = nil
+    var readManualEvents: Set<String>? = nil
+
     var messageModes: [String: ResumeMessageMode]? = nil
 
     func mode(for task: BlockedSession) -> ResumeMessageMode { messageModes?[task.episodeKey] ?? .fixed }
@@ -91,7 +94,7 @@ struct ResumeChoices: Codable, Equatable {
     var messages: [String: String] = [:]
 
     var keepAliveIgnoredEpisodes: Set<String> {
-        keepAliveEpisodes.union(recoveryDecisions?.keys.map { $0 } ?? [])
+        keepAliveEpisodes.union(ignoredEpisodes ?? []).union(recoveryDecisions?.keys.map { $0 } ?? [])
     }
 
     func permitsKeepAlive(for tasks: [BlockedSession], ignoring episodes: Set<String>) -> Bool {
@@ -99,7 +102,7 @@ struct ResumeChoices: Codable, Equatable {
     }
 
     func available(_ tasks: [BlockedSession]) -> [BlockedSession] {
-        tasks.filter { !keepAliveEpisodes.contains($0.episodeKey) }
+        tasks.filter { !keepAliveEpisodes.contains($0.episodeKey) && !(ignoredEpisodes?.contains($0.episodeKey) ?? false) }
     }
     func selected(_ tasks: [BlockedSession]) -> [BlockedSession] {
         available(tasks).filter { !deselectedEpisodes.contains($0.episodeKey) }

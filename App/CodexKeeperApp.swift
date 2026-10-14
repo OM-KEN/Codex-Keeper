@@ -17,6 +17,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var menuBar: MenuBarController?
     private var onboardingWindow: NSWindow?
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        menuBar?.confirmQuit() == false ? .terminateCancel : .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) { menuBar?.shutdown(); AppServerClient.closeAll() }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
