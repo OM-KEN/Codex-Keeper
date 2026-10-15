@@ -40,16 +40,20 @@ Select **Review task** in the reminder at the top of the menu, or use the system
 
 If you do not choose during early recovery, the task waits. It resumes automatically once normal recovery is confirmed. Temporary sync failures retry automatically without asking you to choose a recovery method.
 
-The trash button at the top right of each task lets you ignore its current pause after confirmation. The task disappears from the list, while the original task and records remain. If you continue it manually and it later pauses for quota again, Keeper treats that as a new pause.
+The trash button at the top right of a current task lets you ignore its current pause after confirmation. The task disappears from the list, while the original task and records remain. If you continue it manually and it later pauses for quota again, Keeper treats that as a new pause. Click a past resume point in the timeline to view its read-only records.
 
 </details>
 
 <details>
 <summary>Can I change the message sent when a task resumes?</summary>
 
-Click a task name in the menu to select tasks and edit the message. You can also use the text saved in that task's Codex input box.
+Click the task entry in the menu to select tasks and choose a message mode:
 
-In Settings, choose the default “Continue” or edit a custom message. The interface supports Simplified Chinese and English and follows the macOS language setting for the app. The default message follows the language; custom messages stay as written.
+- **Default “Continue”**: The default for new tasks, with no text to enter.
+- **Custom message**: Opens an editor and preserves your text when you switch modes. Your custom message in Settings can supply the initial text.
+- **Use Codex Input**: Sends the task's saved draft text without attachments. An empty draft sends “Continue”; the original draft is preserved.
+
+The interface supports Simplified Chinese and English and follows the macOS language setting for the app. The default “Continue” follows the language; custom messages stay as written.
 
 If project files changed or cannot be checked, Keeper adds a reminder before the resume message asking Codex to check the project and progress first. You can turn it off in Settings.
 
