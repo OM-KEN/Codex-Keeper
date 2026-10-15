@@ -14,7 +14,10 @@ struct NextAction {
 }
 
 /// Choices refer to a quota-stop episode, so a later stop in the same task defaults to selected.
-enum ResumeMessageMode: String, Codable { case fixed, composerDraft }
+enum ResumeMessageMode: String, Codable {
+    case localizedDefault = "default"
+    case fixed, composerDraft
+}
 
 enum ResumeMessagePreferences {
     enum Mode: String { case localizedDefault = "default", custom }
@@ -88,7 +91,10 @@ struct ResumeChoices: Codable, Equatable {
 
     var messageModes: [String: ResumeMessageMode]? = nil
 
-    func mode(for task: BlockedSession) -> ResumeMessageMode { messageModes?[task.episodeKey] ?? .fixed }
+    func mode(for task: BlockedSession) -> ResumeMessageMode {
+        if let mode = messageModes?[task.episodeKey] { return mode }
+        return messages[task.episodeKey] == nil ? .localizedDefault : .fixed
+    }
     var keepAliveEpisodes = Set<String>()
     var deselectedEpisodes = Set<String>()
     var messages: [String: String] = [:]
@@ -112,6 +118,7 @@ struct ResumeChoices: Codable, Equatable {
         for task in tasks { recoveryDecisions?.removeValue(forKey: task.episodeKey) }
     }
     func message(for task: BlockedSession, default value: String) -> String {
+        if mode(for: task) == .localizedDefault { return L10n.text("继续") }
         let custom = messages[task.episodeKey]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return custom.isEmpty ? value : custom
     }

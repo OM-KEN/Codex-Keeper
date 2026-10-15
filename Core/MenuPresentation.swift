@@ -19,6 +19,7 @@ struct MenuSummary {
     var tasks: [String] = []
     var taskCount = 0
     var taskProgress = ""
+    var tasksNeedAttention = false
     var timeline: [MenuTimelinePoint] = []
     var statusDatePrefix = ""
     var reminderTitle = ""
@@ -231,17 +232,24 @@ extension MenuSummary {
                     day: Calendar.current.isDate(date, inSameDayAs: now) ? "" : dayText(date),
                     label: label, kind: kind, solidBefore: solid)
             }
+            func observedWindow(_ window: QuotaWindow) -> MenuTimelinePoint {
+                let start = window.resetsAt.addingTimeInterval(-Double(window.windowMinutes) * 60)
+                if let reset = observedResets.filter({ $0 <= now && abs($0.timeIntervalSince(start)) <= ScheduleEngine.alignmentTolerance })
+                    .min(by: { abs($0.timeIntervalSince(start)) < abs($1.timeIntervalSince(start)) }) {
+                    return point(reset, "已重置", .reset)
+                }
+                return point(start, plan.mode == .keepAlive ? "窗口开始" : "开始", plan.mode == .keepAlive ? .keepAliveNotNeeded : .start)
+            }
             var joinsCurrentWindow = false
             if let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now {
                 let start = five.resetsAt.addingTimeInterval(-Double(five.windowMinutes) * 60)
                 if start <= now {
                     // Only a confirmed operation matching this real window can claim completion.
                     let confirmed = confirmation(for: start)
-                    let needsNoKeepAlive = plan.mode == .keepAlive
-                    let kind: MenuTimelinePoint.Kind = confirmed.map { $0.kind == .resume ? .completedResume : .completedKeepAlive } ??
-                        (needsNoKeepAlive ? .keepAliveNotNeeded : .start)
-                    let label = confirmed.map { $0.kind == .resume ? "已继续" : "已保活" } ?? (needsNoKeepAlive ? "无需保活" : "开始")
-                    result.timeline.append(point(start, label, kind))
+                    if let confirmed {
+                        result.timeline.append(point(start, confirmed.kind == .resume ? "已继续" : "已保活",
+                            confirmed.kind == .resume ? .completedResume : .completedKeepAlive))
+                    } else { result.timeline.append(observedWindow(five)) }
                     if abs(actionDate.timeIntervalSince(five.resetsAt)) < ScheduleEngine.alignmentTolerance {
                         joinsCurrentWindow = true
                     } else if five.resetsAt < actionDate {
@@ -268,10 +276,7 @@ extension MenuSummary {
                         confirmation.kind == .resume ? "已继续" : "已保活",
                         confirmation.kind == .resume ? .completedResume : .completedKeepAlive)
                 }
-                let observed = observedWindows.map {
-                    point($0.resetsAt.addingTimeInterval(-Double($0.windowMinutes) * 60),
-                        plan.mode == .keepAlive ? "无需保活" : "开始", plan.mode == .keepAlive ? .keepAliveNotNeeded : .start)
-                } + observedResets.map { point($0, "重置", .reset) }
+                let observed = observedWindows.map(observedWindow) + observedResets.map { point($0, "已重置", .reset) }
                 // A confirmed action takes precedence over an observation of the same window.
                 let history = completed + observed.filter { observation in
                     !completed.contains { abs($0.date.timeIntervalSince(observation.date)) <= ScheduleEngine.alignmentTolerance }
@@ -440,11 +445,16 @@ struct MenuPresentation {
         if enabled, !fatalIssue, let usage, usage.isFresh(at: now), let accountID = usage.accountID, !accountID.isEmpty,
            let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now, five.windowMinutes > 0 {
             let start = five.resetsAt.addingTimeInterval(-Double(five.windowMinutes) * 60)
-            if start <= now && start <= usage.capturedAt {
+            let latestStart = observedWindows.map { $0.resetsAt.addingTimeInterval(-Double($0.windowMinutes) * 60) }.max() ?? start
+            if start <= now && start <= usage.capturedAt && start >= latestStart.addingTimeInterval(-ScheduleEngine.alignmentTolerance) {
                 observedAccountID = accountID
-                for previous in observedWindows where previous.resetsAt <= now && previous.resetsAt <= usage.capturedAt &&
-                    start >= previous.resetsAt && !observedResets.contains(previous.resetsAt) {
-                    observedResets.append(previous.resetsAt)
+                if let previous = observedWindows.filter({ $0.windowMinutes == five.windowMinutes &&
+                    five.resetsAt.timeIntervalSince($0.resetsAt) > ScheduleEngine.alignmentTolerance }).max(by: { $0.resetsAt < $1.resetsAt }) {
+                    // A later real window verifies expiry, or replaces an unexpired window after an early reset.
+                    let reset = start >= previous.resetsAt ? previous.resetsAt : start
+                    if !observedResets.contains(where: { abs($0.timeIntervalSince(reset)) <= ScheduleEngine.alignmentTolerance }) {
+                        observedResets.append(reset)
+                    }
                 }
                 if !observedWindows.contains(where: { $0.resetsAt == five.resetsAt && $0.windowMinutes == five.windowMinutes }) {
                     observedWindows.append(five)
@@ -562,8 +572,9 @@ extension MenuSummary {
         let labels = order.compactMap { key in counts[key].map { L10n.format(key, $0) } }
         tasks = labels.isEmpty ? [] : [labels.joined(separator: " · ")]
         taskCount = counts.values.reduce(0, +)
+        tasksNeedAttention = ["%d 个任务发送失败", "%d 个任务续跑已停止", "%d 个任务需到 Codex 手动继续", "%d 个任务待选择"].contains { counts[$0] != nil }
         let confirmed = operations.filter { $0.respondedAt != nil }.count
-        taskProgress = !operations.isEmpty && confirmed < operations.count ? "\(confirmed)/\(operations.count)" : ""
+        taskProgress = !operations.isEmpty && confirmed < operations.count ? L10n.format("已继续 %d/%d", confirmed, operations.count) : ""
         reminderTitle = ""; reminderBody = ""
         if counts["%d 个任务需到 Codex 手动继续"] != nil {
             headline = "需要手动继续"; action = ""; eyebrow = ""; isTime = false; isSyncing = false

@@ -321,7 +321,7 @@ import Darwin
                 earlyRecoveryPolicy: "ask", usage: menuUsage, blocked: [])
             let menu = MenuSummary.build(plan: menuPlan, usage: menuUsage, schedule: schedule, tasks: [], now: menuUsage.capturedAt)
             check(menu.badge == "计划内" && menu.action == "保持活动" && menu.timeline.first?.date == windowStart &&
-                menu.timeline.first?.kind == .keepAliveNotNeeded && menu.timeline.first?.label == "无需保活",
+                menu.timeline.first?.kind == .keepAliveNotNeeded && menu.timeline.first?.label == "窗口开始",
                 "an unconfirmed 13:03:08 active window is shown on plan without claiming Keeper kept it alive")
             let lateStart = menuNode.addingTimeInterval(608)
             menuUsage.capturedAt = lateStart.addingTimeInterval(30); menuUsage.fiveHour?.resetsAt = lateStart.addingTimeInterval(18000)
@@ -868,7 +868,7 @@ import Darwin
         let displayQuota = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 20, windowMinutes: 300, resetsAt: localNode.addingTimeInterval(660)), weekly: nil, capturedAt: localNode, accountID: "display-account", sourceFile: "app-server")
         let displayPlan = engine.plan(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: displayQuota, blocked: [])
         let display = MenuSummary.build(plan: displayPlan, usage: displayQuota, schedule: schedule, tasks: [], now: localNode)
-        check(display.timeline.first?.kind == .keepAliveNotNeeded && display.timeline.first?.label == "无需保活" &&
+        check(display.timeline.first?.kind == .keepAliveNotNeeded && display.timeline.first?.label == "窗口开始" &&
             display.timeline.first?.symbol == "circle.fill" && display.timeline.first?.isAction == false,
             "an active off-plan window needs no keep-alive without claiming a successful execution")
         check(display.headline == "18:00" && display.action == "保持活动" && display.badge == "计划外", "off-plan menu keeps the next viable keepalive action while classifying the actual window")
@@ -1011,7 +1011,30 @@ import Darwin
         check(confirmations.first?.actionAt == date("2026-09-11T08:05:00Z"), "concurrent resume completion matches its own task start")
         check(confirmations.last?.windowStart == date("2026-09-11T13:00:05Z"), "confirmed keepalive uses actual resulting quota window")
         let oldChoicesData = Data("{\"keepAliveEpisodes\":[],\"deselectedEpisodes\":[],\"messages\":{}}".utf8)
-        check(try JSONDecoder().decode(ResumeChoices.self, from: oldChoicesData).mode(for: stoppedTask) == .fixed, "old pending settings default to fixed message without migration loss")
+        let oldChoices = try JSONDecoder().decode(ResumeChoices.self, from: oldChoicesData)
+        check(oldChoices.mode(for: stoppedTask) == .localizedDefault &&
+            oldChoices.message(for: stoppedTask, default: "设置中的自定义内容") == L10n.text("继续"),
+            "old pending settings without a saved message use localized continue independently of global custom text")
+        var savedChoicesObject = try JSONSerialization.jsonObject(with: oldChoicesData) as! [String: Any]
+        for message in ["继续", "Continue", "继续并检查测试", " \n "] {
+            savedChoicesObject["messages"] = [stoppedTask.episodeKey: message]
+            let savedChoices = try JSONDecoder().decode(ResumeChoices.self, from: JSONSerialization.data(withJSONObject: savedChoicesObject))
+            check(savedChoices.mode(for: stoppedTask) == .fixed && savedChoices.messages[stoppedTask.episodeKey] == message,
+                "legacy per-task messages remain custom without changing their saved text: \(message.debugDescription)")
+        }
+        savedChoicesObject["messages"] = [stoppedTask.episodeKey: "保留的自定义内容"]
+        for mode in [ResumeMessageMode.fixed, .composerDraft, .localizedDefault] {
+            savedChoicesObject["messageModes"] = [stoppedTask.episodeKey: mode.rawValue]
+            let savedChoices = try JSONDecoder().decode(ResumeChoices.self, from: JSONSerialization.data(withJSONObject: savedChoicesObject))
+            check(savedChoices.mode(for: stoppedTask) == mode && savedChoices.messages[stoppedTask.episodeKey] == "保留的自定义内容",
+                "explicit per-task mode wins over retained custom text after decoding: \(mode.rawValue)")
+        }
+        var customChoices = ResumeChoices(messageModes: [stoppedTask.episodeKey: .fixed])
+        check(customChoices.message(for: stoppedTask, default: "设置中的自定义内容") == "设置中的自定义内容",
+            "new custom mode keeps the existing global preference as its initial content")
+        customChoices.messages[stoppedTask.episodeKey] = " \n "
+        check(customChoices.message(for: stoppedTask, default: "设置中的自定义内容") == "设置中的自定义内容",
+            "blank per-task custom content keeps the existing safe preference fallback")
         let draftURL = temp.appendingPathComponent("drafts.json")
         func writeDrafts(_ atoms: [String: Any]) throws {
             try JSONSerialization.data(withJSONObject: ["electron-persisted-atom-state": atoms]).write(to: draftURL)
@@ -1019,8 +1042,10 @@ import Darwin
         let reader = ComposerDraftReader(url: draftURL)
         let draftKey = "local:" + stoppedTask.id
         var draftRequest = ResumeRequest(target: stoppedTask, prompt: "固定内容", accountID: nil, workspace: nil, messageMode: .composerDraft)
-        try writeDrafts(["composer-prompt-drafts-v2": [draftKey: ["prompt": "第一段\n第二段"]]])
+        try writeDrafts(["composer-prompt-drafts-v2": [draftKey: ["prompt": "第一段\n第二段", "attachments": [["id": "file-one"]]]]])
+        let originalDraft = try Data(contentsOf: draftURL)
         check(try draftRequest.resolvedPrompt(reader: reader) == "第一段\n第二段", "draft mode reads only the selected task text")
+        check(try Data(contentsOf: draftURL) == originalDraft, "reading composer text leaves the saved draft and attachments unchanged")
         try writeDrafts(["composer-prompt-drafts-v2": [draftKey: ["prompt": "刚刚修改"]]])
         check(try draftRequest.resolvedPrompt(reader: reader) == "刚刚修改", "draft is read at dispatch instead of cached when selection changes")
         try writeDrafts(["composer-prompt-drafts-v2": [:], "composer-prompt-drafts-v1": [draftKey: "已发送的旧稿"]])
@@ -1035,6 +1060,9 @@ import Darwin
         catch { check(true, "unknown references cannot be silently lost") }
         draftRequest.messageMode = .fixed
         check(try draftRequest.resolvedPrompt(reader: reader) == "固定内容", "fixed mode never depends on draft readability")
+        draftRequest.messageMode = .localizedDefault
+        check(try draftRequest.resolvedPrompt(reader: reader) == L10n.text("继续"),
+            "explicit default dispatch ignores a retained custom prompt and does not read an unsupported composer draft")
         let file = temp.appendingPathComponent("rollout-11111111-1111-1111-1111-111111111111.jsonl")
         let meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"22222222-2222-2222-2222-222222222222\",\"cwd\":\"/tmp/project\"}}\n"
         let events = meta + "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
@@ -2342,6 +2370,8 @@ import Darwin
             let parts = Calendar.current.dateComponents([.hour, .minute], from: clockNow)
             appDefaults.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "ask", "resumeWorkspaceReminder": false,
                 "dailyAnchorMinutes": ((parts.hour! * 60 + parts.minute!) + 20) % 1440])
+            appDefaults.set("设置中的自定义内容", forKey: "resumeMessage")
+            appDefaults.set("custom", forKey: ResumeMessagePreferences.modeKey)
             let appRecorder = BatchRecorder(expected: 1)
             let appExecution = ExecutionCoordinator(provider: provider, makeResumeTransport: { BatchTransport(recorder: appRecorder) },
                 defaults: appDefaults, ledgerURL: runtime.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), codexHome: home)
@@ -2359,6 +2389,27 @@ import Darwin
             provider.set(live); try await sync(state)
             let first = state.availableTasks.first { $0.id == parentID }!
             let second = state.availableTasks.first { $0.id == childID }!
+            check(state.choices.mode(for: first) == .localizedDefault && state.choices.mode(for: second) == .localizedDefault,
+                "new tasks start in default mode even when global resume text is custom")
+            state.setMessageMode(first, .fixed)
+            let customText = "保留第一段\n保留第二段"
+            state.setMessage(first, customText)
+            for mode in [ResumeMessageMode.localizedDefault, .composerDraft, .fixed] {
+                state.setMessageMode(first, mode)
+                check(state.choices.mode(for: first) == mode && state.choices.messages[first.episodeKey] == customText,
+                    "actual AppState mode changes preserve custom text: \(mode.rawValue)")
+            }
+            check(state.choices.message(for: first, default: ResumeMessagePreferences.current(defaults: appDefaults)) == customText,
+                "returning to custom mode restores the task's complete text")
+            state.setMessageMode(first, .composerDraft)
+            state = makeState(); try await sync(state)
+            check(state.choices.mode(for: first) == .composerDraft && state.choices.messages[first.episodeKey] == customText,
+                "AppState persistence retains composer mode and the inactive custom text")
+            state.setMessageMode(first, .localizedDefault)
+            state = makeState(); try await sync(state)
+            check(state.choices.mode(for: first) == .localizedDefault && state.choices.messages[first.episodeKey] == customText &&
+                state.choices.message(for: first, default: ResumeMessagePreferences.current(defaults: appDefaults)) == L10n.text("继续"),
+                "AppState restart keeps explicit default mode while retaining and ignoring custom text")
             check(state.choices.recoveryDecisions?.count == 2 && state.choices.recoveryDecisions?[first.episodeKey]?.phase == .waitingForActivity && state.nextAction?.needsRecoveryDecision == true,
                 "real AppState persists unanswered reminders for both recovered episodes")
             check(state.nextAction?.mode == .keepAlive && state.nextAction?.date != nil,
@@ -2463,6 +2514,8 @@ import Darwin
             for _ in 0..<400 { if !appExecution.running { break }; try await Task.sleep(nanoseconds: 10_000_000) }
             check(appRecorder.count == 1 && appExecution.hasAttempted(first) && !appExecution.hasAttempted(second),
                 "the real manual coordinator sends only the explicitly chosen episode through the fake transport")
+            check(appRecorder.prompt(for: first.id) == L10n.text("继续"),
+                "actual AppState and coordinator dispatch localized continue despite stored task and global custom text")
 
             // A preflight error must keep a responded decision and must not enter an immediate retry loop.
             clockNow = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
@@ -2943,6 +2996,85 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
             confirmations: confirmations, usageError: error, usageErrorIsTransient: transient, sessionError: sessionError,
             running: running, executionMode: running ? .keepAlive : nil, now: now)
     }
+    // Replay the real early reset: both limits cleared before the previous five-hour deadline.
+    let beforeResetAt = at(14, 11, 43)
+    var beforeReset = reading(at(13, 3, 1), at: beforeResetAt)
+    beforeReset.fiveHour?.usedPercent = 51
+    beforeReset.weekly = QuotaWindow(usedPercent: 95, windowMinutes: 10080, resetsAt: at(13, 4, 26, days: 5))
+    var emptyReset = reading(at(14, 13, 7), at: at(14, 13, 7))
+    emptyReset.fiveHour?.usedPercent = 0; emptyReset.zeroUseWindowActive = false
+    emptyReset.weekly = QuotaWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: at(14, 13, 7, days: 7))
+    let earlyStart = at(14, 13, 15)
+    var afterReset = reading(earlyStart, at: at(14, 13, 27))
+    afterReset.fiveHour?.usedPercent = 0; afterReset.zeroUseWindowActive = true
+    afterReset.weekly = QuotaWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: at(14, 13, 15, days: 7))
+    let resetHistoryURL = directory.appendingPathComponent("early-reset.json")
+    var earlyReset = MenuPresentation(historyURL: resetHistoryURL)
+    let beforeResetMenu = render(&earlyReset, beforeReset, at: beforeResetAt)
+    check(beforeResetMenu.timeline.first?.label == "窗口开始",
+        "a first active window uses a neutral origin without claiming a reset or Keeper action")
+    let emptyResetMenu = render(&earlyReset, emptyReset, at: emptyReset.capturedAt)
+    check(!emptyResetMenu.timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
+        "the rolling empty-window reading cannot invent a fixed reset timestamp")
+    let earlyResetMenu = render(&earlyReset, afterReset, at: afterReset.capturedAt)
+    check(earlyResetMenu.timeline.contains { $0.date == earlyStart && $0.kind == .reset && $0.label == "已重置" } &&
+        earlyResetMenu.timeline.filter { abs($0.date.timeIntervalSince(earlyStart)) <= ScheduleEngine.alignmentTolerance }.count == 1,
+        "the real 51%/95% to 0%/0% transition replaces the unexpired window with one confirmed reset point")
+    let savedResetHistory = try Data(contentsOf: resetHistoryURL)
+    var reopenedReset = MenuPresentation(historyURL: resetHistoryURL)
+    check(render(&reopenedReset, afterReset, at: afterReset.capturedAt).timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
+        "an early reset remains visible after restarting without a new usage drop")
+    var legacyResetHistory = try JSONSerialization.jsonObject(with: savedResetHistory) as! [String: Any]
+    legacyResetHistory["resets"] = []
+    let legacyResetURL = directory.appendingPathComponent("legacy-early-reset.json")
+    try JSONSerialization.data(withJSONObject: legacyResetHistory).write(to: legacyResetURL)
+    var recoveredReset = MenuPresentation(historyURL: legacyResetURL)
+    check(render(&recoveredReset, afterReset, at: afterReset.capturedAt).timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
+        "existing saved overlapping windows recover a reset that the previous version labelled as unnecessary keepalive")
+    let nextWindow = reading(at(19, 14), at: at(19, 15))
+    _ = render(&earlyReset, nextWindow, at: nextWindow.capturedAt)
+    let savedAfterNextWindow = try JSONSerialization.jsonObject(with: Data(contentsOf: resetHistoryURL)) as! [String: Any]
+    let storedResets = (savedAfterNextWindow["resets"] as! [Double]).map { Date(timeIntervalSinceReferenceDate: $0) }
+    check(storedResets.contains(earlyStart) && storedResets.contains(at(19, 13, 15)) && !storedResets.contains(at(18, 3, 1)),
+        "a superseded 18:03 deadline never becomes a reset after the replacement window ends at 19:13")
+    var correctedWindow = reading(at(13, 5, 1), at: at(14, 12))
+    correctedWindow.fiveHour?.usedPercent = 0; correctedWindow.zeroUseWindowActive = true
+    var correctedPresentation = MenuPresentation()
+    _ = render(&correctedPresentation, beforeReset, at: beforeResetAt)
+    check(!render(&correctedPresentation, correctedWindow, at: correctedWindow.capturedAt).timeline.contains { $0.date <= correctedWindow.capturedAt && $0.label == "已重置" },
+        "small reset-time corrections do not create an early reset")
+    var backwardsPresentation = MenuPresentation(historyURL: legacyResetURL)
+    _ = render(&backwardsPresentation, afterReset, at: afterReset.capturedAt)
+    let backwardsWindow = reading(at(13, 30), at: at(14, 30))
+    check(!render(&backwardsPresentation, backwardsWindow, at: backwardsWindow.capturedAt).timeline.contains { $0.date == at(13, 30) && $0.label == "已重置" },
+        "a server window timestamp moving backwards is not a new reset")
+    for source in 0..<4 {
+        var limited = MenuPresentation()
+        _ = render(&limited, beforeReset, at: beforeResetAt)
+        var candidate = afterReset
+        if source == 0 { candidate.accountID = "another-account" }
+        if source == 1 { candidate.sourceFile = "rollout.jsonl" }
+        if source == 3 { candidate.fiveHour?.windowMinutes = 360 }
+        let captured = candidate.capturedAt.addingTimeInterval(source == 2 ? 61 : 0)
+        check(!render(&limited, candidate, at: captured).timeline.contains { $0.label == "已重置" && $0.date <= captured },
+            "another account, rollout fallback, stale data or changed window length cannot prove an early reset: \(source)")
+    }
+    var firstReading = MenuPresentation()
+    check(render(&firstReading, afterReset, at: afterReset.capturedAt).timeline.first?.label == "窗口开始",
+        "a full balance at first launch has no claimed reset without earlier same-account evidence")
+    var afterMissedZero = afterReset; afterMissedZero.fiveHour?.usedPercent = 4
+    var missedZero = MenuPresentation()
+    _ = render(&missedZero, beforeReset, at: beforeResetAt)
+    check(render(&missedZero, afterMissedZero, at: afterMissedZero.capturedAt).timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
+        "a real replacement window still proves reset when polling misses the exact zero-usage reading")
+    var actionAtReset = MenuPresentation()
+    _ = render(&actionAtReset, beforeReset, at: beforeResetAt)
+    let confirmedResetAction = completed(.resume, earlyStart)
+    var confirmedReading = afterReset; confirmedReading.capturedAt = earlyStart.addingTimeInterval(40)
+    check(render(&actionAtReset, confirmedReading, at: confirmedReading.capturedAt, confirmations: [confirmedResetAction])
+        .timeline.contains { $0.date == earlyStart && $0.kind == .completedResume && $0.label == "已继续" },
+        "a real matching Keeper operation retains its continued fact at a reset boundary")
+
     let now = at(19)
     let usage = reading(at(18, 1), at: now)
     let confirmations = log.confirmations()
@@ -3018,8 +3150,8 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     var nearReset = MenuPresentation()
     _ = render(&nearReset, reading(at(13, 1), at: at(15)), at: at(15))
     let joined = render(&nearReset, reading(at(18, 1, 13), at: now), at: now)
-    check(joined.timeline.map(\.date) == [at(13, 1), at(18, 1, 13), at(23, 1, 13)] &&
-        joined.timeline.first?.kind == .keepAliveNotNeeded && joined.timeline.first?.label == "无需保活",
+    check(joined.timeline.map(\.date) == [at(13, 1), at(18, 1), at(23, 1, 13)] &&
+        joined.timeline.first?.kind == .keepAliveNotNeeded && joined.timeline.first?.label == "窗口开始",
         "the verified old 18:01 reset merges with the 18:01:13 current origin and falls back to the observed 13:01 origin")
     let historyURL = directory.appendingPathComponent("menu-history.json")
     var beforeRestart = MenuPresentation(historyURL: historyURL)
@@ -3028,8 +3160,8 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     var afterRestart = MenuPresentation(historyURL: historyURL)
     let restored = render(&afterRestart, reading(at(18, 1, 13), at: now), at: now,
         confirmations: [completed(.keepAlive, at(8))])
-    check(restored.timeline.map(\.date) == [at(13, 1), at(18, 1, 13), at(23, 1, 13)] &&
-        restored.timeline.first?.kind == .keepAliveNotNeeded && restored.timeline.first?.label == "无需保活",
+    check(restored.timeline.map(\.date) == [at(13, 1), at(18, 1), at(23, 1, 13)] &&
+        restored.timeline.first?.kind == .keepAliveNotNeeded && restored.timeline.first?.label == "窗口开始",
         "restarting Keeper restores the nearer observed 13:01 window instead of the 08:00 completed ping")
     func storedHistory(_ name: String) throws -> URL {
         let url = directory.appendingPathComponent(name + ".json")

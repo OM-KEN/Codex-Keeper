@@ -5,12 +5,15 @@ import AppKit
     override var acceptsFirstResponder: Bool { false }
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric) }
     override func resize(withOldSuperviewSize oldSize: NSSize) {
-        guard let superview else { return }
-        frame = NSRect(x: 10, y: -3, width: max(0, superview.bounds.width - 20), height: superview.bounds.height)
+        guard let button = superview as? NSButton, let cell = button.cell as? NSButtonCell else { return }
+        let content = cell.imageRect(forBounds: button.bounds).union(cell.titleRect(forBounds: button.bounds))
+        frame = NSRect(x: content.minX, y: button.bounds.minY, width: content.width,
+            height: max(0, button.bounds.height - MenuBarQuotaView.railHeight))
     }
 }
 
 @MainActor final class MenuBarQuotaView: NSView {
+    fileprivate static let railHeight: CGFloat = 3
     private var quota: MenuQuota?
     private let contentButton = MenuBarContentButton()
     private var menuHighlighted = false
@@ -23,7 +26,7 @@ import AppKit
             leadingAnchor.constraint(equalTo: button.leadingAnchor),
             trailingAnchor.constraint(equalTo: button.trailingAnchor),
             bottomAnchor.constraint(equalTo: button.bottomAnchor),
-            heightAnchor.constraint(equalToConstant: 3)
+            heightAnchor.constraint(equalToConstant: Self.railHeight)
         ])
         contentButton.isBordered = false
         contentButton.imagePosition = .imageLeft
@@ -56,6 +59,7 @@ import AppKit
         contentButton.title = title
         contentButton.image = image
         contentButton.image?.isTemplate = true
+        contentButton.resize(withOldSuperviewSize: .zero)
         setHighlighted(menuHighlighted)
     }
 
@@ -67,7 +71,7 @@ import AppKit
         contentButton.cell?.backgroundStyle = highlighted || dark ? .emphasized : .normal
         contentButton.contentTintColor = color
         contentButton.attributedTitle = NSAttributedString(string: contentButton.title, attributes: [
-            .font: contentButton.font ?? NSFont.menuBarFont(ofSize: 0), .baselineOffset: 1, .foregroundColor: color
+            .font: contentButton.font ?? NSFont.menuBarFont(ofSize: 0), .foregroundColor: color
         ])
         if quota == nil, let button = superview as? NSButton {
             button.attributedTitle = NSAttributedString(string: button.title, attributes: [

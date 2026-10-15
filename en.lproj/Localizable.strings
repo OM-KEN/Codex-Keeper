@@ -342,3 +342,15 @@
 "正在保活，完成后可选择现在继续" = "Keeping alive; you can continue now when it finishes";
 "正在保活，完成后可立即重试" = "Keeping alive; you can retry when it finishes";
 "额度提前恢复，可选择现在继续；确认正常恢复后会自动继续。" = "Quota recovered early. You can continue now; automatic continuation resumes when the scheduled recovery is confirmed.";
+
+"使用 Codex 输入框内容" = "Use Codex Input";
+
+"已继续 %d/%d" = "Resumed %d/%d";
+
+"移除任务：%@" = "Remove task: %@";
+
+"需要处理" = "Needs attention";
+
+"窗口开始" = "Window Started";
+
+"已重置" = "Quota Reset";

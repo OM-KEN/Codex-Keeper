@@ -305,14 +305,23 @@ import UserNotifications
     @objc private func openTasks() { openTasks(history: nil) }
     private func openTasks(history: MenuTimelinePoint?) {
         if tasksWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 500), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 572, height: 340), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = L10n.text("自动继续任务")
+            let progress = NSTitlebarAccessoryViewController()
+            progress.layoutAttribute = .right
+            progress.view = NSHostingView(rootView: ResumeTasksProgressView(state: appState))
+            progress.view.setFrameSize(NSSize(width: 140, height: 28))
+            window.addTitlebarAccessoryViewController(progress)
             window.center(); window.isReleasedWhenClosed = false
             tasksWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)
         tasksWindow?.contentView = NSHostingView(rootView: ResumeTasksView(state: appState,
             historyIDs: history?.operationIDs, historyAccountID: appState.displayAccountID, historyLabel: history.map { $0.timeLabel + " · " + L10n.text($0.label) }))
+        if let progress = tasksWindow?.titlebarAccessoryViewControllers.first {
+            progress.view = NSHostingView(rootView: ResumeTasksProgressView(state: appState, historyIDs: history?.operationIDs))
+            progress.view.setFrameSize(NSSize(width: 140, height: 28))
+        }
         tasksWindow?.makeKeyAndOrderFront(nil)
     }
     @objc func openKeeperSettings() {

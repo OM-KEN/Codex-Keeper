@@ -413,6 +413,10 @@ struct ResumeRequest {
     var messageMode: ResumeMessageMode = .fixed
 
     func resolvedPrompt(reader: ComposerDraftReader = ComposerDraftReader()) throws -> String {
-        messageMode == .composerDraft ? try reader.read(threadID: target.id) ?? L10n.text("继续") : prompt
+        switch messageMode {
+        case .localizedDefault: return L10n.text("继续")
+        case .fixed: return prompt
+        case .composerDraft: return try reader.read(threadID: target.id) ?? L10n.text("继续")
+        }
     }
 }

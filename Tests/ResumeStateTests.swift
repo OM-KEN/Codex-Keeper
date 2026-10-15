@@ -948,10 +948,19 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
         failure: "Secret reason", protectsThread: false)
     var summary = MenuSummary(headline: "正在继续")
     summary.applyResumeTasks(operations: [first, second], pending: [], choices: ResumeChoices())
-    check(summary.taskProgress == "1/2" && summary.headline == "正在继续" && !summary.tasks.joined().contains("Secret"),
+    check(summary.taskProgress == L10n.format("已继续 %d/%d", 1, 2) && summary.tasksNeedAttention && summary.headline == "正在继续" && !summary.tasks.joined().contains("Secret"),
         "progress stays in task bubble while headline omits score and failure details")
+    var sending = second; sending.phase = .sending; sending.failure = nil
+    var confirming = first; confirming.phase = .confirming; confirming.respondedAt = nil
+    summary.applyResumeTasks(operations: [sending, confirming], pending: [], choices: ResumeChoices())
+    check(summary.taskProgress == L10n.format("已继续 %d/%d", 0, 2) && !summary.tasksNeedAttention,
+        "normal sending and confirmation keep their normal tone with the continued count")
+    var needsChoice = ResumeChoices(); needsChoice.requestRecoveryDecision(for: target, now: Date())
+    summary.applyResumeTasks(operations: [], pending: [target], choices: needsChoice)
+    check(summary.tasksNeedAttention && summary.taskProgress.isEmpty,
+        "a recovery choice needs attention without inventing a started batch")
     summary.applyResumeTasks(operations: [], pending: [], choices: ResumeChoices())
-    check(summary.tasks.isEmpty && summary.taskProgress.isEmpty, "all confirmed startup tasks remove current record bubble")
+    check(summary.tasks.isEmpty && summary.taskProgress.isEmpty && !summary.tasksNeedAttention, "all confirmed startup tasks remove current record bubble")
     let fixed = Date().addingTimeInterval(-1800)
     let snapshot = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 10, windowMinutes: 300, resetsAt: fixed.addingTimeInterval(18000)), weekly: nil,
         capturedAt: Date(), accountID: usage.account, sourceFile: "app-server", zeroUseWindowActive: true)
