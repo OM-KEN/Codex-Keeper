@@ -3,6 +3,7 @@ import SwiftUI
 struct MenuSummaryView: View {
     let summary: MenuSummary
     var openTasks: () -> Void = {}
+    var openHistory: (MenuTimelinePoint) -> Void = { _ in }
     var showError: () -> Void = {}
     var refresh: () -> Void = {}
     @State private var tasksHovered = false
@@ -12,17 +13,17 @@ struct MenuSummaryView: View {
             if !summary.reminderTitle.isEmpty {
                 Button(action: openTasks) {
                     HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "bell.badge.fill").foregroundStyle(.orange)
+                        Image(systemName: "bell.badge.fill").foregroundStyle(.red)
                         VStack(alignment: .leading, spacing: 5) {
                             Text(summary.reminderTitle).font(.system(size: 12, weight: .semibold))
                             Text(summary.reminderBody).font(.system(size: 11))
                                 .fixedSize(horizontal: false, vertical: true)
-                            Text(L10n.text("处理任务")).font(.system(size: 11, weight: .semibold)).foregroundStyle(.orange)
+                            Text(L10n.text("处理任务")).font(.system(size: 11, weight: .semibold)).foregroundStyle(.red)
                         }.frame(maxWidth: .infinity, alignment: .leading)
-                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.orange)
+                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.red)
                     }
-                    .padding(10).background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
-                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.orange.opacity(0.25)))
+                    .padding(10).background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.red.opacity(0.20)))
                     .contentShape(Rectangle())
                 }.buttonStyle(.plain).help(L10n.text("处理任务"))
             }
@@ -79,34 +80,35 @@ struct MenuSummaryView: View {
                 }
                 if let title = summary.tasks.first {
                     let bubble = MenuTaskBubble(showsTail: summary.timeline.last?.kind == .resume)
+                    let tone = summary.tasksNeedAttention ? Color.red : Color.accentColor
                     Button(action: openTasks) {
                         HStack(spacing: 5) {
                             Image(systemName: summary.taskCount > 1 ? "bubble.left.and.text.bubble.right" : "text.bubble")
                             Text(title).lineLimit(2).truncationMode(.tail)
-                            if summary.taskCount > 1 {
-                                Text(L10n.format("等%d个会话", summary.taskCount)).foregroundStyle(.primary).fixedSize()
-                            }
                             Spacer(minLength: 0)
-                            Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
+                            if !summary.taskProgress.isEmpty { Text(summary.taskProgress).monospacedDigit().fixedSize() }
+                            if summary.taskProgress.isEmpty {
+                                Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
+                            }
                         }.font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
-                        .foregroundStyle(tasksHovered ? Color.accentColor : Color.primary)
+                        .foregroundStyle(summary.tasksNeedAttention ? Color.red : tasksHovered ? Color.accentColor : Color.primary)
                         .padding(.horizontal, 10).padding(.vertical, 8)
                         .padding(.bottom, bubble.showsTail ? 5 : 0)
                         .background {
                             bubble.fill(.regularMaterial)
                                 .overlay {
-                                    bubble.fill(Color.accentColor.opacity(tasksHovered ? 0.10 : 0))
+                                    bubble.fill(tone.opacity(tasksHovered ? 0.10 : summary.tasksNeedAttention ? 0.05 : 0))
                                 }
                                 .overlay {
-                                    bubble.stroke(tasksHovered ? Color.accentColor.opacity(0.35) : Color.primary.opacity(0.10), lineWidth: 1)
+                                    bubble.stroke(summary.tasksNeedAttention || tasksHovered ? tone.opacity(0.35) : Color.primary.opacity(0.10), lineWidth: 1)
                                 }
                         }
                         .contentShape(bubble)
                     }.buttonStyle(.plain).padding(.top, 6).help(title + "\n" + L10n.text("选择会话和续跑方式"))
                         .onHover { tasksHovered = $0 }
                 }
-                if summary.timeline.count > 1 {
-                    MenuTimelineView(points: summary.timeline).padding(.top, 10)
+                if summary.timeline.count > 1 || summary.timeline.contains(where: \.isHistory) {
+                    MenuTimelineView(points: summary.timeline, openHistory: openHistory).padding(.top, 10)
                 }
                 if !summary.note.isEmpty {
                     Text(L10n.text(summary.note)).font(.system(size: 11)).foregroundStyle(.secondary)
@@ -273,18 +275,24 @@ private extension VerticalAlignment {
 
 private struct MenuTimelineView: View {
     let points: [MenuTimelinePoint]
+    let openHistory: (MenuTimelinePoint) -> Void
+    @State private var hoveredDate: Date?
     var body: some View {
         HStack(alignment: .timelineSymbol, spacing: 6) {
             ForEach(Array(points.enumerated()), id: \.offset) { index, point in
                 VStack(spacing: 5) {
                     Text(point.timeLabel).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(point.isHistory && hoveredDate == point.date ? Color.accentColor : Color.primary)
                         .lineLimit(1).minimumScaleFactor(0.75)
                     Image(systemName: point.symbol).font(.system(size: 13, weight: .medium))
                         .foregroundStyle(point.isAction ? Color.accentColor : Color.secondary)
                         .frame(width: 16, height: 16)
                         .alignmentGuide(.timelineSymbol) { $0[VerticalAlignment.center] }
-                    Text(L10n.text(point.label)).font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(L10n.text(point.label)).font(.system(size: 10)).foregroundStyle(point.isHistory && hoveredDate == point.date ? Color.accentColor : Color.secondary)
                 }
+                .contentShape(Rectangle())
+                .onTapGesture { if point.isHistory { hoveredDate = nil; openHistory(point) } }
+                .onHover { hoveredDate = $0 && point.isHistory ? point.date : nil }
                 .layoutPriority(1)
                 .help(L10n.text(point.kind == .keepAlive || point.kind == .scheduled ? "计划节点；已有有效额度窗口时跳过" : point.label))
                 .accessibilityElement(children: .ignore)
@@ -300,5 +308,6 @@ private struct MenuTimelineView: View {
                 }
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
+        .onDisappear { hoveredDate = nil }
     }
 }

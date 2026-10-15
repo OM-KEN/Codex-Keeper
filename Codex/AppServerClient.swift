@@ -8,7 +8,10 @@ protocol CodexTransport: AnyObject {
     func request(_ method: String, params: [String: Any]) throws -> [String: Any]
     func nextMessage(timeout: TimeInterval) throws -> [String: Any]
     func close()
+    var lastSubmissionRequestID: Int? { get }
 }
+
+extension CodexTransport { var lastSubmissionRequestID: Int? { nil } }
 
 enum CodexConnectionError: LocalizedError {
     case unavailable, timeout, ended, invalidResponse, responseTooLarge, server(String), localizedMessage(String), approvalRequired
@@ -61,8 +64,11 @@ final class AppServerClient: CodexTransport {
     private let input = Pipe()
     private let output = Pipe()
     private var buffer = Data()
+    private var discardingOversized = false
     private var identifier = 0
+    private(set) var lastSubmissionRequestID: Int?
     private var pending: [[String: Any]] = []
+    private var pendingBytes = 0
 
     init(binary: URL? = nil, usageOnly: Bool = false, process: Process = Process()) throws {
         self.process = process
@@ -96,36 +102,63 @@ final class AppServerClient: CodexTransport {
 
     deinit { close() }
 
-    private func write(_ object: [String: Any]) throws {
+    private func write(_ object: [String: Any], contentSubmission: Bool = false) throws {
         stateLock.lock(); defer { stateLock.unlock() }
-        guard !closed, process.isRunning else { throw CodexConnectionError.ended }
-        var data = try JSONSerialization.data(withJSONObject: object)
-        data.append(10)
-        try input.fileHandleForWriting.write(contentsOf: data)
+        var written = 0
+        do {
+            guard !closed, process.isRunning else { throw CodexConnectionError.ended }
+            var data = try JSONSerialization.data(withJSONObject: object); data.append(10)
+            try data.withUnsafeBytes { bytes in
+                while written < bytes.count {
+                    let count = Darwin.write(input.fileHandleForWriting.fileDescriptor, bytes.baseAddress!.advanced(by: written), bytes.count - written)
+                    if count < 0, errno == EINTR { continue }
+                    guard count > 0 else { throw CodexConnectionError.ended }
+                    written += count
+                }
+            }
+        } catch {
+            if contentSubmission { throw ResumeSubmissionError(mayHaveSubmitted: written > 0, underlying: error) }
+            throw error
+        }
     }
 
     func request(_ method: String, params: [String: Any]) throws -> [String: Any] {
         identifier += 1
         let id = identifier
-        try write(["id": id, "method": method, "params": params])
-        let deadline = Date().addingTimeInterval(20)
-        while Date() < deadline {
-            let message = try readMessage(timeout: deadline.timeIntervalSinceNow)
-            if (message["id"] as? Int) == id, message["method"] == nil {
-                if let error = message["error"] as? [String: Any] { throw CodexConnectionError.server(error["message"] as? String ?? "Codex 请求失败") }
-                guard let result = message["result"] as? [String: Any] else { throw CodexConnectionError.invalidResponse }
-                return result
+        let content = method == "turn/start"
+        if content { lastSubmissionRequestID = id }
+        try write(["id": id, "method": method, "params": params], contentSubmission: content)
+        do {
+            let deadline = Date().addingTimeInterval(20)
+            while Date() < deadline {
+                let message = try readMessage(timeout: deadline.timeIntervalSinceNow)
+                if (message["id"] as? Int) == id, message["method"] == nil {
+                    if let error = message["error"] as? [String: Any] {
+                        let failure = CodexConnectionError.server(error["message"] as? String ?? "Codex 请求失败")
+                        if content { throw ResumeSubmissionError(mayHaveSubmitted: false, underlying: failure) }
+                        throw failure
+                    }
+                    guard let result = message["result"] as? [String: Any] else { throw CodexConnectionError.invalidResponse }
+                    return result
+                }
+                // Queue requests for the task-aware single consumer; never infer approval from method/id alone.
+                let size = (try? JSONSerialization.data(withJSONObject: message).count) ?? 0
+                guard pendingBytes + size <= 8 * 1024 * 1024 else { throw CodexConnectionError.responseTooLarge }
+                pending.append(message); pendingBytes += size
             }
-            // Never approve any server request. The caller can interrupt the resumed turn.
-            if message["method"] != nil, message["id"] != nil { throw CodexConnectionError.approvalRequired }
-            if pending.count >= 256 { pending.removeFirst() }
-            pending.append(message)
+            throw CodexConnectionError.timeout
+        } catch {
+            if content, !(error is ResumeSubmissionError) { throw ResumeSubmissionError(mayHaveSubmitted: true, underlying: error) }
+            throw error
         }
-        throw CodexConnectionError.timeout
     }
 
     func nextMessage(timeout: TimeInterval) throws -> [String: Any] {
-        if !pending.isEmpty { return pending.removeFirst() }
+        if !pending.isEmpty {
+            let message = pending.removeFirst()
+            pendingBytes -= (try? JSONSerialization.data(withJSONObject: message).count) ?? 0
+            return message
+        }
         return try readMessage(timeout: timeout)
     }
 
@@ -133,7 +166,13 @@ final class AppServerClient: CodexTransport {
         let deadline = Date().addingTimeInterval(timeout)
         var searchStart = buffer.startIndex
         while true {
-            if let newline = buffer[searchStart...].firstIndex(of: 10) {
+            if discardingOversized {
+                if let newline = buffer.firstIndex(of: 10) {
+                    buffer.removeSubrange(...newline); discardingOversized = false
+                } else { buffer.removeAll(keepingCapacity: false) }
+                searchStart = buffer.startIndex
+            }
+            if !discardingOversized, let newline = buffer[searchStart...].firstIndex(of: 10) {
                 let line = buffer.prefix(upTo: newline)
                 buffer.removeSubrange(...newline)
                 guard let message = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { throw CodexConnectionError.invalidResponse }
@@ -153,7 +192,7 @@ final class AppServerClient: CodexTransport {
             let count = Darwin.read(descriptor.fd, &bytes, bytes.count)
             guard count > 0 else { throw CodexConnectionError.ended }
             buffer.append(contentsOf: bytes.prefix(count))
-            guard buffer.count <= 8 * 1024 * 1024 else { throw CodexConnectionError.responseTooLarge }
+            guard buffer.count <= 8 * 1024 * 1024 else { discardingOversized = true; throw CodexConnectionError.responseTooLarge }
         }
     }
 
@@ -282,6 +321,7 @@ final class AppServerUsageProvider: UsageProvider {
     private var lastAutomaticAttempt: TimeInterval = -.infinity
     private var shortRetryNode: Date?
     private var shortRetryUntil: TimeInterval = 0
+    private var shortRetryActive = false
     private var modelFailure: Error?
     private var modelRetryAfter: TimeInterval = 0
     private var cachedModel: PingModel?
@@ -325,7 +365,8 @@ final class AppServerUsageProvider: UsageProvider {
 
     func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date) {
         retryOpportunityLock.lock(); defer { retryOpportunityLock.unlock() }
-        guard let opportunity else { shortRetryUntil = 0; return }
+        shortRetryActive = opportunity != nil
+        guard let opportunity else { return }
         guard opportunity.node != shortRetryNode else { return }
         shortRetryNode = opportunity.node
         // A fixed monotonic limit cannot be renewed by every 20-second recomputation.
@@ -432,7 +473,7 @@ final class AppServerUsageProvider: UsageProvider {
                                    stage: ((String) -> Void)? = nil, _ operation: (CodexTransport) throws -> T) throws -> T {
         lock.lock(); defer { lock.unlock() }
         let currentFallbackPath = fallbackPath()
-        retryOpportunityLock.lock(); let shortUntil = shortRetryUntil; retryOpportunityLock.unlock()
+        retryOpportunityLock.lock(); let shortUntil = shortRetryActive ? shortRetryUntil : 0; retryOpportunityLock.unlock()
         let automaticRetryAfter = upstreamFailure && uptime() < shortUntil ? lastAutomaticAttempt + 30 : retryAfter
         if uptime() < automaticRetryAfter, let lastFailure {
             // A deliberate retry can bypass background backoff, but repeated clicks cannot spawn a storm.

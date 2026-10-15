@@ -70,9 +70,13 @@ struct DecisionEngine {
                 return wait(date == reset ? "额度恢复并确认后续跑" : "恢复后顺延至计划时间", at: date)
             }
             guard usage.capturedAt > target.blockedAt else { return wait("等待额度恢复确认") }
-            if earlyRecoveryPolicy == "ask", !observedRecovery, !heldForPlan {
-                return NextAction(mode: .resume, date: nil, decision: .wait(reason: "额度已恢复，等待决定"),
-                    note: "额度已恢复，等待决定", needsRecoveryDecision: true)
+            if earlyRecoveryPolicy == "ask", !observedRecovery, !heldForPlan,
+               let reset = [target.fiveHourResetAt, target.weeklyResetAt].compactMap({ $0 }).max() {
+                if reset > now {
+                    let date = schedule.isInAnchorProtection(at: reset, calendar: calendar) ? schedule.anchorProtection(at: reset, calendar: calendar).anchor : reset
+                    return wait(date == reset ? "额度恢复并确认后续跑" : "恢复后顺延至计划时间", at: date)
+                }
+                if usage.capturedAt < reset { return wait("等待额度恢复确认") }
             }
             if atNode { return NextAction(mode: .resume, date: now, decision: .resume(project: target.project, reason: "计划节点，额度已确认可用"), note: "额度已确认可用") }
             let inProtection = schedule.isInAnchorProtection(at: now, calendar: calendar)
@@ -102,6 +106,7 @@ struct DecisionEngine {
 
 /// Distinguish an observed scheduled reset from an early/manual quota reset.
 enum UsageRecovery {
+    private static let observationTolerance: TimeInterval = 90
     static func hasAvailableQuota(for target: BlockedSession, usage: UsageSnapshot?, boundAccount: String?, now: Date) -> Bool {
         guard let account = boundAccount, !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let usage, usage.accountID == account, usage.isFresh(at: now), usage.capturedAt > target.blockedAt,
@@ -126,7 +131,7 @@ enum UsageRecovery {
     }
 
     static func isNatural(from old: UsageSnapshot, to new: UsageSnapshot, now: Date) -> Bool {
-        guard let account = old.accountID, account == new.accountID,
+        guard let account = old.accountID, !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, account == new.accountID,
               old.sourceFile == "app-server", new.isFresh(at: now),
               (old.fiveHour?.usedPercent ?? 0) >= 100 || (old.weekly?.usedPercent ?? 0) >= 100,
               (new.fiveHour?.usedPercent ?? 0) < 100, (new.weekly?.usedPercent ?? 0) < 100 else { return false }
@@ -136,7 +141,19 @@ enum UsageRecovery {
         guard let reset = exhausted.map(\.resetsAt).max() else { return false }
         // The exhausted reading is historical evidence, not permission to send.
         // Bound each side of the expected reset independently; execution still requires fresh quota.
-        return old.capturedAt < reset && reset.timeIntervalSince(old.capturedAt) <= 90 &&
-            new.capturedAt >= reset && new.capturedAt.timeIntervalSince(reset) <= 90
+        return old.capturedAt < reset && reset.timeIntervalSince(old.capturedAt) <= observationTolerance &&
+            new.capturedAt >= reset && new.capturedAt.timeIntervalSince(reset) <= observationTolerance
+    }
+
+    /// Missing samples or a small forecast drift do not prove an early reset.
+    static func isEarly(from old: UsageSnapshot, to new: UsageSnapshot, now: Date) -> Bool {
+        guard let account = old.accountID, !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, account == new.accountID,
+              old.isFresh(at: new.capturedAt), new.isFresh(at: now), new.capturedAt >= old.capturedAt,
+              (old.fiveHour?.usedPercent ?? 0) >= 100 || (old.weekly?.usedPercent ?? 0) >= 100,
+              (new.fiveHour?.usedPercent ?? 0) < 100, (new.weekly?.usedPercent ?? 0) < 100 else { return false }
+        if (old.fiveHour?.usedPercent ?? 0) >= 100 && new.fiveHour == nil { return false }
+        if (old.weekly?.usedPercent ?? 0) >= 100 && new.weekly == nil { return false }
+        let reset = [old.fiveHour, old.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }.map(\.resetsAt).max()
+        return reset.map { $0.timeIntervalSince(new.capturedAt) > observationTolerance } == true
     }
 }

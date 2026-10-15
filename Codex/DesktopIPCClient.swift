@@ -60,7 +60,8 @@ final class DesktopIPCClient: DesktopConnection {
         let response = try request("thread-follower-start-turn", params: ["conversationId": threadID,
             "turnStart": ["request": ["threadId": threadID, "input": [["type": "text", "text": prompt, "text_elements": []]]],
                           "context": ["inheritThreadSettings": true]]], version: 2, target: owner)
-        try check(response)
+        do { try check(response) }
+        catch { throw ResumeSubmissionError(mayHaveSubmitted: false, underlying: error) }
         guard let outer = response["result"] as? [String: Any], let result = outer["result"] as? [String: Any],
               let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String else { throw CodexConnectionError.invalidResponse }
         return id
@@ -77,7 +78,9 @@ final class DesktopIPCClient: DesktopConnection {
         var message: [String: Any] = ["type": "request", "requestId": id, "sourceClientId": clientID,
             "version": version, "method": method, "params": params, "timeoutMs": 15000]
         if let target { message["targetClientId"] = target }
-        try write(message)
+        let content = method == "thread-follower-start-turn"
+        try write(message, contentSubmission: content)
+        do {
         let deadline = Date().addingTimeInterval(20)
         while Date() < deadline {
             let header = try read(4, deadline: deadline)
@@ -91,9 +94,15 @@ final class DesktopIPCClient: DesktopConnection {
             if response["type"] as? String == "response", response["requestId"] as? String == id { return response }
         }
         throw CodexConnectionError.timeout
+        } catch {
+            if content, !(error is ResumeSubmissionError) { throw ResumeSubmissionError(mayHaveSubmitted: true, underlying: error) }
+            throw error
+        }
     }
 
-    private func write(_ object: [String: Any]) throws {
+    private func write(_ object: [String: Any], contentSubmission: Bool = false) throws {
+        var written = 0
+        do {
         let payload = try JSONSerialization.data(withJSONObject: object)
         var length = UInt32(payload.count).littleEndian
         var frame = withUnsafeBytes(of: &length) { Data($0) }; frame.append(payload)
@@ -103,8 +112,12 @@ final class DesktopIPCClient: DesktopConnection {
                 let count = Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { throw CodexConnectionError.ended }
-                offset += count
+                offset += count; written = offset
             }
+        }
+        } catch {
+            if contentSubmission { throw ResumeSubmissionError(mayHaveSubmitted: written > 0, underlying: error) }
+            throw error
         }
     }
 

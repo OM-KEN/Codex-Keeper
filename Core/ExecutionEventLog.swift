@@ -1,5 +1,7 @@
 import Foundation
 
+private enum ExecutionLogWrite { static let lock = NSLock() }
+
 struct ExecutionEventLog {
     let url: URL
     /// A missing log is empty; unreadable or malformed evidence must not start an inactivity deadline.
@@ -20,22 +22,39 @@ struct ExecutionEventLog {
 
     func confirmations() -> [ExecutionConfirmation] {
         guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return [] }
-        let iso = ISO8601DateFormatter()
         var starts: [String: Date] = [:]
         return text.split(separator: "\n").compactMap { line in
             guard let data = line.data(using: .utf8),
                   let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let kind = row["kind"] as? String, ["ping", "resume"].contains(kind),
-                  let at = (row["at"] as? String).flatMap(iso.date(from:)) else { return nil }
-            let key = kind + ":" + (row["thread_id"] as? String ?? row["node"] as? String ?? "")
+                  let at = UsageDecoder.timestamp(row["at"] as? String) else { return nil }
+            let key = kind + ":" + (row["operation_id"] as? String ?? row["thread_id"] as? String ?? row["node"] as? String ?? "")
             if row["event"] as? String == "started" { starts[key] = at; return nil }
-            guard row["event"] as? String == "confirmed" else { return nil }
-            let reset = (row["after_reset"] as? String).flatMap(iso.date(from:))
+            guard ["confirmed", "startup_confirmed"].contains(row["event"] as? String ?? "") else { return nil }
+            let reset = UsageDecoder.timestamp(row["after_reset"] as? String)
             return ExecutionConfirmation(kind: kind == "ping" ? .keepAlive : .resume,
                 actionAt: starts[key] ?? at, confirmedAt: at,
                 windowStart: reset?.addingTimeInterval(-ScheduleEngine.windowDuration),
-                accountID: (row["account_id"] as? String).flatMap { $0.isEmpty ? nil : $0 })
+                accountID: (row["account_id"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                operationID: row["operation_id"] as? String, episodeKey: row["episode_key"] as? String,
+                threadID: row["thread_id"] as? String, turnID: row["turn_id"] as? String)
         }
+    }
+
+    func legacyResumeAttempts() -> [String: LegacyResumeAttempt] {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
+        var result: [String: LegacyResumeAttempt] = [:]
+        for line in text.split(separator: "\n") {
+            guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  row["kind"] as? String == "resume", row["operation_id"] == nil,
+                  let thread = row["thread_id"] as? String, let at = UsageDecoder.timestamp(row["at"] as? String) else { continue }
+            if row["event"] as? String == "started" { result[thread] = LegacyResumeAttempt(startedAt: at) }
+            if row["event"] as? String == "confirmed", var record = result[thread] {
+                record.confirmedAt = at; record.turnID = row["turn_id"] as? String; record.accountID = row["account_id"] as? String
+                result[thread] = record
+            }
+        }
+        return result
     }
 
     /// Old logs lack the plan/timezone provenance needed for drift compensation.
@@ -65,9 +84,10 @@ struct ExecutionEventLog {
         }
     }
 
-    func record(_ event: String, kind: String, node: Date?, before: UsageSnapshot? = nil, after: UsageSnapshot? = nil, error: String? = nil, threadID: String? = nil, turnID: String? = nil, diagnostic: PingDiagnostic? = nil, schedule: ScheduleEngine? = nil, accountID: String? = nil) throws {
-        let iso = ISO8601DateFormatter()
-        var row: [String: Any] = ["event": event, "kind": kind, "at": iso.string(from: Date())]
+    func record(_ event: String, kind: String, node: Date?, before: UsageSnapshot? = nil, after: UsageSnapshot? = nil, error: String? = nil, threadID: String? = nil, turnID: String? = nil, diagnostic: PingDiagnostic? = nil, schedule: ScheduleEngine? = nil, accountID: String? = nil, operationID: String? = nil, episodeKey: String? = nil, at: Date? = nil) throws {
+        ExecutionLogWrite.lock.lock(); defer { ExecutionLogWrite.lock.unlock() }
+        let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var row: [String: Any] = ["event": event, "kind": kind, "at": iso.string(from: at ?? Date())]
         if let node { row["node"] = iso.string(from: node) }
         if let reset = before?.fiveHour?.resetsAt { row["before_reset"] = iso.string(from: reset) }
         if let reset = after?.fiveHour?.resetsAt { row["after_reset"] = iso.string(from: reset) }
@@ -81,6 +101,8 @@ struct ExecutionEventLog {
             row["schedule_timezone"] = schedule.timeZoneID
         }
         if let error { row["error"] = error }
+        if let operationID { row["operation_id"] = operationID }
+        if let episodeKey { row["episode_key"] = episodeKey }
         if let threadID { row["thread_id"] = threadID }
         if let turnID { row["turn_id"] = turnID }
         if let diagnostic {
@@ -102,4 +124,15 @@ struct ExecutionConfirmation {
     let confirmedAt: Date
     let windowStart: Date?
     var accountID: String? = nil
+    var operationID: String? = nil
+    var episodeKey: String? = nil
+    var threadID: String? = nil
+    var turnID: String? = nil
+}
+
+struct LegacyResumeAttempt {
+    let startedAt: Date
+    var confirmedAt: Date?
+    var turnID: String?
+    var accountID: String?
 }

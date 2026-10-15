@@ -30,7 +30,7 @@ Keep Keeper running and your Mac awake and online while using it.
 <details>
 <summary>When does a paused task resume automatically?</summary>
 
-Tasks paused because quota runs out resume once normal quota recovery is confirmed. If recovery is early or uncertain, Keeper asks you to choose.
+Tasks paused because quota runs out resume once normal quota recovery is confirmed. Keeper asks you to choose only when early recovery is confirmed.
 
 Select **Review task** in the reminder at the top of the menu, or use the system notification to choose:
 
@@ -38,16 +38,22 @@ Select **Review task** in the reminder at the top of the menu, or use the system
 - **Continue as scheduled:** Try to resume at the next feasible scheduled time, after checking quota and task state again.
 - **Cancel this time:** Skip this continuation and preserve the task and its history.
 
-If you do not choose, the reminder stays and the task does not resume automatically. Scheduled keep-alives continue.
+If you do not choose during early recovery, the task waits. It resumes automatically once normal recovery is confirmed. Temporary sync failures retry automatically without asking you to choose a recovery method.
+
+The trash button at the top right of a current task lets you ignore its current pause after confirmation. The task disappears from the list, while the original task and records remain. If you continue it manually and it later pauses for quota again, Keeper treats that as a new pause. Click a past resume point in the timeline to view its read-only records.
 
 </details>
 
 <details>
 <summary>Can I change the message sent when a task resumes?</summary>
 
-Click a task name in the menu to select tasks and edit the message. You can also use the text saved in that task's Codex input box.
+Click the task entry in the menu to select tasks and choose a message mode:
 
-In Settings, choose the default “Continue” or edit a custom message. The interface supports Simplified Chinese and English and follows the macOS language setting for the app. The default message follows the language; custom messages stay as written.
+- **Default “Continue”**: The default for new tasks, with no text to enter.
+- **Custom message**: Opens an editor and preserves your text when you switch modes. Your custom message in Settings can supply the initial text.
+- **Use Codex Input**: Sends the task's saved draft text without attachments. An empty draft sends “Continue”; the original draft is preserved.
+
+The interface supports Simplified Chinese and English and follows the macOS language setting for the app. The default “Continue” follows the language; custom messages stay as written.
 
 If project files changed or cannot be checked, Keeper adds a reminder before the resume message asking Codex to check the project and progress first. You can turn it off in Settings.
 
@@ -58,7 +64,7 @@ If project files changed or cannot be checked, Keeper adds a reminder before the
 
 The disk image is not notarized. If macOS blocks the first launch, verify the download source and follow [Apple's instructions for opening the app](https://support.apple.com/en-us/102445).
 
-If quota sync fails, click the refresh button beside the time. If it keeps failing, check your network, Codex sign-in, and version.
+If quota sync fails, Keeper retries automatically and keeps the last valid quota and plan visible. You can also click the refresh button beside the time. If it keeps failing, check your network, Codex sign-in, and version.
 
 If the official Codex CLI cannot be found, click the error message in the menu, enter or choose its executable file, then select **Save and Retry**. Paths with `~/` or spaces are supported. You only need to enter a path if automatic discovery fails.
 

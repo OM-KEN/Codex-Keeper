@@ -139,6 +139,31 @@ import SQLite3
     do {
         var uptime: TimeInterval = 0
         let transport = PollingBudgetTransport(); transport.quotaError = .server("error sending request")
+        var connections = 0
+        let provider = AppServerUsageProvider(makeTransport: { connections += 1; return transport }, contextIdentity: { nil }, uptime: { uptime })
+        let opportunity = UsageRetryOpportunity(node: day, end: day.addingTimeInterval(600))
+        provider.setRetryOpportunity(opportunity, now: day)
+        _ = try? provider.read(); uptime = 30; _ = try? provider.read()
+        uptime = 31; provider.setRetryOpportunity(nil, now: day.addingTimeInterval(uptime))
+        uptime = 60; _ = try? provider.read()
+        check(transport.quotaCalls == 4, "an inactive special opportunity uses ordinary backoff without new RPCs")
+        provider.setRetryOpportunity(opportunity, now: day.addingTimeInterval(uptime)); _ = try? provider.read()
+        check(transport.quotaCalls == 6 && connections == 1 && transport.closes == 0,
+            "restoring the same opportunity restores its bounded automatic retry on the retained connection")
+        uptime = 599; provider.setRetryOpportunity(nil, now: day.addingTimeInterval(uptime))
+        provider.setRetryOpportunity(opportunity, now: day.addingTimeInterval(uptime)); _ = try? provider.read()
+        let beforeExpiry = transport.quotaCalls
+        uptime = 600; provider.setRetryOpportunity(nil, now: day.addingTimeInterval(uptime))
+        provider.setRetryOpportunity(opportunity, now: day.addingTimeInterval(uptime)); _ = try? provider.read()
+        uptime = 631; _ = try? provider.read()
+        check(transport.quotaCalls == beforeExpiry, "nil and same-node reactivation cannot renew the original monotonic retry deadline")
+        transport.quotaError = nil; uptime = 800
+        check((try? provider.read()) != nil && connections == 1,
+            "ordinary background polling recovers after the special period without a manual refresh")
+    }
+    do {
+        var uptime: TimeInterval = 0
+        let transport = PollingBudgetTransport(); transport.quotaError = .server("error sending request")
         let provider = AppServerUsageProvider(makeTransport: { transport }, contextIdentity: { nil }, uptime: { uptime })
         _ = try? provider.read()
         uptime = 20
@@ -307,6 +332,7 @@ import SQLite3
     let savedRuntime = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("app-support/pending-runtime.json"))) as! [String: Any]
     check((savedRuntime["accounts"] as? [String: String])?[stoppedID] == "recovery-account",
         "a task discovered with an identity change waits for covered quota before account binding")
+    clock = clock.addingTimeInterval(1)
     prefs.set(false, forKey: "autoResume"); publishFresh(100); state.recompute(allowExecution: false)
     try await pollingSettle { !state.usage.refreshing }
     check(state.usage.polling.interval == 300, "explicitly disabled automatic continuation does not permanently block idle polling")

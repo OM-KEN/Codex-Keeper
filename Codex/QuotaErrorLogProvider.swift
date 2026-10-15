@@ -4,6 +4,8 @@ import SQLite3
 struct QuotaStop: Equatable {
     let threadID: String
     let at: Date
+    var turnID: String? = nil
+    var sourceEventID: String? = nil
 }
 
 /// Read only the official runtime's turn-error records, never prompt text or prewarm warnings.
@@ -82,7 +84,7 @@ final class QuotaErrorLogProvider {
                 let body = String(cString: bodyRaw)
                 if Self.isQuotaTurnError(body), UUID(uuidString: thread) != nil {
                     let time = Double(sqlite3_column_int64(statement, 1)) + Double(sqlite3_column_int64(statement, 2)) / 1_000_000_000
-                    stops[thread] = QuotaStop(threadID: thread, at: Date(timeIntervalSince1970: time))
+                    stops[thread] = QuotaStop(threadID: thread, at: Date(timeIntervalSince1970: time), turnID: Self.turnID(in: body), sourceEventID: identity + ":" + String(id))
                 }
             }
             step = sqlite3_step(statement)
@@ -91,8 +93,16 @@ final class QuotaErrorLogProvider {
         return stops
     }
 
+    static func turnID(in body: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"turn_id[=:]\s*["']?([A-Za-z0-9-]+)"#),
+              let match = regex.firstMatch(in: body, range: NSRange(body.startIndex..., in: body)),
+              let range = Range(match.range(at: 1), in: body) else { return nil }
+        return String(body[range])
+    }
+
     static func isQuotaTurnError(_ body: String) -> Bool {
         // Runtime logs contain a span prefix. Match the actual event boundary, not an arbitrary quote.
+        guard !body.contains("will_retry=true"), !body.contains("will_retry: true") else { return false }
         guard let marker = body.range(of: ": Turn error: ", options: .backwards) else { return false }
         let prefix = body[..<marker.lowerBound]
         guard prefix.hasSuffix("session_task.run:run_turn") else { return false }

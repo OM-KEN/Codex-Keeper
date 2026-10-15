@@ -18,6 +18,8 @@ struct MenuSummary {
     var quotaAccountID: String?
     var tasks: [String] = []
     var taskCount = 0
+    var taskProgress = ""
+    var tasksNeedAttention = false
     var timeline: [MenuTimelinePoint] = []
     var statusDatePrefix = ""
     var reminderTitle = ""
@@ -39,6 +41,7 @@ struct MenuSummary {
         if isSyncing { return L10n.text("同步中") }
         return "–"
     }
+    var statusQuota: MenuQuota? { quotas.first { $0.name == "5小时" } }
     mutating func applyIssues(usageError: String?, sessionError: String?, executionFailure: String?, executionAction: String,
                              usageErrorIsTransient: Bool = false, executionFailureIsCurrent: Bool = false) {
         error = [sessionError, usageError].compactMap { $0 }.joined(separator: "\n")
@@ -54,7 +57,7 @@ struct MenuSummary {
         headline = refreshing ? "正在同步" : "待同步"
         action = ""; isSyncing = refreshing
         if error != nil {
-            let syncNote = refreshing ? "正在重新同步额度…" : "网络恢复后打开菜单，或点击“重新同步”重试。"
+            let syncNote = refreshing ? "正在重新同步额度…" : "正在自动重试额度读取。"
             note = [note, syncNote].filter { !$0.isEmpty }.joined(separator: "\n")
         }
     }
@@ -72,13 +75,14 @@ struct MenuSummary {
 }
 
 struct MenuTimelinePoint {
-    enum Kind { case start, keepAliveNotNeeded, reset, keepAlive, resume, scheduled, completedKeepAlive, completedResume }
+    enum Kind { case start, keepAliveNotNeeded, reset, keepAlive, resume, scheduled, completedKeepAlive, completedResume, resumeRecord }
     let date: Date
     let time: String
     let day: String
     let label: String
     let kind: Kind
     let solidBefore: Bool
+    var operationIDs: Set<String> = []
     var timeLabel: String { [day, time].filter { !$0.isEmpty }.joined(separator: " ") }
     var symbol: String {
         switch kind {
@@ -87,18 +91,24 @@ struct MenuTimelinePoint {
         case .keepAlive: return "waveform.path.ecg"
         case .resume: return "paperplane"
         case .scheduled: return "circle"
+        case .resumeRecord: return "text.bubble"
         case .completedKeepAlive, .completedResume: return "checkmark.circle.fill"
         }
     }
+    var isHistory: Bool { [.completedKeepAlive, .completedResume, .resumeRecord].contains(kind) }
     var isAction: Bool { [.keepAlive, .resume, .completedKeepAlive, .completedResume].contains(kind) }
 }
 
 struct MenuQuota: Identifiable {
+    enum StatusLevel { case normal, critical }
     let name: String
     let remaining: Double
     let detail: String
     var id: String { name }
     var barRemaining: Double { remaining.rounded() <= 0 ? 0 : max(0, min(100, remaining)) }
+    var statusLevel: StatusLevel {
+        remaining.rounded() <= 10 ? .critical : .normal
+    }
 }
 
 /// Remembers only visible bar lengths; quota labels always use the newest reading.
@@ -157,9 +167,9 @@ private func menuPlanCycleStart(schedule: ScheduleEngine, now: Date) -> Date {
 }
 
 extension MenuSummary {
-    static func build(plan: NextAction?, usage: UsageSnapshot?, schedule: ScheduleEngine, tasks: [BlockedSession], confirmations: [ExecutionConfirmation] = [], observedWindows: [QuotaWindow] = [], observedResets: [Date] = [], now: Date = Date()) -> MenuSummary {
+    static func build(plan: NextAction?, usage: UsageSnapshot?, schedule: ScheduleEngine, tasks: [BlockedSession], confirmations: [ExecutionConfirmation] = [], observedWindows: [QuotaWindow] = [], observedResets: [Date] = [], now: Date = Date(), requireFresh: Bool = true) -> MenuSummary {
         if plan?.note == "已停用" { return MenuSummary(headline: "已停用") }
-        guard let usage, usage.isFresh(at: now), let plan else { return MenuSummary(headline: "正在同步", isSyncing: true) }
+        guard let usage, (!requireFresh || usage.isFresh(at: now)), let plan else { return MenuSummary(headline: "正在同步", isSyncing: true) }
         let clock = DateFormatter(); clock.dateFormat = "HH:mm"
         let day = DateFormatter(); day.dateFormat = L10n.text("M月d日")
         func dayText(_ date: Date) -> String {
@@ -181,7 +191,7 @@ extension MenuSummary {
             result.headline = "正在同步"; result.action = ""; result.isSyncing = true
             return result
         }
-        if let date = plan.date {
+        if let date = plan.date, date >= now {
             result.headline = clock.string(from: date)
             result.statusDatePrefix = Calendar.current.isDate(date, inSameDayAs: now) ? "" : dayText(date)
             result.eyebrow = L10n.format("下一次 · %@", dayText(date))
@@ -198,20 +208,17 @@ extension MenuSummary {
         }
         func confirmation(for start: Date) -> ExecutionConfirmation? {
             confirmations.filter {
-                ($0.accountID == nil || $0.accountID == usage.accountID) && $0.confirmedAt <= now &&
+                $0.accountID != nil && $0.accountID == usage.accountID && $0.confirmedAt <= now &&
                 abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(start)) <= ScheduleEngine.alignmentTolerance
             }.max { $0.confirmedAt < $1.confirmedAt }
         }
         if let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now {
             let start = five.resetsAt.addingTimeInterval(-Double(five.windowMinutes) * 60)
             let confirmed = confirmation(for: start)
-            let confirmedOnPlan = confirmed?.kind == .keepAlive && confirmed.flatMap {
-                schedule.currentKeepAliveNode(at: $0.actionAt)
-            } != nil
-            let windowOnPlan = (confirmed?.kind ?? plan.mode) == .keepAlive ? schedule.currentKeepAliveNode(at: start) != nil :
-                schedule.currentNode(at: start) != nil
+            let confirmedOnPlan = confirmed.flatMap { schedule.currentKeepAliveNode(at: $0.actionAt) } != nil
+            let windowOnPlan = schedule.currentKeepAliveNode(at: start) != nil
             result.badge = windowOnPlan || confirmedOnPlan ? "计划内" : "计划外"
-            if result.badge == "计划外", plan.mode != .resume {
+            if plan.date == nil, plan.mode != .resume, usage.nextResetDate(at: now) == five.resetsAt {
                 result.headline = clock.string(from: five.resetsAt)
                 result.statusDatePrefix = Calendar.current.isDate(five.resetsAt, inSameDayAs: now) ? "" : dayText(five.resetsAt)
                 result.eyebrow = L10n.format("当前额度 · %@", dayText(five.resetsAt))
@@ -219,11 +226,19 @@ extension MenuSummary {
                 result.isTime = true
             }
         }
-        if let actionDate = plan.date {
+        if let actionDate = plan.date, actionDate >= now {
             func point(_ date: Date, _ label: String, _ kind: MenuTimelinePoint.Kind, solid: Bool = false) -> MenuTimelinePoint {
                 MenuTimelinePoint(date: date, time: clock.string(from: date),
                     day: Calendar.current.isDate(date, inSameDayAs: now) ? "" : dayText(date),
                     label: label, kind: kind, solidBefore: solid)
+            }
+            func observedWindow(_ window: QuotaWindow) -> MenuTimelinePoint {
+                let start = window.resetsAt.addingTimeInterval(-Double(window.windowMinutes) * 60)
+                if let reset = observedResets.filter({ $0 <= now && abs($0.timeIntervalSince(start)) <= ScheduleEngine.alignmentTolerance })
+                    .min(by: { abs($0.timeIntervalSince(start)) < abs($1.timeIntervalSince(start)) }) {
+                    return point(reset, "已重置", .reset)
+                }
+                return point(start, plan.mode == .keepAlive ? "窗口开始" : "开始", plan.mode == .keepAlive ? .keepAliveNotNeeded : .start)
             }
             var joinsCurrentWindow = false
             if let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now {
@@ -231,11 +246,10 @@ extension MenuSummary {
                 if start <= now {
                     // Only a confirmed operation matching this real window can claim completion.
                     let confirmed = confirmation(for: start)
-                    let needsNoKeepAlive = plan.mode == .keepAlive
-                    let kind: MenuTimelinePoint.Kind = confirmed.map { $0.kind == .resume ? .completedResume : .completedKeepAlive } ??
-                        (needsNoKeepAlive ? .keepAliveNotNeeded : .start)
-                    let label = confirmed.map { $0.kind == .resume ? "已继续" : "已保活" } ?? (needsNoKeepAlive ? "无需保活" : "开始")
-                    result.timeline.append(point(start, label, kind))
+                    if let confirmed {
+                        result.timeline.append(point(start, confirmed.kind == .resume ? "已继续" : "已保活",
+                            confirmed.kind == .resume ? .completedResume : .completedKeepAlive))
+                    } else { result.timeline.append(observedWindow(five)) }
                     if abs(actionDate.timeIntervalSince(five.resetsAt)) < ScheduleEngine.alignmentTolerance {
                         joinsCurrentWindow = true
                     } else if five.resetsAt < actionDate {
@@ -262,10 +276,7 @@ extension MenuSummary {
                         confirmation.kind == .resume ? "已继续" : "已保活",
                         confirmation.kind == .resume ? .completedResume : .completedKeepAlive)
                 }
-                let observed = observedWindows.map {
-                    point($0.resetsAt.addingTimeInterval(-Double($0.windowMinutes) * 60),
-                        plan.mode == .keepAlive ? "无需保活" : "开始", plan.mode == .keepAlive ? .keepAliveNotNeeded : .start)
-                } + observedResets.map { point($0, "重置", .reset) }
+                let observed = observedWindows.map(observedWindow) + observedResets.map { point($0, "已重置", .reset) }
                 // A confirmed action takes precedence over an observation of the same window.
                 let history = completed + observed.filter { observation in
                     !completed.contains { abs($0.date.timeIntervalSince(observation.date)) <= ScheduleEngine.alignmentTolerance }
@@ -302,9 +313,18 @@ struct MenuPresentation {
         let accountID: String
         let windows: [QuotaWindow]
         let resets: [Date]
+        var accounts: [String: AccountObservedHistory]? = nil
+    }
+    private struct AccountObservedHistory: Codable, Equatable {
+        let configuration: Configuration
+        let cycle: Date
+        let windows: [QuotaWindow]
+        let resets: [Date]
     }
     private struct CachedSummary {
         let summary: MenuSummary
+        let usage: UsageSnapshot
+        let confirmations: [ExecutionConfirmation]
         let capturedAt: Date
         let accountID: String?
         let plan: NextAction
@@ -313,9 +333,9 @@ struct MenuPresentation {
         let choices: ResumeChoices
     }
     private var configuration: Configuration?
-    private var cacheDay: Date?
     private var observedCycle: Date?
     private var observedAccountID: String?
+    private var accountHistory: [String: AccountObservedHistory] = [:]
     private var observedWindows: [QuotaWindow] = []
     private var observedResets: [Date] = []
     private var cached: CachedSummary?
@@ -336,6 +356,7 @@ struct MenuPresentation {
             observedAccountID = history.accountID
             observedWindows = history.windows
             observedResets = history.resets
+            accountHistory = history.accounts ?? [:]
             savedHistory = history
         }
     }
@@ -344,17 +365,16 @@ struct MenuPresentation {
         guard let historyURL else { return }
         let history: ObservedHistory?
         if let configuration, let observedCycle, let observedAccountID {
+            accountHistory[observedAccountID] = AccountObservedHistory(configuration: configuration, cycle: observedCycle, windows: observedWindows, resets: observedResets)
             history = ObservedHistory(version: 1, configuration: configuration, cycle: observedCycle,
-                accountID: observedAccountID, windows: observedWindows, resets: observedResets)
+                accountID: observedAccountID, windows: observedWindows, resets: observedResets, accounts: accountHistory)
         } else { history = nil }
         guard history != savedHistory else { return }
         do {
             if let history {
                 try FileManager.default.createDirectory(at: historyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try JSONEncoder().encode(history).write(to: historyURL, options: .atomic)
-            } else if FileManager.default.fileExists(atPath: historyURL.path) {
-                try FileManager.default.removeItem(at: historyURL)
-            }
+            } else { return }
             savedHistory = history
         } catch {
             // Optional display history never blocks fresh quota or execution checks.
@@ -377,6 +397,7 @@ struct MenuPresentation {
                         refreshMessage: String = "", now: Date = Date()) -> MenuSummary {
         // Notification delivery and retired deadlines do not change the user's action plan.
         var currentChoices = choices
+        currentChoices.readManualEvents = nil
         for key in currentChoices.recoveryDecisions?.keys.map({ $0 }) ?? [] {
             currentChoices.recoveryDecisions?[key]?.notification = .pending
             currentChoices.recoveryDecisions?[key]?.deadline = nil
@@ -386,26 +407,31 @@ struct MenuPresentation {
         let currentConfiguration = Configuration(anchorMinutes: schedule.anchorMinutes, autoResume: autoResume,
             earlyRecoveryPolicy: earlyRecoveryPolicy, choices: configuredChoices,
             timeZone: TimeZone.current.identifier)
-        let currentDay = Calendar.current.startOfDay(for: now)
         let cycleStart = menuPlanCycleStart(schedule: schedule, now: now)
         let fatalIssue = sessionError != nil || (usageError != nil && !usageErrorIsTransient) || plan?.note == "账户已改变"
-        let changedAccount = usage?.sourceFile == "app-server" && (cached != nil || executionBase != nil || observedAccountID != nil) &&
+        let changedAccount = usage?.sourceFile == "app-server" && usage?.accountID != nil && usage?.isFresh(at: now) == true && (cached != nil || executionBase != nil || observedAccountID != nil) &&
             usage?.accountID != (cached?.accountID ?? executionBase?.accountID ?? observedAccountID)
-        if !enabled || fatalIssue || changedAccount || configuration != currentConfiguration || cacheDay != currentDay {
+        if !enabled || fatalIssue || changedAccount || configuration != currentConfiguration {
             cached = nil
             executionBase = nil
         }
-        if !enabled || fatalIssue || changedAccount || configuration != currentConfiguration || observedCycle != cycleStart {
+        if changedAccount || configuration != currentConfiguration || observedCycle != cycleStart {
+            if let account = observedAccountID, let configuration, let observedCycle {
+                accountHistory[account] = AccountObservedHistory(configuration: configuration, cycle: observedCycle, windows: observedWindows, resets: observedResets)
+            }
             observedWindows = []
             observedResets = []
             observedAccountID = nil
         }
+        if changedAccount, let account = usage?.accountID, let history = accountHistory[account],
+           history.configuration == currentConfiguration, history.cycle == cycleStart {
+            observedWindows = history.windows; observedResets = history.resets; observedAccountID = account
+        }
         configuration = currentConfiguration
-        cacheDay = currentDay
         observedCycle = cycleStart
         let selected = tasks.sorted { $0.episodeKey < $1.episodeKey }
         let available = availableTasks.sorted { $0.episodeKey < $1.episodeKey }
-        if let previous = cached, previous.tasks != selected || previous.availableTasks != available || previous.choices != currentChoices {
+        if let previous = cached, previous.choices != currentChoices {
             cached = nil
         }
         if refreshing && !wasRefreshing && !refreshRequested { showsRefreshFeedback = false }
@@ -419,11 +445,16 @@ struct MenuPresentation {
         if enabled, !fatalIssue, let usage, usage.isFresh(at: now), let accountID = usage.accountID, !accountID.isEmpty,
            let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now, five.windowMinutes > 0 {
             let start = five.resetsAt.addingTimeInterval(-Double(five.windowMinutes) * 60)
-            if start <= now && start <= usage.capturedAt {
+            let latestStart = observedWindows.map { $0.resetsAt.addingTimeInterval(-Double($0.windowMinutes) * 60) }.max() ?? start
+            if start <= now && start <= usage.capturedAt && start >= latestStart.addingTimeInterval(-ScheduleEngine.alignmentTolerance) {
                 observedAccountID = accountID
-                for previous in observedWindows where previous.resetsAt <= now && previous.resetsAt <= usage.capturedAt &&
-                    start >= previous.resetsAt && !observedResets.contains(previous.resetsAt) {
-                    observedResets.append(previous.resetsAt)
+                if let previous = observedWindows.filter({ $0.windowMinutes == five.windowMinutes &&
+                    five.resetsAt.timeIntervalSince($0.resetsAt) > ScheduleEngine.alignmentTolerance }).max(by: { $0.resetsAt < $1.resetsAt }) {
+                    // A later real window verifies expiry, or replaces an unexpired window after an early reset.
+                    let reset = start >= previous.resetsAt ? previous.resetsAt : start
+                    if !observedResets.contains(where: { abs($0.timeIntervalSince(reset)) <= ScheduleEngine.alignmentTolerance }) {
+                        observedResets.append(reset)
+                    }
                 }
                 if !observedWindows.contains(where: { $0.resetsAt == five.resetsAt && $0.windowMinutes == five.windowMinutes }) {
                     observedWindows.append(five)
@@ -437,21 +468,36 @@ struct MenuPresentation {
         var capturedAt: Date?
         var restoredCache = false
         if enabled && !fatalIssue {
-            if let usage, usage.isFresh(at: now), let plan {
+            if let usage, usage.isFresh(at: now), usage.accountID != nil, let plan {
                 // Every real new reading replaces the previous display, including absent or unknown windows.
                 capturedAt = usage.capturedAt
-                cached = CachedSummary(summary: summary, capturedAt: usage.capturedAt, accountID: usage.accountID,
+                cached = CachedSummary(summary: summary, usage: usage, confirmations: confirmations, capturedAt: usage.capturedAt, accountID: usage.accountID,
                     plan: plan, tasks: selected, availableTasks: available, choices: currentChoices)
             } else if let previous = cached {
                 let syncNotes = ["等待额度同步", "额度已过期，等待实时确认", "等待额度恢复确认", "正在同步窗口状态"]
                 let compatiblePlan = plan.map { syncNotes.contains($0.note) ||
                     ($0.mode == previous.plan.mode && $0.date == previous.plan.date && $0.note == previous.plan.note) } ?? true
                 if compatiblePlan {
-                    summary = previous.summary; capturedAt = previous.capturedAt
-                    restoredCache = true
+                    let displayPlan: NextAction
+                    if previous.tasks != selected || previous.availableTasks != available {
+                        var current = DecisionEngine(schedule: schedule).plan(now: now, enabled: enabled, autoResume: autoResume,
+                            earlyRecoveryPolicy: earlyRecoveryPolicy, usage: previous.usage, blocked: tasks, reserveIdleDate: tasks.isEmpty)
+                        if case .ping = current.decision {
+                            current.date = schedule.nextKeepAliveNode(after: now)
+                            current.decision = .wait(reason: "等待下一可行计划节点")
+                        }
+                        displayPlan = current
+                    }
+                    else if let date = previous.plan.date, date >= now { displayPlan = previous.plan }
+                    else if let plan, let date = plan.date, date >= now { displayPlan = plan }
+                    else { displayPlan = DecisionEngine(schedule: schedule).plan(now: now, enabled: enabled, autoResume: autoResume,
+                        earlyRecoveryPolicy: earlyRecoveryPolicy, usage: previous.usage, blocked: tasks, reserveIdleDate: tasks.isEmpty) }
+                    summary = MenuSummary.build(plan: displayPlan, usage: previous.usage, schedule: schedule, tasks: tasks,
+                        confirmations: confirmations.isEmpty ? previous.confirmations : confirmations, observedWindows: observedWindows, observedResets: observedResets, now: now, requireFresh: false)
+                    capturedAt = previous.capturedAt; restoredCache = true
                 } else { cached = nil }
             }
-            if running, !restoredCache, usage?.isFresh(at: now) != true, let previous = executionBase {
+            if running, executionMode != .resume, !restoredCache, usage?.isFresh(at: now) != true, let previous = executionBase {
                 summary = previous.summary
                 capturedAt = previous.capturedAt
             }
@@ -471,7 +517,7 @@ struct MenuPresentation {
                 summary.hasStatusIssue = true
             }
             if running {
-                if let previous = executionBase {
+                if executionMode != .resume, let previous = executionBase {
                     summary.timeline = previous.summary.timeline
                     summary.tasks = previous.summary.tasks
                     summary.taskCount = previous.summary.taskCount
@@ -496,5 +542,71 @@ struct MenuPresentation {
         }
         if showsRefreshFeedback && !refreshMessage.isEmpty { summary.refreshMessage = refreshMessage }
         return summary
+    }
+}
+
+extension MenuSummary {
+    mutating func applyResumeTasks(operations: [ResumeOperation], pending: [BlockedSession], choices: ResumeChoices) {
+        let operations = operations.filter { !(choices.ignoredEpisodes?.contains($0.target.episodeKey) ?? false) }
+        let recordedKeys = Set(operations.map { $0.target.episodeKey })
+        var counts: [String: Int] = [:]
+        for operation in operations {
+            if operation.needsManualContinuation, !(choices.readManualEvents?.contains(operation.id) ?? false) {
+                counts["%d 个任务需到 Codex 手动继续", default: 0] += 1
+            } else if operation.respondedAt == nil {
+                switch operation.phase {
+                case .preparing, .sending: counts["%d 个任务正在发送", default: 0] += 1
+                case .confirming, .checking: counts["%d 个任务确认中", default: 0] += 1
+                case .notSubmitted: counts["%d 个任务发送失败", default: 0] += 1
+                case .stopped: counts[operation.terminal == .quotaStopped ? "%d 个任务等待自动继续" : "%d 个任务续跑已停止", default: 0] += 1
+                default: break
+                }
+            }
+        }
+        for target in pending where !recordedKeys.contains(target.episodeKey) {
+            let choice = choices.recoveryDecisions?[target.episodeKey]
+            let key = target.identityUncertain == true ? "%d 个任务确认中" : choice != nil && choice?.phase != .responded ? "%d 个任务待选择" : "%d 个任务等待自动继续"
+            counts[key, default: 0] += 1
+        }
+        let order = ["%d 个任务正在发送", "%d 个任务确认中", "%d 个任务发送失败", "%d 个任务续跑已停止", "%d 个任务需到 Codex 手动继续", "%d 个任务待选择", "%d 个任务等待自动继续"]
+        let labels = order.compactMap { key in counts[key].map { L10n.format(key, $0) } }
+        tasks = labels.isEmpty ? [] : [labels.joined(separator: " · ")]
+        taskCount = counts.values.reduce(0, +)
+        tasksNeedAttention = ["%d 个任务发送失败", "%d 个任务续跑已停止", "%d 个任务需到 Codex 手动继续", "%d 个任务待选择"].contains { counts[$0] != nil }
+        let confirmed = operations.filter { $0.respondedAt != nil }.count
+        taskProgress = !operations.isEmpty && confirmed < operations.count ? L10n.format("已继续 %d/%d", confirmed, operations.count) : ""
+        reminderTitle = ""; reminderBody = ""
+        if counts["%d 个任务需到 Codex 手动继续"] != nil {
+            headline = "需要手动继续"; action = ""; eyebrow = ""; isTime = false; isSyncing = false
+            warning = L10n.text("需要手动继续")
+        }
+    }
+
+    mutating func applyResumeHistory(_ operations: [ResumeOperation], accountID: String?, confirmations: [ExecutionConfirmation] = [], now: Date = Date()) {
+        let visible = operations.filter { $0.accountID == accountID }
+        for index in timeline.indices where timeline[index].isHistory {
+            guard timeline[index].kind != .completedKeepAlive else { timeline[index].operationIDs = []; continue }
+            let date = timeline[index].date
+            let ids = Set(confirmations.filter { $0.kind == .resume && $0.accountID == accountID &&
+                abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(date)) <= ScheduleEngine.alignmentTolerance
+            }.compactMap(\.operationID))
+            let batches = Set(visible.filter { ids.contains($0.id) }.map(\.batchID))
+            timeline[index].operationIDs = Set(visible.filter { ids.contains($0.id) || batches.contains($0.batchID) }.map(\.id))
+        }
+        let clock = DateFormatter(); clock.dateFormat = "HH:mm"
+        let day = DateFormatter(); day.dateFormat = L10n.text("M月d日")
+        let represented = Set(timeline.flatMap(\.operationIDs))
+        let missing = visible.filter { operation in
+            !represented.contains(operation.id) && operation.actionAt <= now && (operation.respondedAt != nil ||
+                (operation.receivedAt != nil && operation.endedAt != nil) || (operation.phase == .checking && !operation.protectsThread))
+        }.sorted { $0.actionAt > $1.actionAt }.prefix(2)
+        for operation in missing {
+            guard !timeline.contains(where: { $0.operationIDs.contains(operation.id) }) else { continue }
+            timeline.append(MenuTimelinePoint(date: operation.actionAt, time: clock.string(from: operation.actionAt),
+                day: Calendar.current.isDate(operation.actionAt, inSameDayAs: now) ? "" : day.string(from: operation.actionAt),
+                label: operation.respondedAt == nil ? "续跑记录" : "已继续", kind: operation.respondedAt == nil ? .resumeRecord : .completedResume,
+                solidBefore: false, operationIDs: Set(visible.filter { $0.batchID == operation.batchID }.map(\.id))))
+        }
+        timeline.sort { $0.date < $1.date }
     }
 }

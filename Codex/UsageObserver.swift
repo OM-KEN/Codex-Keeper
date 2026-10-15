@@ -92,11 +92,9 @@ final class UsageObserver: ObservableObject {
 
     func invalidate(clearAccount: Bool = false) {
         hasReliableReading = false
-        if var previous = snapshot {
-            previous.capturedAt = .distantPast
-            if clearAccount { previous.accountID = nil }
-            snapshot = previous
-        }
+        // Keep the original reading and its capture time as facts. Critical refresh gates execution.
+        // Only a reliable new account response may change the display account.
+
     }
 
     func setPolling(_ policy: UsagePollingPolicy, retryOpportunity: UsageRetryOpportunity?) {

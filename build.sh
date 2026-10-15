@@ -37,7 +37,7 @@ SOURCES=(
     Core/MenuPresentation.swift
     Core/PingEngine.swift
     Core/PingDiagnostics.swift
-    Core/ResumeEngine.swift
+    Core/ResumeEngine.swift Core/ResumeState.swift
     Core/ExecutionCoordinator.swift
     Core/ExecutionEventLog.swift
     Codex/AppServerClient.swift
@@ -48,6 +48,7 @@ SOURCES=(
     Codex/SessionWatcher.swift
     Codex/BlockedSessionDetector.swift
     UI/MenuSummaryView.swift
+    UI/MenuBarQuotaView.swift
     UI/ResumeTasksView.swift
     UI/SettingsView.swift
     UI/AboutView.swift
