@@ -260,6 +260,9 @@
 "当前没有稳定版本" = "No stable release is available";
 "检查更新失败，请稍后重试。" = "Could not check for updates. Try again later.";
 "前往 GitHub 更新" = "View Update on GitHub";
+"发现重要更新" = "Important Update Available";
+"Codex Keeper %@ 已发布，建议查看发布说明并更新。" = "Codex Keeper %@ is available. We recommend reviewing the release notes and updating.";
+"稍后" = "Later";
 "支持与反馈" = "Support and Feedback";
 "问题反馈…" = "Report an Issue…";
 "问题反馈" = "Report an Issue";

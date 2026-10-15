@@ -75,7 +75,7 @@ If the official Codex CLI cannot be found, click the error message in the menu, 
 
 Click the version number below **Settings…** in the menu to open About. It shows the app icon and version, lets you check for updates, and offers feedback by email or GitHub.
 
-Update Reminders are enabled by default. When a newer version is available, **Update Available** and a green up arrow appear after the version number. Open About and select **View Update on GitHub** to download it. You can turn off reminders in About or check manually at any time.
+Update Reminders are enabled by default. When a newer version is available, **Update Available** and a green up arrow appear after the version number. Important updates also show a one-time alert. After choosing **Later**, you can still open About and select **View Update on GitHub** to download it. You can turn off reminders in About or check manually at any time.
 
 </details>
 
