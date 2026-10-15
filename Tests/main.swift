@@ -10,23 +10,26 @@ import Darwin
             count += 1
             if !value { failed += 1; print("FAIL: \(name)") }
         }
-        try await checkResumeStateRegression(check)
-        if CommandLine.arguments.contains("--resume-state-only") {
-            print("\(count - failed)/\(count) resume state checks passed")
-            if failed > 0 { exit(1) }
-            return
-        }
-        try checkMenuTimelineHistory(check)
-        if CommandLine.arguments.contains("--timeline-history-only") {
-            print("\(count - failed)/\(count) timeline history checks passed")
-            if failed > 0 { exit(1) }
-            return
-        }
-        checkMenuQuotaPresentation(check)
-        if CommandLine.arguments.contains("--quota-display-only") {
-            print("\(count - failed)/\(count) quota display checks passed")
-            if failed > 0 { exit(1) }
-            return
+        let appUpdateOnly = CommandLine.arguments.contains("--app-update-only")
+        if !appUpdateOnly {
+            try await checkResumeStateRegression(check)
+            if CommandLine.arguments.contains("--resume-state-only") {
+                print("\(count - failed)/\(count) resume state checks passed")
+                if failed > 0 { exit(1) }
+                return
+            }
+            try checkMenuTimelineHistory(check)
+            if CommandLine.arguments.contains("--timeline-history-only") {
+                print("\(count - failed)/\(count) timeline history checks passed")
+                if failed > 0 { exit(1) }
+                return
+            }
+            checkMenuQuotaPresentation(check)
+            if CommandLine.arguments.contains("--quota-display-only") {
+                print("\(count - failed)/\(count) quota display checks passed")
+                if failed > 0 { exit(1) }
+                return
+            }
         }
         do {
             let updateSuite = "keeper.updates.tests." + UUID().uuidString
@@ -40,20 +43,27 @@ import Darwin
             check(SemanticVersion(tag: "V0.1.4") == currentVersion &&
                 ["0.1", "0.1.4-beta.1", "0.1.4+build", "01.1.4", "0.-1.4", "0.1.４"].allSatisfy { SemanticVersion(tag: $0) == nil },
                 "stable versions accept the tag prefix and reject noncanonical or prerelease versions")
-            func releaseResponse(_ tag: String = "v0.1.4", status: Int = 200, url: String? = nil) -> HTTPURLResponse {
-                let defaultURL = status == 404 ? "https://github.com/OM-KEN/Codex-Keeper/releases/latest" :
-                    "https://github.com/OM-KEN/Codex-Keeper/releases/tag/\(tag)"
-                return HTTPURLResponse(url: URL(string: url ?? defaultURL)!,
-                    statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+            func releaseResponse(_ tag: String = "v0.1.4", status: Int = 200, url: String? = nil,
+                                 pageURL: String? = nil, body: String? = nil,
+                                 draft: Bool = false, prerelease: Bool = false) -> (Data, URLResponse) {
+                let payload: [String: Any] = ["tag_name": tag,
+                    "html_url": pageURL ?? "https://github.com/OM-KEN/Codex-Keeper/releases/tag/\(tag)",
+                    "draft": draft, "prerelease": prerelease, "body": body as Any? ?? NSNull()]
+                return (try! JSONSerialization.data(withJSONObject: payload), HTTPURLResponse(
+                    url: URL(string: url ?? "https://api.github.com/repos/OM-KEN/Codex-Keeper/releases/latest")!,
+                    statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!)
+            }
+            func parseResponse(_ payload: (Data, URLResponse)) -> LatestReleaseParseResult {
+                LatestReleaseParser.parse(data: payload.0, response: payload.1)
             }
             let newRelease = AppRelease(version: SemanticVersion(tag: "0.1.10")!,
-                pageURL: releaseResponse("v0.1.10").url!)
-            check(LatestReleaseParser.parse(response: releaseResponse("v0.1.10")) == .release(newRelease),
-                "latest release redirect preserves the trusted stable version and release page")
-            check(LatestReleaseParser.parse(response: releaseResponse(status: 404)) == .noStableRelease,
+                pageURL: URL(string: "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v0.1.10")!)
+            check(parseResponse(releaseResponse("v0.1.10")) == .release(newRelease),
+                "latest release JSON preserves the trusted stable version and release page")
+            check(parseResponse(releaseResponse(status: 404)) == .noStableRelease,
                 "missing latest release reports that no stable release is available")
             for status in [403, 500, 302] {
-                check(LatestReleaseParser.parse(response: releaseResponse(status: status)) == .failure,
+                check(parseResponse(releaseResponse(status: status)) == .failure,
                     "unsuccessful or unfinished release response is not a successful check: \(status)")
             }
             let invalidReleaseURLs = [
@@ -66,14 +76,78 @@ import Darwin
                 "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v0.1.10?next=elsewhere"
             ]
             check(invalidReleaseURLs.allSatisfy {
-                LatestReleaseParser.parse(response: releaseResponse(url: $0)) == .failure
-            }, "only a finished HTTPS release redirect for this repository and a numeric stable tag is accepted")
-            check(LatestReleaseParser.parse(response: releaseResponse(status: 404,
-                url: "https://github.com/OM-KEN/Copied/releases/latest")) == .failure,
+                parseResponse(releaseResponse("v0.1.10", pageURL: $0)) == .failure
+            }, "only a trusted HTTPS release page for this repository and a numeric stable tag is accepted")
+            check(parseResponse(releaseResponse(status: 404,
+                url: "https://api.github.com/repos/OM-KEN/Copied/releases/latest")) == .failure,
                 "a missing release in another repository cannot report that Codex Keeper has no stable release")
-            check(LatestReleaseParser.parse(response: URLResponse(url: releaseResponse().url!, mimeType: nil,
+            check(LatestReleaseParser.parse(data: releaseResponse().0, response: URLResponse(url: LatestReleaseParser.endpoint, mimeType: nil,
                 expectedContentLength: 0, textEncodingName: nil)) == .failure,
                 "non-HTTP release responses cannot report an available update")
+            let invalidAPIURLs = [
+                "http://api.github.com/repos/OM-KEN/Codex-Keeper/releases/latest",
+                "https://api.github.com/repos/OM-KEN/Copied/releases/latest",
+                "https://api.github.com.evil.example/repos/OM-KEN/Codex-Keeper/releases/latest",
+                "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v1.1.1",
+                "https://user@api.github.com/repos/OM-KEN/Codex-Keeper/releases/latest",
+                "https://api.github.com:443/repos/OM-KEN/Codex-Keeper/releases/latest",
+                "https://api.github.com/repos/OM-KEN/Codex-Keeper/releases/latest?next=elsewhere",
+                "https://api.github.com/repos/OM-KEN/Codex-Keeper/releases/latest#fragment"
+            ]
+            for status in [200, 404] {
+                check(invalidAPIURLs.allSatisfy {
+                    parseResponse(releaseResponse("v1.1.1", status: status, url: $0)) == .failure
+                }, "only this exact HTTPS latest-release API endpoint is trusted for status \(status)")
+            }
+            check(parseResponse(releaseResponse("v1.1.1", pageURL: "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v1.1.0")) == .failure &&
+                parseResponse(releaseResponse("v1.1.1", draft: true)) == .failure &&
+                parseResponse(releaseResponse("v1.1.1", prerelease: true)) == .failure,
+                "release tags must match the verified page and drafts or prereleases are rejected")
+            for invalidData in [Data(), Data("not JSON".utf8), Data([0xff])] {
+                check(LatestReleaseParser.parse(data: invalidData, response: releaseResponse().1) == .failure,
+                    "an invalid JSON response cannot be mistaken for a successful update check")
+            }
+            let wrongFieldValues: [(String, Any)] = [("tag_name", 11), ("html_url", NSNull()),
+                ("draft", "false"), ("prerelease", 0), ("body", ["instructions": "open another URL"])]
+            for (field, value) in wrongFieldValues {
+                var payload = try JSONSerialization.jsonObject(with: releaseResponse().0) as! [String: Any]
+                payload[field] = value
+                check(LatestReleaseParser.parse(data: try JSONSerialization.data(withJSONObject: payload), response: releaseResponse().1) == .failure,
+                    "release JSON rejects an invalid field type: \(field)")
+            }
+            for field in ["tag_name", "html_url", "draft", "prerelease"] {
+                var payload = try JSONSerialization.jsonObject(with: releaseResponse().0) as! [String: Any]
+                payload.removeValue(forKey: field)
+                check(LatestReleaseParser.parse(data: try JSONSerialization.data(withJSONObject: payload), response: releaseResponse().1) == .failure,
+                    "release JSON requires the trust field: \(field)")
+            }
+            let importantVersion = SemanticVersion(tag: "1.1.0")!
+            let importantRelease = AppRelease(version: SemanticVersion(tag: "1.1.1")!,
+                pageURL: URL(string: "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v1.1.1")!,
+                importantUpdateVersion: importantVersion)
+            let importantBody = "Release notes\n<!-- keeper-important-update: 1.1.0 -->\nUser-facing changes"
+            check(parseResponse(releaseResponse("v1.1.1", body: importantBody)) == .release(importantRelease) &&
+                parseResponse(releaseResponse("v1.1.1", body: "  <!-- keeper-important-update: 1.1.0 -->\r\n")) == .release(importantRelease),
+                "a single standalone canonical marker can carry an earlier important-update threshold into a patch release")
+            let plainRelease = AppRelease(version: importantRelease.version, pageURL: importantRelease.pageURL)
+            let invalidBodies = [
+                "Ordinary release notes without a marker",
+                "Text <!-- keeper-important-update: 1.1.0 -->",
+                "<!-- keeper-important-update: 1.1.0 --> trailing text",
+                "<!-- keeper-important-update: v1.1.0 -->",
+                "<!-- keeper-important-update: 01.1.0 -->",
+                "<!-- keeper-important-update: 1.1.0-beta -->",
+                "<!-- keeper-important-update: 1.2.0 -->",
+                "<!-- keeper-important-update: 1.1.0 -->\n<!-- keeper-important-update: 1.1.0 -->",
+                "<!-- keeper-important-update: 1.1.0 -->\n<!-- keeper-important-update: 1.0.0 -->",
+                "<!-- keeper-important-update: invalid -->\n<!-- keeper-important-update: 1.1.0 -->",
+                "<!-- keeper-important-update: 1.1.0 --><!-- keeper-important-update: 1.1.0 -->",
+                "<!-- keeper-important-update: \n1.1.0 -->"
+            ]
+            for body in invalidBodies {
+                check(parseResponse(releaseResponse("v1.1.1", body: body)) == .release(plainRelease),
+                    "an absent, malformed, duplicate or future marker leaves the ordinary release available: \(body)")
+            }
             for tag in ["v0.1.4", "v0.1.3"] {
                 let service = AppUpdateService(defaults: updateDefaults, currentVersion: "0.1.4", loadResponse: { _ in releaseResponse(tag) })
                 await service.checkManually()
@@ -81,7 +155,7 @@ import Darwin
                     "equal or older releases never offer a downgrade: \(tag)")
             }
             var requests: [URLRequest] = []
-            var pendingResponse: CheckedContinuation<URLResponse, Error>?
+            var pendingResponse: CheckedContinuation<(Data, URLResponse), Error>?
             var requestStarted: CheckedContinuation<Void, Never>?
             let service = AppUpdateService(defaults: updateDefaults, currentVersion: "0.1.4", loadResponse: { request in
                 requests.append(request)
@@ -95,12 +169,15 @@ import Darwin
             let firstCheck = Task { await service.checkManually() }
             await withCheckedContinuation { requestStarted = $0 }
             await service.checkManually()
+            await service.checkAutomaticallyIfDue()
             check(service.status == .checking && requests.count == 1,
                 "another manual check does not send a duplicate request while the first is pending")
-            check(requests.first?.url?.absoluteString == "https://github.com/OM-KEN/Codex-Keeper/releases/latest" &&
-                requests.first?.httpMethod == "HEAD" && requests.first?.timeoutInterval == 10 &&
-                requests.first?.cachePolicy == .reloadIgnoringLocalCacheData,
-                "manual update request uses a fresh short HEAD request to this repository's latest release")
+            check(requests.first?.url?.absoluteString == "https://api.github.com/repos/OM-KEN/Codex-Keeper/releases/latest" &&
+                requests.first?.httpMethod == "GET" && requests.first?.timeoutInterval == 10 &&
+                requests.first?.cachePolicy == .reloadIgnoringLocalCacheData &&
+                requests.first?.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json" &&
+                requests.first?.value(forHTTPHeaderField: "X-GitHub-Api-Version") == "2026-03-10",
+                "manual update checking sends one fresh short JSON GET to this repository's latest-release API")
             pendingResponse?.resume(returning: releaseResponse("v0.1.10"))
             await firstCheck.value
             check(service.status == .updateAvailable(newRelease) && service.availableRelease == newRelease,
@@ -203,6 +280,199 @@ import Darwin
             check(invalidCacheService.availableRelease == nil && !invalidCacheService.showsMenuUpdateIndicator &&
                 automaticDefaults.object(forKey: "appUpdateCachedReleaseURL") == nil,
                 "an untrusted cached release is discarded instead of becoming a menu update link")
+
+            let importantSuite = "keeper.important-updates.tests." + UUID().uuidString
+            let importantDefaults = UserDefaults(suiteName: importantSuite)!
+            defer { importantDefaults.removePersistentDomain(forName: importantSuite) }
+            var latestTag = "v1.0.2"
+            var latestBody: String?
+            var failMetadata = false
+            func importantService(_ current: String = "1.0.1") -> AppUpdateService {
+                AppUpdateService(defaults: importantDefaults, currentVersion: current, loadResponse: { _ in
+                    if failMetadata { throw URLError(.timedOut) }
+                    return releaseResponse(latestTag, body: latestBody)
+                })
+            }
+            let ordinaryPatch = importantService()
+            await ordinaryPatch.checkManually()
+            check(ordinaryPatch.showsMenuUpdateIndicator && ordinaryPatch.claimImportantUpdatePrompt() == nil &&
+                importantDefaults.object(forKey: "appUpdatePromptedImportantVersions") == nil,
+                "an ordinary patch keeps its menu update entry without claiming an important-update prompt")
+            latestTag = "v1.1.1"; latestBody = importantBody
+            let discoveredImportant = importantService()
+            await discoveredImportant.checkManually()
+            check(discoveredImportant.availableRelease == importantRelease &&
+                importantDefaults.string(forKey: "appUpdateCachedImportantVersion") == "1.1.0" &&
+                importantDefaults.object(forKey: "appUpdatePromptedImportantVersions") == nil,
+                "discovering an important update caches its threshold without prematurely claiming the prompt")
+            let cachedImportant = importantService()
+            check(cachedImportant.availableRelease == importantRelease && cachedImportant.claimImportantUpdatePrompt() == importantRelease &&
+                cachedImportant.claimImportantUpdatePrompt() == nil && cachedImportant.showsMenuUpdateIndicator,
+                "a same-major important update can be claimed once from startup cache while its menu entry stays available")
+            latestTag = "v1.1.2"
+            await cachedImportant.checkManually()
+            let patchedRestart = importantService()
+            check(patchedRestart.availableRelease?.version == SemanticVersion(tag: "1.1.2") &&
+                patchedRestart.availableRelease?.importantUpdateVersion == importantVersion &&
+                patchedRestart.claimImportantUpdatePrompt() == nil,
+                "later patches and restarts do not repeat a prompt for the same important-update threshold")
+            latestTag = "v1.2.1"; latestBody = "<!-- keeper-important-update: 1.2.0 -->"
+            let nextImportant = importantService()
+            await nextImportant.checkManually()
+            nextImportant.setAutomaticRemindersEnabled(false)
+            check(nextImportant.claimImportantUpdatePrompt() == nil && !nextImportant.showsMenuUpdateIndicator &&
+                importantDefaults.stringArray(forKey: "appUpdatePromptedImportantVersions") == ["1.1.0"],
+                "turning reminders off does not claim a newly discovered important-update threshold")
+            await nextImportant.checkManually()
+            let disabledImportantRestart = importantService()
+            check(disabledImportantRestart.availableRelease?.version == SemanticVersion(tag: "1.2.1") &&
+                disabledImportantRestart.claimImportantUpdatePrompt() == nil,
+                "manual checks and restarting while reminders are off retain the link without consuming the prompt")
+            disabledImportantRestart.setAutomaticRemindersEnabled(true)
+            check(disabledImportantRestart.claimImportantUpdatePrompt()?.version == SemanticVersion(tag: "1.2.1") &&
+                disabledImportantRestart.claimImportantUpdatePrompt() == nil,
+                "reenabling reminders allows the unclaimed important threshold to prompt once")
+
+            importantDefaults.removePersistentDomain(forName: importantSuite)
+            latestTag = "v1.2.1"; latestBody = importantBody
+            let skippedIntermediate = importantService()
+            await skippedIntermediate.checkManually()
+            check(skippedIntermediate.claimImportantUpdatePrompt()?.version == SemanticVersion(tag: "1.2.1"),
+                "a user who skipped the marked version is directed to the latest release")
+            importantDefaults.removeObject(forKey: "appUpdatePromptedImportantVersions")
+            let alreadyUpgraded = importantService("1.1.0")
+            check(alreadyUpgraded.showsMenuUpdateIndicator && alreadyUpgraded.claimImportantUpdatePrompt() == nil &&
+                importantDefaults.object(forKey: "appUpdatePromptedImportantVersions") == nil,
+                "installing the important threshold prevents an automatic prompt even while a newer patch exists")
+            let awaitingFailure = importantService()
+            failMetadata = true
+            await awaitingFailure.checkManually()
+            check(awaitingFailure.status == .failed && awaitingFailure.availableRelease?.importantUpdateVersion == importantVersion &&
+                awaitingFailure.claimImportantUpdatePrompt()?.version == SemanticVersion(tag: "1.2.1"),
+                "a failed check preserves a verified cached threshold and still permits its first prompt")
+            check(importantService().claimImportantUpdatePrompt() == nil,
+                "a claimed cached update remains claimed after a failed check and another restart")
+            failMetadata = false
+            for invalidMarker in ["1.3.0", "v1.1.0", "01.1.0", "invalid"] {
+                importantDefaults.set(invalidMarker, forKey: "appUpdateCachedImportantVersion")
+                importantDefaults.removeObject(forKey: "appUpdatePromptedImportantVersions")
+                let invalidMarkerRestart = importantService()
+                check(invalidMarkerRestart.showsMenuUpdateIndicator && invalidMarkerRestart.claimImportantUpdatePrompt() == nil &&
+                    importantDefaults.object(forKey: "appUpdateCachedImportantVersion") == nil,
+                    "invalid or future cached thresholds never trigger an important prompt: \(invalidMarker)")
+            }
+            check(importantService().showsMenuUpdateIndicator && importantService().claimImportantUpdatePrompt() == nil,
+                "an older cache containing only a trusted release URL retains the ordinary menu reminder")
+            latestBody = "<!-- keeper-important-update: 1.3.0 -->"
+            let futureMarker = importantService()
+            await futureMarker.checkManually()
+            check(futureMarker.showsMenuUpdateIndicator && futureMarker.claimImportantUpdatePrompt() == nil &&
+                futureMarker.availableRelease?.importantUpdateVersion == nil,
+                "a future network marker does not hide the release or manufacture an important prompt")
+            latestBody = importantBody
+            await futureMarker.checkManually()
+            latestBody = "An ordinary release without a marker"
+            await futureMarker.checkManually()
+            check(futureMarker.availableRelease?.importantUpdateVersion == nil &&
+                importantDefaults.object(forKey: "appUpdateCachedImportantVersion") == nil &&
+                futureMarker.claimImportantUpdatePrompt() == nil,
+                "fresh release metadata without a marker clears an obsolete cached important threshold")
+            latestBody = importantBody
+            await futureMarker.checkManually()
+            let noStableImportant = AppUpdateService(defaults: importantDefaults, currentVersion: "1.0.1",
+                loadResponse: { _ in releaseResponse(status: 404) })
+            await noStableImportant.checkManually()
+            check(noStableImportant.availableRelease == nil && noStableImportant.claimImportantUpdatePrompt() == nil &&
+                importantDefaults.object(forKey: "appUpdateCachedReleaseURL") == nil &&
+                importantDefaults.object(forKey: "appUpdateCachedImportantVersion") == nil,
+                "a confirmed absence of stable releases clears both the trusted link and important threshold")
+
+            let rateLimitSuite = "keeper.rate-limited-updates.tests." + UUID().uuidString
+            let rateLimitDefaults = UserDefaults(suiteName: rateLimitSuite)!
+            defer { rateLimitDefaults.removePersistentDomain(forName: rateLimitSuite) }
+            var rateLimitClock = Date(timeIntervalSince1970: 1_800_000_000)
+            var fallbackTag = "v1.1.1"
+            var rateStatus = 403
+            var rateLimited = true
+            var metadataOverride: (Data, URLResponse)?
+            var fallbackOverride: (Data, URLResponse)?
+            var rateRequests: [URLRequest] = []
+            func rateLimitResponse(status: Int = 403, url: URL = LatestReleaseParser.endpoint) -> (Data, URLResponse) {
+                (Data("{\"message\":\"API rate limit exceeded\"}".utf8), HTTPURLResponse(url: url, statusCode: status,
+                    httpVersion: "HTTP/1.1", headerFields: ["X-RateLimit-Remaining": "0"])!)
+            }
+            func rateLimitService() -> AppUpdateService {
+                AppUpdateService(defaults: rateLimitDefaults, currentVersion: "1.0.1", now: { rateLimitClock }, loadResponse: { request in
+                    rateRequests.append(request)
+                    if request.httpMethod == "HEAD" {
+                        if let fallbackOverride { return fallbackOverride }
+                        return (Data(), HTTPURLResponse(url: URL(string: "https://github.com/OM-KEN/Codex-Keeper/releases/tag/\(fallbackTag)")!,
+                            statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!)
+                    }
+                    if let metadataOverride { return metadataOverride }
+                    return rateLimited ? rateLimitResponse(status: rateStatus) : releaseResponse(fallbackTag, body: importantBody)
+                })
+            }
+            let limitedService = rateLimitService()
+            await limitedService.checkAutomaticallyIfDue()
+            check(rateRequests.map(\.httpMethod) == ["GET", "HEAD"] &&
+                rateRequests.last?.url == LatestReleaseParser.fallbackEndpoint && rateRequests.last?.timeoutInterval == 10 &&
+                limitedService.showsMenuUpdateIndicator && limitedService.availableRelease?.version == SemanticVersion(tag: "1.1.1") &&
+                limitedService.claimImportantUpdatePrompt() == nil,
+                "a trusted API rate limit falls back once to HEAD and offers only the ordinary verified update")
+            rateLimitClock.addTimeInterval(60 * 60 - 1)
+            let limitedRestart = rateLimitService()
+            await limitedRestart.checkAutomaticallyIfDue()
+            check(rateRequests.count == 2 && limitedRestart.showsMenuUpdateIndicator,
+                "a fallback success retains the metadata failure's one-hour backoff across restart")
+            rateLimitClock.addTimeInterval(1); rateLimited = false
+            await limitedRestart.checkAutomaticallyIfDue()
+            check(rateRequests.map(\.httpMethod) == ["GET", "HEAD", "GET"] &&
+                limitedRestart.availableRelease == importantRelease,
+                "the API metadata is retried after one hour instead of waiting a full day after fallback")
+            rateLimited = true; rateStatus = 429
+            let cachedLimited = rateLimitService()
+            await cachedLimited.checkManually()
+            check(cachedLimited.availableRelease == importantRelease && cachedLimited.claimImportantUpdatePrompt() == importantRelease,
+                "a rate-limited HEAD for the identical release preserves its previously verified important threshold")
+            fallbackTag = "v1.1.2"
+            await cachedLimited.checkManually()
+            check(cachedLimited.availableRelease?.version == SemanticVersion(tag: "1.1.2") &&
+                cachedLimited.availableRelease?.importantUpdateVersion == nil && cachedLimited.claimImportantUpdatePrompt() == nil &&
+                rateLimitDefaults.object(forKey: "appUpdateCachedImportantVersion") == nil,
+                "a different fallback release never inherits an unverified important marker from an earlier version")
+            let retainedFallbackRelease = cachedLimited.availableRelease
+            for rejectedMetadata in [releaseResponse(status: 403), releaseResponse(status: 500),
+                rateLimitResponse(url: URL(string: "https://api.github.com/repos/OM-KEN/Copied/releases/latest")!)] {
+                metadataOverride = rejectedMetadata
+                let requestCount = rateRequests.count
+                await cachedLimited.checkManually()
+                check(rateRequests.count == requestCount + 1 && cachedLimited.status == .failed &&
+                    cachedLimited.availableRelease == retainedFallbackRelease,
+                    "ordinary API errors and untrusted responses preserve the cache without making a HEAD request")
+            }
+            metadataOverride = nil
+            fallbackOverride = releaseResponse(status: 500)
+            let failedFallbackCount = rateRequests.count
+            await cachedLimited.checkManually()
+            check(rateRequests.count == failedFallbackCount + 2 && cachedLimited.status == .failed &&
+                cachedLimited.availableRelease == retainedFallbackRelease,
+                "a failed limited-API fallback preserves the trusted release without making further requests")
+            fallbackOverride = releaseResponse(status: 404, url: LatestReleaseParser.fallbackEndpoint.absoluteString)
+            await cachedLimited.checkManually()
+            check(cachedLimited.status == .noStableRelease && cachedLimited.availableRelease == nil &&
+                rateLimitDefaults.object(forKey: "appUpdateCachedReleaseURL") == nil &&
+                rateLimitDefaults.bool(forKey: "appUpdateLastCheckFailed"),
+                "the exact fallback latest-page 404 clears a release while retaining one-hour metadata retry")
+            check(LatestReleaseParser.parse(data: rateLimitResponse().0,
+                response: rateLimitResponse(url: URL(string: "https://api.github.com/repos/OM-KEN/Copied/releases/latest")!).1) == .failure,
+                "an untrusted API rate-limit response cannot authorize a HEAD fallback")
+            let rejectedFallbacks = invalidReleaseURLs.map { releaseResponse(url: $0).1 }
+            check(rejectedFallbacks.allSatisfy { LatestReleaseParser.parseFallback(response: $0) == .failure } &&
+                LatestReleaseParser.parseFallback(response: releaseResponse(status: 404).1) == .failure &&
+                LatestReleaseParser.parseFallback(response: releaseResponse(status: 404,
+                    url: LatestReleaseParser.fallbackEndpoint.absoluteString).1) == .noStableRelease,
+                "fallback release pages remain trusted and fallback 404 is meaningful only at the exact GitHub latest page")
             check(MenuVersionTextFormatter.string(version: "0.1.4", hasUpdate: false) == "版本 0.1.4" &&
                 MenuVersionTextFormatter.string(version: "0.1.4", hasUpdate: true) == "版本 0.1.4 · 有新版本",
                 "the available-version reminder follows the version text in the menu")
@@ -218,6 +488,11 @@ import Darwin
                 "feedback email preserves environment fields and encodes reserved characters and line breaks")
             check(FeedbackSupport.githubIssueChooserURL.absoluteString == "https://github.com/OM-KEN/Codex-Keeper/issues/new/choose",
                 "GitHub feedback opens the issue chooser for Codex Keeper")
+        }
+        if appUpdateOnly {
+            print("\(count - failed)/\(count) app update checks passed")
+            if failed > 0 { exit(1) }
+            return
         }
         let onboardingSuite = "keeper.onboarding.tests." + UUID().uuidString
         let onboardingDefaults = UserDefaults(suiteName: onboardingSuite)!

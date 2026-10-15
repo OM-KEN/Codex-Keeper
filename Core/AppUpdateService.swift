@@ -38,6 +38,7 @@ struct SemanticVersion: Comparable, CustomStringConvertible {
 struct AppRelease: Equatable {
     let version: SemanticVersion
     let pageURL: URL
+    var importantUpdateVersion: SemanticVersion? = nil
 }
 
 extension AppRelease {
@@ -54,18 +55,59 @@ extension AppRelease {
 enum LatestReleaseParseResult: Equatable {
     case release(AppRelease)
     case noStableRelease
+    case rateLimited
     case failure
 }
 
 enum LatestReleaseParser {
-    static func parse(response: URLResponse) -> LatestReleaseParseResult {
-        guard let response = response as? HTTPURLResponse else { return .failure }
-        guard let url = response.url else { return .failure }
-        if response.statusCode == 404 {
-            return url.absoluteString == "https://github.com/OM-KEN/Codex-Keeper/releases/latest" ? .noStableRelease : .failure
+    static let endpoint = URL(string: "https://api.github.com/repos/OM-KEN/Codex-Keeper/releases/latest")!
+    static let fallbackEndpoint = URL(string: "https://github.com/OM-KEN/Codex-Keeper/releases/latest")!
+
+    private struct Payload: Decodable {
+        let tag_name: String
+        let html_url: URL
+        let draft: Bool
+        let prerelease: Bool
+        let body: String?
+    }
+
+    static func parse(data: Data, response: URLResponse) -> LatestReleaseParseResult {
+        guard let response = response as? HTTPURLResponse, response.url == endpoint else { return .failure }
+        if response.statusCode == 429 { return .rateLimited }
+        if response.statusCode == 403 {
+            let message = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["message"] as? String
+            if response.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" ||
+               response.value(forHTTPHeaderField: "Retry-After") != nil ||
+               message?.lowercased().contains("rate limit") == true { return .rateLimited }
         }
+        if response.statusCode == 404 { return .noStableRelease }
+        guard (200..<300).contains(response.statusCode),
+              let payload = try? JSONDecoder().decode(Payload.self, from: data), !payload.draft, !payload.prerelease,
+              let version = SemanticVersion(tag: payload.tag_name),
+              var release = AppRelease(pageURL: payload.html_url), release.version == version else { return .failure }
+        release.importantUpdateVersion = importantUpdateVersion(in: payload.body, releaseVersion: version)
+        return .release(release)
+    }
+
+    static func parseFallback(response: URLResponse) -> LatestReleaseParseResult {
+        guard let response = response as? HTTPURLResponse, let url = response.url else { return .failure }
+        if response.statusCode == 404 { return url == fallbackEndpoint ? .noStableRelease : .failure }
         guard (200..<300).contains(response.statusCode), let release = AppRelease(pageURL: url) else { return .failure }
         return .release(release)
+    }
+
+    private static func importantUpdateVersion(in body: String?, releaseVersion: SemanticVersion) -> SemanticVersion? {
+        guard let body else { return nil }
+        let key = "keeper-important-update"
+        let lines = body.components(separatedBy: .newlines).filter { $0.contains(key) }
+        guard lines.count == 1 else { return nil }
+        let line = lines[0].trimmingCharacters(in: .whitespaces)
+        let prefix = "<!-- keeper-important-update: "
+        let suffix = " -->"
+        guard line.hasPrefix(prefix), line.hasSuffix(suffix) else { return nil }
+        let value = String(line.dropFirst(prefix.count).dropLast(suffix.count))
+        guard let version = SemanticVersion(tag: value), value == version.description, version <= releaseVersion else { return nil }
+        return version
     }
 }
 
@@ -83,13 +125,15 @@ enum AppUpdateStatus: Equatable {
     private static let lastCheckKey = "appUpdateLastCheck"
     private static let lastCheckFailedKey = "appUpdateLastCheckFailed"
     private static let cachedReleaseURLKey = "appUpdateCachedReleaseURL"
+    private static let cachedImportantVersionKey = "appUpdateCachedImportantVersion"
+    private static let promptedImportantVersionsKey = "appUpdatePromptedImportantVersions"
     @Published private(set) var status: AppUpdateStatus = .idle
     @Published private(set) var availableRelease: AppRelease?
     @Published private(set) var automaticRemindersEnabled: Bool
     private let defaults: UserDefaults
     private let currentVersion: String
     private let now: () -> Date
-    private let loadResponse: (URLRequest) async throws -> URLResponse
+    private let loadResponse: (URLRequest) async throws -> (Data, URLResponse)
     private var automaticChecksStarted = false
     private var automaticTimer: Timer?
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
@@ -97,7 +141,7 @@ enum AppUpdateStatus: Equatable {
 
     init(defaults: UserDefaults = .standard, currentVersion: String = AppVersion.currentString,
          now: @escaping () -> Date = Date.init,
-         loadResponse: @escaping (URLRequest) async throws -> URLResponse = AppUpdateService.fetch) {
+         loadResponse: @escaping (URLRequest) async throws -> (Data, URLResponse) = AppUpdateService.fetch) {
         self.defaults = defaults
         self.currentVersion = currentVersion
         self.now = now
@@ -113,6 +157,17 @@ enum AppUpdateStatus: Equatable {
     }
 
     var showsMenuUpdateIndicator: Bool { automaticRemindersEnabled && availableRelease != nil }
+
+    func claimImportantUpdatePrompt() -> AppRelease? {
+        guard automaticRemindersEnabled, let current = SemanticVersion(tag: currentVersion),
+              let release = availableRelease, let important = release.importantUpdateVersion,
+              current < important, important <= release.version else { return nil }
+        var prompted = defaults.stringArray(forKey: Self.promptedImportantVersionsKey) ?? []
+        guard !prompted.contains(important.description) else { return nil }
+        prompted.append(important.description)
+        defaults.set(prompted, forKey: Self.promptedImportantVersionsKey)
+        return release
+    }
 
     func startAutomaticChecks() {
         automaticChecksStarted = true
@@ -190,24 +245,43 @@ enum AppUpdateStatus: Equatable {
         }
         let previousStatus = status
         status = .checking
-        var request = URLRequest(url: URL(string: "https://github.com/OM-KEN/Codex-Keeper/releases/latest")!,
+        var request = URLRequest(url: LatestReleaseParser.endpoint,
             cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
-        request.httpMethod = "HEAD"
+        request.httpMethod = "GET"
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("2026-03-10", forHTTPHeaderField: "X-GitHub-Api-Version")
         do {
-            let response = try await loadResponse(request)
+            let (data, response) = try await loadResponse(request)
             guard !Task.isCancelled, manual || automaticRemindersEnabled else { status = previousStatus; return }
-            switch LatestReleaseParser.parse(response: response) {
+            var result = LatestReleaseParser.parse(data: data, response: response)
+            let metadataRateLimited = result == .rateLimited
+            if metadataRateLimited {
+                var fallback = URLRequest(url: LatestReleaseParser.fallbackEndpoint,
+                    cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+                fallback.httpMethod = "HEAD"
+                let (_, response) = try await loadResponse(fallback)
+                guard !Task.isCancelled, manual || automaticRemindersEnabled else { status = previousStatus; return }
+                result = LatestReleaseParser.parseFallback(response: response)
+                if case .release(var release) = result, let cached = availableRelease,
+                   release.version == cached.version, release.pageURL == cached.pageURL {
+                    release.importantUpdateVersion = cached.importantUpdateVersion
+                    result = .release(release)
+                }
+            }
+            switch result {
             case .release(let release):
-                recordCheck(success: true)
+                recordCheck(success: !metadataRateLimited)
                 availableRelease = release.version > current ? release : nil
                 defaults.set(availableRelease?.pageURL.absoluteString, forKey: Self.cachedReleaseURLKey)
+                defaults.set(availableRelease?.importantUpdateVersion?.description, forKey: Self.cachedImportantVersionKey)
                 status = release.version > current ? .updateAvailable(release) : .upToDate
             case .noStableRelease:
-                recordCheck(success: true)
+                recordCheck(success: !metadataRateLimited)
                 availableRelease = nil
                 defaults.removeObject(forKey: Self.cachedReleaseURLKey)
+                defaults.removeObject(forKey: Self.cachedImportantVersionKey)
                 status = .noStableRelease
-            case .failure:
+            case .failure, .rateLimited:
                 recordCheck(success: false); status = .failed
             }
         } catch {
@@ -222,28 +296,38 @@ enum AppUpdateStatus: Equatable {
     }
 
     private func restoreCachedRelease() {
-        guard let value = defaults.string(forKey: Self.cachedReleaseURLKey) else { return }
-        guard let url = URL(string: value), let release = AppRelease(pageURL: url),
+        guard let value = defaults.string(forKey: Self.cachedReleaseURLKey) else {
+            defaults.removeObject(forKey: Self.cachedImportantVersionKey)
+            return
+        }
+        guard let url = URL(string: value), var release = AppRelease(pageURL: url),
               let current = SemanticVersion(tag: currentVersion) else {
             defaults.removeObject(forKey: Self.cachedReleaseURLKey)
+            defaults.removeObject(forKey: Self.cachedImportantVersionKey)
             return
         }
         if release.version > current {
+            if let value = defaults.string(forKey: Self.cachedImportantVersionKey),
+               let important = SemanticVersion(tag: value), value == important.description, important <= release.version {
+                release.importantUpdateVersion = important
+            } else {
+                defaults.removeObject(forKey: Self.cachedImportantVersionKey)
+            }
             availableRelease = release
             status = .updateAvailable(release)
         } else {
             defaults.removeObject(forKey: Self.cachedReleaseURLKey)
+            defaults.removeObject(forKey: Self.cachedImportantVersionKey)
             status = .upToDate
         }
     }
 
-    nonisolated private static func fetch(_ request: URLRequest) async throws -> URLResponse {
+    nonisolated private static func fetch(_ request: URLRequest) async throws -> (Data, URLResponse) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 10
         configuration.timeoutIntervalForResource = 15
         let session = URLSession(configuration: configuration)
         defer { session.finishTasksAndInvalidate() }
-        let (_, response) = try await session.data(for: request)
-        return response
+        return try await session.data(for: request)
     }
 }

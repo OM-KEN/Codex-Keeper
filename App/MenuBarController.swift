@@ -21,6 +21,9 @@ import UserNotifications
     private let appState = AppState()
     private let updateService = AppUpdateService()
     private var updateScheduled = false
+    private var menuIsTracking = false
+    private var importantUpdatePromptScheduled = false
+    private var showingImportantUpdate = false
     private var notifiedCurrentPing = false
     private var executionFailureSeen = false
     private var presentation = MenuPresentation(historyURL: FileManager.default
@@ -84,8 +87,15 @@ import UserNotifications
         executionFailureSeen = true
         appState.refresh(manual: true, source: "menu_open"); rebuildMenu()
     }
-    func menuWillOpen(_ menu: NSMenu) { statusQuotaView.setHighlighted(true); quotaHost?.menuWillOpen() }
-    func menuDidClose(_ menu: NSMenu) { statusQuotaView.setHighlighted(false); quotaHost?.menuDidClose() }
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsTracking = true
+        statusQuotaView.setHighlighted(true); quotaHost?.menuWillOpen()
+    }
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsTracking = false
+        statusQuotaView.setHighlighted(false); quotaHost?.menuDidClose()
+        scheduleImportantUpdatePrompt()
+    }
     func shutdown() { updateService.stop(); appState.execution.stopOwnedTasks() }
     func confirmQuit() -> Bool {
         let names = appState.execution.independentTaskNames
@@ -212,6 +222,30 @@ import UserNotifications
             title.append(NSAttributedString(attachment: attachment))
             versionItem?.attributedTitle = title
         }
+        scheduleImportantUpdatePrompt()
+    }
+
+    private func scheduleImportantUpdatePrompt() {
+        guard !importantUpdatePromptScheduled, !showingImportantUpdate else { return }
+        importantUpdatePromptScheduled = true
+        RunLoop.main.perform(inModes: [.default]) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.importantUpdatePromptScheduled = false
+                self.presentImportantUpdateIfPossible()
+            }
+        }
+    }
+
+    private func presentImportantUpdateIfPossible() {
+        guard !menuIsTracking, !showingImportantUpdate, !appState.execution.running,
+              NSApp.modalWindow == nil, !NSApp.windows.contains(where: { $0.attachedSheet != nil }),
+              let release = updateService.claimImportantUpdatePrompt() else { return }
+        showingImportantUpdate = true
+        defer { showingImportantUpdate = false }
+        let alert = ImportantUpdateAlert.make(release: release)
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(release.pageURL) }
     }
 
     private func makeSummary(running: Bool? = nil) -> MenuSummary {
