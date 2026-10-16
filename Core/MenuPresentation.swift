@@ -174,6 +174,7 @@ extension MenuSummary {
         let day = DateFormatter(); day.dateFormat = L10n.text("M月d日")
         func dayText(_ date: Date) -> String {
             if Calendar.current.isDate(date, inSameDayAs: now) { return L10n.text("今天") }
+            if let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now), Calendar.current.isDate(date, inSameDayAs: yesterday) { return L10n.text("昨天") }
             if let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: now), Calendar.current.isDate(date, inSameDayAs: tomorrow) { return L10n.text("明天") }
             return day.string(from: date)
         }
@@ -266,12 +267,12 @@ extension MenuSummary {
             }
             if result.timeline.count < 3, let first = result.timeline.first?.date,
                let accountID = usage.accountID, !accountID.isEmpty {
-                let cycleStart = menuPlanCycleStart(schedule: schedule, now: now)
+                let historyStart = max(menuPlanCycleStart(schedule: schedule, now: now), Calendar.current.startOfDay(for: now))
                 let completed = confirmations.compactMap { confirmation -> MenuTimelinePoint? in
                     let date = confirmation.windowStart ?? confirmation.actionAt
                     guard confirmation.accountID == accountID, confirmation.confirmedAt <= now,
                           confirmation.actionAt <= confirmation.confirmedAt, date <= confirmation.confirmedAt,
-                          date >= cycleStart, date < first else { return nil }
+                          date >= historyStart, date < first else { return nil }
                     return point(date,
                         confirmation.kind == .resume ? "已继续" : "已保活",
                         confirmation.kind == .resume ? .completedResume : .completedKeepAlive)
@@ -283,7 +284,7 @@ extension MenuSummary {
                 }
                 var added: [MenuTimelinePoint] = []
                 for candidate in history.sorted(by: { $0.date > $1.date }) where
-                    candidate.date >= cycleStart && candidate.date < first && candidate.date <= now {
+                    candidate.date >= historyStart && candidate.date < first && candidate.date <= now {
                     guard result.timeline.count + added.count < 3 else { break }
                     guard !(result.timeline + added).contains(where: {
                         abs($0.date.timeIntervalSince(candidate.date)) <= ScheduleEngine.alignmentTolerance
@@ -594,17 +595,17 @@ extension MenuSummary {
             timeline[index].operationIDs = Set(visible.filter { ids.contains($0.id) || batches.contains($0.batchID) }.map(\.id))
         }
         let clock = DateFormatter(); clock.dateFormat = "HH:mm"
-        let day = DateFormatter(); day.dateFormat = L10n.text("M月d日")
+        let today = Calendar.current.startOfDay(for: now)
         let represented = Set(timeline.flatMap(\.operationIDs))
         let missing = visible.filter { operation in
-            !represented.contains(operation.id) && operation.actionAt <= now && (operation.respondedAt != nil ||
+            !represented.contains(operation.id) && operation.actionAt >= today && operation.actionAt <= now && (operation.respondedAt != nil ||
                 (operation.receivedAt != nil && operation.endedAt != nil) || (operation.phase == .checking && !operation.protectsThread))
         }.sorted { $0.actionAt > $1.actionAt }.prefix(2)
         for operation in missing {
             guard timeline.count < 4 else { break }
             guard !timeline.contains(where: { $0.operationIDs.contains(operation.id) }) else { continue }
             timeline.append(MenuTimelinePoint(date: operation.actionAt, time: clock.string(from: operation.actionAt),
-                day: Calendar.current.isDate(operation.actionAt, inSameDayAs: now) ? "" : day.string(from: operation.actionAt),
+                day: "",
                 label: operation.respondedAt == nil ? "续跑记录" : "已继续", kind: operation.respondedAt == nil ? .resumeRecord : .completedResume,
                 solidBefore: false, operationIDs: Set(visible.filter { $0.batchID == operation.batchID }.map(\.id))))
         }

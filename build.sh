@@ -52,6 +52,7 @@ SOURCES=(
     UI/ResumeTasksView.swift
     UI/SettingsView.swift
     UI/AboutView.swift
+    UI/ImportantUpdateWindowController.swift
     UI/OnboardingView.swift
 )
 ICON_SOURCE="Codex Keeper.jpg"

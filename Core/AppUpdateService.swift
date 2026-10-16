@@ -39,6 +39,7 @@ struct AppRelease: Equatable {
     let version: SemanticVersion
     let pageURL: URL
     var importantUpdateVersion: SemanticVersion? = nil
+    var releaseNotes = ""
 }
 
 extension AppRelease {
@@ -49,6 +50,44 @@ extension AppRelease {
               pageURL.path.hasPrefix(prefix),
               let version = SemanticVersion(tag: String(pageURL.path.dropFirst(prefix.count))) else { return nil }
         self.init(version: version, pageURL: pageURL)
+    }
+
+    func displayNotes(localization: String?) -> String {
+        let text = releaseNotes
+            .replacingOccurrences(of: #"<!--\s*keeper-important-update:[\s\S]*?-->"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let englishHeadings = ["## What's New", "## Fixes"]
+        let chineseHeadings = ["## 新功能", "## 修复"]
+        let prefersEnglish = localization?.lowercased().hasPrefix("en") == true
+        let preferredHeadings = prefersEnglish ? englishHeadings : chineseHeadings
+        let fallbackHeadings = prefersEnglish ? chineseHeadings : englishHeadings
+        var preamble = ""
+        var sections: [(heading: String, content: String)] = []
+        for line in text.components(separatedBy: "\n") {
+            if line.hasPrefix("## ") {
+                sections.append((line.trimmingCharacters(in: .whitespaces), ""))
+            } else if sections.isEmpty {
+                preamble += line + "\n"
+            } else {
+                sections[sections.count - 1].content += line + "\n"
+            }
+        }
+        let populatedSections = sections.filter {
+            !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let preferred = populatedSections.filter { preferredHeadings.contains($0.heading) }
+        let selected = preferred.isEmpty
+            ? populatedSections.filter { fallbackHeadings.contains($0.heading) }
+            : preferred
+        if !selected.isEmpty {
+            return selected.map {
+                $0.heading + "\n" + $0.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.joined(separator: "\n\n")
+        }
+        return populatedSections.isEmpty && preamble.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "" : text
     }
 }
 
@@ -86,6 +125,7 @@ enum LatestReleaseParser {
               let version = SemanticVersion(tag: payload.tag_name),
               var release = AppRelease(pageURL: payload.html_url), release.version == version else { return .failure }
         release.importantUpdateVersion = importantUpdateVersion(in: payload.body, releaseVersion: version)
+        release.releaseNotes = payload.body ?? ""
         return .release(release)
     }
 
@@ -126,6 +166,7 @@ enum AppUpdateStatus: Equatable {
     private static let lastCheckFailedKey = "appUpdateLastCheckFailed"
     private static let cachedReleaseURLKey = "appUpdateCachedReleaseURL"
     private static let cachedImportantVersionKey = "appUpdateCachedImportantVersion"
+    private static let cachedReleaseNotesKey = "appUpdateCachedReleaseNotes"
     private static let promptedImportantVersionsKey = "appUpdatePromptedImportantVersions"
     @Published private(set) var status: AppUpdateStatus = .idle
     @Published private(set) var availableRelease: AppRelease?
@@ -265,6 +306,7 @@ enum AppUpdateStatus: Equatable {
                 if case .release(var release) = result, let cached = availableRelease,
                    release.version == cached.version, release.pageURL == cached.pageURL {
                     release.importantUpdateVersion = cached.importantUpdateVersion
+                    release.releaseNotes = cached.releaseNotes
                     result = .release(release)
                 }
             }
@@ -274,12 +316,14 @@ enum AppUpdateStatus: Equatable {
                 availableRelease = release.version > current ? release : nil
                 defaults.set(availableRelease?.pageURL.absoluteString, forKey: Self.cachedReleaseURLKey)
                 defaults.set(availableRelease?.importantUpdateVersion?.description, forKey: Self.cachedImportantVersionKey)
+                defaults.set(availableRelease?.releaseNotes, forKey: Self.cachedReleaseNotesKey)
                 status = release.version > current ? .updateAvailable(release) : .upToDate
             case .noStableRelease:
                 recordCheck(success: !metadataRateLimited)
                 availableRelease = nil
                 defaults.removeObject(forKey: Self.cachedReleaseURLKey)
                 defaults.removeObject(forKey: Self.cachedImportantVersionKey)
+                defaults.removeObject(forKey: Self.cachedReleaseNotesKey)
                 status = .noStableRelease
             case .failure, .rateLimited:
                 recordCheck(success: false); status = .failed
@@ -298,15 +342,18 @@ enum AppUpdateStatus: Equatable {
     private func restoreCachedRelease() {
         guard let value = defaults.string(forKey: Self.cachedReleaseURLKey) else {
             defaults.removeObject(forKey: Self.cachedImportantVersionKey)
+            defaults.removeObject(forKey: Self.cachedReleaseNotesKey)
             return
         }
         guard let url = URL(string: value), var release = AppRelease(pageURL: url),
               let current = SemanticVersion(tag: currentVersion) else {
             defaults.removeObject(forKey: Self.cachedReleaseURLKey)
             defaults.removeObject(forKey: Self.cachedImportantVersionKey)
+            defaults.removeObject(forKey: Self.cachedReleaseNotesKey)
             return
         }
         if release.version > current {
+            release.releaseNotes = defaults.string(forKey: Self.cachedReleaseNotesKey) ?? ""
             if let value = defaults.string(forKey: Self.cachedImportantVersionKey),
                let important = SemanticVersion(tag: value), value == important.description, important <= release.version {
                 release.importantUpdateVersion = important
@@ -318,6 +365,7 @@ enum AppUpdateStatus: Equatable {
         } else {
             defaults.removeObject(forKey: Self.cachedReleaseURLKey)
             defaults.removeObject(forKey: Self.cachedImportantVersionKey)
+            defaults.removeObject(forKey: Self.cachedReleaseNotesKey)
             status = .upToDate
         }
     }

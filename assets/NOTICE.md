@@ -1,6 +1,6 @@
-# 安装包背景
+# 复用的 Copied 内容
 
-`dmg_background.png` 及安装布局参考 Copied，遵循以下 MIT 许可。此处许可仅说明所复用的 Copied 内容。
+`dmg_background.png`、安装布局和重要更新窗口参考 Copied，遵循以下 MIT 许可。重要更新窗口及发布说明排版参考提交 `f0ce1b54331d3dc0bc974adfdf74734a46cc9752`。此处许可仅说明所复用的 Copied 内容。
 
 MIT License
 

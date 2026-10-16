@@ -122,14 +122,16 @@ import Darwin
                     "release JSON requires the trust field: \(field)")
             }
             let importantVersion = SemanticVersion(tag: "1.1.0")!
+            let importantBody = "Release notes\n<!-- keeper-important-update: 1.1.0 -->\nUser-facing changes"
             let importantRelease = AppRelease(version: SemanticVersion(tag: "1.1.1")!,
                 pageURL: URL(string: "https://github.com/OM-KEN/Codex-Keeper/releases/tag/v1.1.1")!,
-                importantUpdateVersion: importantVersion)
-            let importantBody = "Release notes\n<!-- keeper-important-update: 1.1.0 -->\nUser-facing changes"
+                importantUpdateVersion: importantVersion, releaseNotes: importantBody)
+            let markerOnlyBody = "  <!-- keeper-important-update: 1.1.0 -->\r\n"
+            var markerOnlyRelease = importantRelease
+            markerOnlyRelease.releaseNotes = markerOnlyBody
             check(parseResponse(releaseResponse("v1.1.1", body: importantBody)) == .release(importantRelease) &&
-                parseResponse(releaseResponse("v1.1.1", body: "  <!-- keeper-important-update: 1.1.0 -->\r\n")) == .release(importantRelease),
+                parseResponse(releaseResponse("v1.1.1", body: markerOnlyBody)) == .release(markerOnlyRelease),
                 "a single standalone canonical marker can carry an earlier important-update threshold into a patch release")
-            let plainRelease = AppRelease(version: importantRelease.version, pageURL: importantRelease.pageURL)
             let invalidBodies = [
                 "Ordinary release notes without a marker",
                 "Text <!-- keeper-important-update: 1.1.0 -->",
@@ -145,9 +147,71 @@ import Darwin
                 "<!-- keeper-important-update: \n1.1.0 -->"
             ]
             for body in invalidBodies {
+                let plainRelease = AppRelease(version: importantRelease.version, pageURL: importantRelease.pageURL, releaseNotes: body)
                 check(parseResponse(releaseResponse("v1.1.1", body: body)) == .release(plainRelease),
                     "an absent, malformed, duplicate or future marker leaves the ordinary release available: \(body)")
             }
+            func notesRelease(_ notes: String) -> AppRelease {
+                AppRelease(version: importantRelease.version, pageURL: importantRelease.pageURL, releaseNotes: notes)
+            }
+            let englishNotes = "## What's New\n- **English** feature.\nA second line.\n\n## Fixes\n- English fix."
+            let chineseNotes = "## 新功能\n- **中文**功能。\n第二行。\n\n## 修复\n- 中文修复。"
+            let bilingualNotes = "<!-- keeper-important-update: 1.1.0 -->\n\n\(englishNotes)\n\n\(chineseNotes)"
+            for locale in ["zh-Hans", "zh-Hant", nil] as [String?] {
+                check(notesRelease(bilingualNotes).displayNotes(localization: locale) == chineseNotes,
+                    "Chinese update windows show the original Chinese sections without metadata: \(locale ?? "default")")
+            }
+            for locale in ["en", "en-US"] {
+                check(notesRelease(bilingualNotes).displayNotes(localization: locale) == englishNotes,
+                    "English update windows show the original English sections: \(locale)")
+            }
+            check(notesRelease(bilingualNotes.replacingOccurrences(of: "\n", with: "\r\n")).displayNotes(localization: "en") == englishNotes,
+                "Windows line endings preserve release-note sections and multiline list items")
+            check(notesRelease(englishNotes).displayNotes(localization: "zh-Hans") == englishNotes &&
+                notesRelease(chineseNotes).displayNotes(localization: "en") == chineseNotes &&
+                notesRelease("## 新功能\n\n\(englishNotes)").displayNotes(localization: "zh-Hans") == englishNotes,
+                "missing or empty translations fall back to actual release notes without rewriting them")
+            for notes in ["", " \r\n ", markerOnlyBody, "<!-- keeper-important-update: 1.1.0 -->\n## 新功能\n\n## 修复\n"] {
+                check(notesRelease(notes).displayNotes(localization: "zh-Hans").isEmpty,
+                    "empty notes and metadata-only releases leave the short fallback explanation available")
+            }
+            let unstructuredNotes = "A release paragraph.\n\n- First item.\n- Second item."
+            check(notesRelease(unstructuredNotes).displayNotes(localization: "en") == unstructuredNotes &&
+                notesRelease("## Notes\n- Available notes.").displayNotes(localization: "zh-Hans") == "## Notes\n- Available notes.",
+                "unsectioned notes and unknown headings remain readable")
+            check(notesRelease("Before <!-- keeper-important-update: 1.0.0 -->\nAfter").displayNotes(localization: "en") == "Before \nAfter",
+                "important-update metadata is hidden even in unstructured display text")
+
+            let notesSuite = "keeper.release-notes.tests." + UUID().uuidString
+            let notesDefaults = UserDefaults(suiteName: notesSuite)!
+            defer { notesDefaults.removePersistentDomain(forName: notesSuite) }
+            var responseNotes = bilingualNotes
+            func notesService() -> AppUpdateService {
+                AppUpdateService(defaults: notesDefaults, currentVersion: "1.0.1", loadResponse: { _ in
+                    releaseResponse("v1.1.1", body: responseNotes)
+                })
+            }
+            let freshNotes = notesService()
+            await freshNotes.checkManually()
+            check(freshNotes.availableRelease?.releaseNotes == bilingualNotes &&
+                notesDefaults.string(forKey: "appUpdateCachedReleaseNotes") == bilingualNotes &&
+                notesService().availableRelease?.displayNotes(localization: "zh-Hans") == chineseNotes,
+                "verified notes are cached with the release and remain localized after restarting")
+            responseNotes = "<!-- keeper-important-update: 1.1.0 -->\n\n## 修复\n- 修订后的说明。"
+            await freshNotes.checkManually()
+            check(notesService().availableRelease?.displayNotes(localization: "zh-Hans") == "## 修复\n- 修订后的说明。",
+                "refreshing the same release updates its cached notes")
+            let failedNotes = AppUpdateService(defaults: notesDefaults, currentVersion: "1.0.1", loadResponse: { _ in throw URLError(.timedOut) })
+            await failedNotes.checkManually()
+            check(failedNotes.availableRelease?.releaseNotes == responseNotes,
+                "a failed check preserves the matching release notes")
+            let missingNotes = AppUpdateService(defaults: notesDefaults, currentVersion: "1.0.1", loadResponse: { _ in releaseResponse(status: 404) })
+            await missingNotes.checkManually()
+            check(missingNotes.availableRelease == nil && notesDefaults.object(forKey: "appUpdateCachedReleaseNotes") == nil,
+                "removing a stable release clears its cached notes")
+            notesDefaults.set(importantRelease.pageURL.absoluteString, forKey: "appUpdateCachedReleaseURL")
+            check(notesService().availableRelease?.releaseNotes == "",
+                "an older URL-only cache remains usable with no manufactured release notes")
             for tag in ["v0.1.4", "v0.1.3"] {
                 let service = AppUpdateService(defaults: updateDefaults, currentVersion: "0.1.4", loadResponse: { _ in releaseResponse(tag) })
                 await service.checkManually()
@@ -439,6 +503,7 @@ import Darwin
             await cachedLimited.checkManually()
             check(cachedLimited.availableRelease?.version == SemanticVersion(tag: "1.1.2") &&
                 cachedLimited.availableRelease?.importantUpdateVersion == nil && cachedLimited.claimImportantUpdatePrompt() == nil &&
+                cachedLimited.availableRelease?.releaseNotes.isEmpty == true &&
                 rateLimitDefaults.object(forKey: "appUpdateCachedImportantVersion") == nil,
                 "a different fallback release never inherits an unverified important marker from an earlier version")
             let retainedFallbackRelease = cachedLimited.availableRelease
@@ -3371,10 +3436,10 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
             "an existing \(count)-point timeline never grows when older history is available")
     }
     let historyTarget = BlockedSession(id: "timeline-limit", project: "Test", cwd: directory.path,
-        blockedAt: at(0), fiveHourResetAt: nil, weeklyResetAt: nil,
+        blockedAt: at(0, days: -1), fiveHourResetAt: nil, weeklyResetAt: nil,
         fileURL: directory.appendingPathComponent("unused.jsonl"))
     let olderResume = ResumeOperation(id: "older", batchID: "older", accountID: "timeline-account", target: historyTarget,
-        actionAt: at(23, 17, days: -1), phase: .continued, respondedAt: at(23, 18, days: -1), protectsThread: false)
+        actionAt: at(0, 7), phase: .continued, respondedAt: at(0, 8), protectsThread: false)
     let latestResume = ResumeOperation(id: "latest", batchID: "latest", accountID: "timeline-account", target: historyTarget,
         actionAt: at(0, 17), phase: .continued, respondedAt: at(0, 18), protectsThread: false)
     for (start, time, count) in [(at(8, 3), at(9), 4), (at(13, 3), at(15), 3), (at(18, 3), at(21), 2)] {
@@ -3588,8 +3653,46 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     var lateConfirmation = MenuPresentation()
     let afterMidnight = render(&lateConfirmation, reading(at(6, 1, days: 1), at: nextMorning), at: nextMorning,
         confirmations: [completed(.keepAlive, at(20, 1))], anchor: 1200, plan: lateResume)
-    check(afterMidnight.timeline.first?.date == at(20, 1) && afterMidnight.timeline.count == 3,
-        "a confirmed prior calendar-day action remains in the active evening-anchor cycle")
+    check(afterMidnight.timeline.map(\.date) == [at(6, 1, days: 1), at(11, 1, days: 1)],
+        "an expired prior-day action stays hidden even inside the current evening-anchor cycle")
+    let storedHistory = try JSONSerialization.jsonObject(with: Data(contentsOf: lateAnchorURL)) as! [String: Any]
+    check((storedHistory["windows"] as? [Any])?.count == 2,
+        "hiding prior-day observations leaves their persisted window history intact")
+
+    var yesterdayResume = latestResume
+    yesterdayResume.actionAt = at(23, 59, 59, days: -1); yesterdayResume.respondedAt = at(0, 1)
+    var midnightResume = olderResume
+    midnightResume.actionAt = at(0); midnightResume.respondedAt = at(0, 1)
+    var midnightHistory = MenuSummary()
+    midnightHistory.applyResumeHistory([yesterdayResume, midnightResume], accountID: "timeline-account", now: at(1))
+    check(midnightHistory.timeline.map(\.date) == [at(0)] && midnightHistory.timeline.first?.operationIDs == [midnightResume.id],
+        "resume history includes local midnight and hides yesterday even when its response arrived today")
+
+    let overnightStart = at(23, 1)
+    let overnightPlan = NextAction(mode: .resume, date: at(4, 1, days: 1), decision: .wait(reason: "等待计划"), note: "等待计划")
+    var overnightPresentation = MenuPresentation()
+    let beforeMidnightAt = at(23, 30)
+    let overnightUsage = reading(overnightStart, at: beforeMidnightAt)
+    _ = render(&overnightPresentation, overnightUsage, at: beforeMidnightAt,
+        confirmations: [completed(.keepAlive, at(18, 1))], plan: overnightPlan)
+    let overnight = render(&overnightPresentation, nil, at: at(0, 1, days: 1),
+        confirmations: [completed(.keepAlive, at(18, 1))], plan: overnightPlan, error: "临时失败", transient: true)
+    check(overnight.timeline.map(\.date) == [overnightStart, at(4, 1, days: 1)] &&
+        overnight.timeline.first?.day == L10n.text("昨天") && overnight.timeline.first?.timeLabel == L10n.text("昨天") + " 23:01",
+        "crossing midnight with a cached reading hides ended history and labels the active origin Yesterday")
+
+    let overnightOperation = ResumeOperation(id: "overnight", batchID: "overnight", accountID: "timeline-account", target: historyTarget,
+        actionAt: overnightStart, phase: .continued, respondedAt: at(23, 2), protectsThread: false)
+    let overnightConfirmation = ExecutionConfirmation(kind: .resume, actionAt: overnightStart,
+        confirmedAt: at(23, 2), windowStart: nil, accountID: "timeline-account", operationID: overnightOperation.id)
+    var overnightConfirmed = MenuPresentation()
+    var confirmedOvernight = render(&overnightConfirmed, reading(overnightStart, at: at(0, 30, days: 1)), at: at(0, 30, days: 1),
+        confirmations: [overnightConfirmation], plan: overnightPlan)
+    confirmedOvernight.applyResumeHistory([overnightOperation], accountID: "timeline-account",
+        confirmations: [overnightConfirmation], now: at(0, 30, days: 1))
+    check(confirmedOvernight.timeline.first?.day == L10n.text("昨天") && confirmedOvernight.timeline.first?.kind == .completedResume &&
+        confirmedOvernight.timeline.first?.operationIDs == [overnightOperation.id],
+        "a still-active yesterday resume origin retains its confirmed label and exact clickable history association")
 
     var continuity = MenuPresentation()
     let before = render(&continuity, usage, at: now, confirmations: confirmations)

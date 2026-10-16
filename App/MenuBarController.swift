@@ -23,7 +23,7 @@ import UserNotifications
     private var updateScheduled = false
     private var menuIsTracking = false
     private var importantUpdatePromptScheduled = false
-    private var showingImportantUpdate = false
+    private let importantUpdateWindow = ImportantUpdateWindowController()
     private var notifiedCurrentPing = false
     private var executionFailureSeen = false
     private var presentation = MenuPresentation(historyURL: FileManager.default
@@ -226,7 +226,7 @@ import UserNotifications
     }
 
     private func scheduleImportantUpdatePrompt() {
-        guard !importantUpdatePromptScheduled, !showingImportantUpdate else { return }
+        guard !importantUpdatePromptScheduled, importantUpdateWindow.window?.isVisible != true else { return }
         importantUpdatePromptScheduled = true
         RunLoop.main.perform(inModes: [.default]) { [weak self] in
             MainActor.assumeIsolated {
@@ -238,14 +238,10 @@ import UserNotifications
     }
 
     private func presentImportantUpdateIfPossible() {
-        guard !menuIsTracking, !showingImportantUpdate, !appState.execution.running,
+        guard !menuIsTracking, importantUpdateWindow.window?.isVisible != true, !appState.execution.running,
               NSApp.modalWindow == nil, !NSApp.windows.contains(where: { $0.attachedSheet != nil }),
               let release = updateService.claimImportantUpdatePrompt() else { return }
-        showingImportantUpdate = true
-        defer { showingImportantUpdate = false }
-        let alert = ImportantUpdateAlert.make(release: release)
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(release.pageURL) }
+        importantUpdateWindow.show(release)
     }
 
     private func makeSummary(running: Bool? = nil) -> MenuSummary {

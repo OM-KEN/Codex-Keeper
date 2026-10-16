@@ -11,8 +11,9 @@
 "下一次 · %@" = "Next · %@";
 "当前额度 · %@" = "Current quota · %@";
 "下一步" = "Next";
+"昨天" = "Yest.";
 "今天" = "Today";
-"明天" = "Tomorrow";
+"明天" = "Tmrw.";
 "次日 " = "Next day ";
 "开始" = "Start";
 "开始使用" = "Get Started";
@@ -260,8 +261,9 @@
 "当前没有稳定版本" = "No stable release is available";
 "检查更新失败，请稍后重试。" = "Could not check for updates. Try again later.";
 "前往 GitHub 更新" = "View Update on GitHub";
-"发现重要更新" = "Important Update Available";
-"Codex Keeper %@ 已发布，建议查看发布说明并更新。" = "Codex Keeper %@ is available. We recommend reviewing the release notes and updating.";
+"重要更新" = "Important Update";
+"此版本包含重要改进或修复，建议查看更新。" = "This version includes important improvements or fixes. We recommend reviewing the update.";
+"查看更新" = "View Update";
 "稍后" = "Later";
 "支持与反馈" = "Support and Feedback";
 "问题反馈…" = "Report an Issue…";
@@ -337,7 +339,7 @@
 
 "%d 个任务等待自动继续" = "%d tasks waiting to continue automatically";
 
-"续跑记录" = "Continuation record";
+"续跑记录" = "Resume log";
 
 "%d 个任务续跑已停止" = "%d continuations stopped";
 
@@ -354,6 +356,6 @@
 
 "需要处理" = "Needs attention";
 
-"窗口开始" = "Window Started";
+"窗口开始" = "Window start";
 
 "已重置" = "Quota Reset";

@@ -1,18 +1,6 @@
 import SwiftUI
 import AppKit
 
-enum ImportantUpdateAlert {
-    @MainActor static func make(release: AppRelease) -> NSAlert {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = L10n.text("发现重要更新")
-        alert.informativeText = L10n.format("Codex Keeper %@ 已发布，建议查看发布说明并更新。", release.version.description)
-        alert.addButton(withTitle: L10n.text("前往 GitHub 更新"))
-        alert.addButton(withTitle: L10n.text("稍后")).keyEquivalent = "\u{1b}"
-        return alert
-    }
-}
-
 struct AboutView: View {
     @ObservedObject var updateService: AppUpdateService
     @State private var showFeedbackOptions = false
