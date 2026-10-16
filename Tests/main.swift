@@ -3370,6 +3370,25 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
         check(shown.timeline.count == count && shown.timeline.first?.date == start,
             "an existing \(count)-point timeline never grows when older history is available")
     }
+    let historyTarget = BlockedSession(id: "timeline-limit", project: "Test", cwd: directory.path,
+        blockedAt: at(0), fiveHourResetAt: nil, weeklyResetAt: nil,
+        fileURL: directory.appendingPathComponent("unused.jsonl"))
+    let olderResume = ResumeOperation(id: "older", batchID: "older", accountID: "timeline-account", target: historyTarget,
+        actionAt: at(23, 17, days: -1), phase: .continued, respondedAt: at(23, 18, days: -1), protectsThread: false)
+    let latestResume = ResumeOperation(id: "latest", batchID: "latest", accountID: "timeline-account", target: historyTarget,
+        actionAt: at(0, 17), phase: .continued, respondedAt: at(0, 18), protectsThread: false)
+    for (start, time, count) in [(at(8, 3), at(9), 4), (at(13, 3), at(15), 3), (at(18, 3), at(21), 2)] {
+        var state = MenuPresentation()
+        var shown = render(&state, reading(start, at: time), at: time)
+        let original = shown.timeline.map(\.date)
+        shown.applyResumeHistory([olderResume, latestResume], accountID: "timeline-account", now: time)
+        check(original.count == count && shown.timeline.count == 4 &&
+            shown.timeline.filter { original.contains($0.date) }.map(\.date) == original,
+            "resume history keeps the \(count)-point current plan intact and the total at four")
+        let expectedIDs: Set<String> = count == 4 ? [] : count == 3 ? [latestResume.id] : [olderResume.id, latestResume.id]
+        check(Set(shown.timeline.flatMap(\.operationIDs)) == expectedIDs,
+            "resume history fills only available slots with the newest batches: \(count) original points")
+    }
     var firstOpen = MenuPresentation()
     let late = render(&firstOpen, reading(at(17, 59), at: at(21)), at: at(21))
     check(late.timeline.map(\.date) == [at(17, 59), at(23)],

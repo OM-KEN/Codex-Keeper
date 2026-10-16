@@ -601,6 +601,7 @@ extension MenuSummary {
                 (operation.receivedAt != nil && operation.endedAt != nil) || (operation.phase == .checking && !operation.protectsThread))
         }.sorted { $0.actionAt > $1.actionAt }.prefix(2)
         for operation in missing {
+            guard timeline.count < 4 else { break }
             guard !timeline.contains(where: { $0.operationIDs.contains(operation.id) }) else { continue }
             timeline.append(MenuTimelinePoint(date: operation.actionAt, time: clock.string(from: operation.actionAt),
                 day: Calendar.current.isDate(operation.actionAt, inSameDayAs: now) ? "" : day.string(from: operation.actionAt),
