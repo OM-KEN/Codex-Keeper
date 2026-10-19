@@ -31,7 +31,7 @@ struct MenuSummaryView: View {
                 Button(action: showError) {
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                        Text(L10n.text(summary.error)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                        Text(L10n.text(summary.error)).fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
                         Image(systemName: "chevron.right").font(.system(size: 9))
                     }
                     .font(.system(size: 11)).foregroundStyle(.red)

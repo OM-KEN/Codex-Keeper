@@ -121,12 +121,14 @@ final class UsageObserver: ObservableObject {
     }
 
     func refresh(manual: Bool = false, source: String = "manual", critical: Bool = false) {
-        let trigger = manual || critical ? source : "automatic"
+        let trigger = manual || critical || source != "manual" ? source : "automatic"
         if critical { criticalRefreshPending = true }
         guard !refreshing else {
-            if manual {
-                pendingManualSource = source
-                refreshMessage = L10n.text("正在同步，完成后重新读取…")
+            if manual || critical {
+                if manual {
+                    pendingManualSource = source
+                    refreshMessage = L10n.text("正在同步，完成后重新读取…")
+                }
                 appendLogEntry(["event": "usage_refresh_queued", "trigger": trigger,
                     "request_id": requestID ?? "", "logged_at": ISO8601DateFormatter().string(from: Date())])
             }
@@ -138,8 +140,8 @@ final class UsageObserver: ObservableObject {
         let id = UUID().uuidString
         requestID = id
         let started = ProcessInfo.processInfo.systemUptime
-        if manual {
-            refreshMessage = L10n.text("正在刷新额度…")
+        if manual || critical {
+            if manual { refreshMessage = L10n.text("正在刷新额度…") }
             appendLogEntry(["event": "usage_refresh_started", "trigger": trigger,
                 "request_id": id, "logged_at": ISO8601DateFormatter().string(from: Date())])
         }
@@ -156,7 +158,7 @@ final class UsageObserver: ObservableObject {
             }.value
             if let failure = result.2, manual || !failure.sameFailure(as: lastReadFailure) {
                 var entry: [String: Any] = ["event": "usage_read_failed", "logged_at": ISO8601DateFormatter().string(from: Date()),
-                    "reason": failure.reason, "trigger": manual ? "manual" : "automatic",
+                    "reason": failure.reason, "trigger": trigger,
                     "request_stage": failure.requestStage, "cooldown": failure.cooldown, "elapsed_ms": failure.elapsedMilliseconds]
                 if let attempted = failure.rpcAttempted { entry["rpc_attempted"] = attempted }
                 appendLogEntry(entry)
@@ -176,7 +178,7 @@ final class UsageObserver: ObservableObject {
                 let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
                 refreshMessage = result.1 == nil ? L10n.format("已更新 · %@", clock.string(from: Date())) : L10n.text("刷新失败，请点击刷新按钮重试。")
             }
-            if manual {
+            if manual || critical {
                 appendLogEntry(["event": "usage_refresh_finished", "trigger": trigger,
                     "request_id": id, "logged_at": ISO8601DateFormatter().string(from: Date()),
                     "elapsed_ms": Int((ProcessInfo.processInfo.systemUptime - started) * 1000),

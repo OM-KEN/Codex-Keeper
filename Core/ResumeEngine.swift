@@ -104,7 +104,7 @@ final class OwnedSessionResumeTransport: ResumeTransport {
         do { turnID = try connection.start(threadID: target.id, prompt: prompt, owner: owner) }
         catch {
             if let error = error as? ResumeSubmissionError, !error.mayHaveSubmitted { cancel(); throw error }
-            update(.unknown(error.localizedDescription)); connection.cancel(); try? file.close()
+            update(.unknown(CodexConnectionError.diagnosticDescription(for: error))); connection.cancel(); try? file.close()
             update(.observationEnded); return
         }
         update(.received(ResumeReceipt(threadID: target.id, turnID: turnID, message: L10n.text("已接收")), Date()))
@@ -118,10 +118,11 @@ final class OwnedSessionResumeTransport: ResumeTransport {
                 do {
                     let data = try file.read(upToCount: 65536) ?? Data()
                     if try monitor.consume(data) { update(.responded(turnID, monitor.responseAt ?? Date())); return }
+                    if let terminal = monitor.terminal { update(.ended(turnID, terminal, nil, Date())); return }
                     if data.isEmpty { Thread.sleep(forTimeInterval: min(0.25, observationSeconds)) }
                 } catch {
-                    if let terminal = monitor.terminal { update(.ended(turnID, terminal, error.localizedDescription, Date())) }
-                    else { update(.unknown(error.localizedDescription)) }
+                    if let terminal = monitor.terminal { update(.ended(turnID, terminal, CodexConnectionError.diagnosticDescription(for: error), Date())) }
+                    else { update(.unknown(CodexConnectionError.diagnosticDescription(for: error))) }
                     return
                 }
             }
@@ -153,11 +154,12 @@ struct ResumeTurnMonitor {
                 terminal = ResumeModelActivity.quotaError(String(describing: payload)) ? .quotaStopped : .failed
                 throw CodexConnectionError.server(message)
             }
-            if type == "task_complete", let error = payload["error"] {
+            if type == "task_complete", let error = payload["error"], !(error is NSNull) {
                 terminal = ResumeModelActivity.quotaError(String(describing: error)) ? .quotaStopped : .failed
                 throw CodexConnectionError.server((error as? [String: Any])?["message"] as? String ?? "续跑未完成")
             }
-            if ResumeModelActivity.rollout(row) || (type == "task_complete" && eventTurn == turnID) {
+            if type == "task_complete" { terminal = .completed }
+            if ResumeModelActivity.rollout(row) {
                 responseAt = UsageDecoder.timestamp(row["timestamp"] as? String) ?? Date()
                 if type == "task_complete" { terminal = .completed }
                 return true
@@ -211,7 +213,7 @@ final class AppServerResumeTransport: ResumeTransport {
             update(.received(ResumeReceipt(threadID: target.id, turnID: id, message: L10n.text("已接收")), Date()))
         } catch {
             if let error = error as? ResumeSubmissionError, !error.mayHaveSubmitted { cancel(); throw error }
-            update(.unknown(error.localizedDescription))
+            update(.unknown(CodexConnectionError.diagnosticDescription(for: error)))
         }
         let initialTurn = turnID; let initialUptime = receivedUptime
         let submissionRequestID = client.lastSubmissionRequestID
@@ -232,8 +234,8 @@ final class AppServerResumeTransport: ResumeTransport {
                 do { message = replay.isEmpty ? try client.nextMessage(timeout: min(1, max(0.01, observationSeconds))) : replay.removeFirst() }
                 catch CodexConnectionError.timeout { continue }
                 catch CodexConnectionError.ended {
-                    cancel(); update(.ended(turnID, .disconnected, L10n.text("确认中"), Date())); return
-                } catch { if !awaiting { awaiting = true; update(.unknown(error.localizedDescription)) }; Thread.sleep(forTimeInterval: 0.25); continue }
+                    cancel(); update(.ended(turnID, .disconnected, L10n.text("正在确认中"), Date())); return
+                } catch { if !awaiting { awaiting = true; update(.unknown(CodexConnectionError.diagnosticDescription(for: error))) }; Thread.sleep(forTimeInterval: 0.25); continue }
                 // A late RPC reply still belongs to the only content request on this connection.
                 if turnID == nil, message["method"] == nil, let submissionRequestID, message["id"] as? Int == submissionRequestID,
                    let result = message["result"] as? [String: Any], let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String {
@@ -247,7 +249,7 @@ final class AppServerResumeTransport: ResumeTransport {
                 }
                 if turnID == nil, message["method"] == nil, let submissionRequestID, message["id"] as? Int == submissionRequestID,
                    let error = message["error"] as? [String: Any] {
-                    cancel(); update(.notSubmitted(CodexConnectionError.server(error["message"] as? String ?? "Codex 请求失败").localizedDescription)); return
+                    cancel(); update(.notSubmitted(CodexConnectionError.diagnosticDescription(for: CodexConnectionError.server(error["message"] as? String ?? "Codex 请求失败")))); return
                 }
                 guard let method = message["method"] as? String, let params = message["params"] as? [String: Any],
                       (params["threadId"] ?? params["thread_id"]) as? String == target.id else { continue }
@@ -277,11 +279,10 @@ final class AppServerResumeTransport: ResumeTransport {
                 }
                 if method == "error", (params["willRetry"] ?? params["will_retry"]) as? Bool == true { continue }
                 if method == "turn/completed", let turn, let status = turn["status"] as? String {
-                    let error = turn["error"].map { String(describing: $0) }
+                    let error = turn["error"].flatMap { $0 is NSNull ? nil : String(describing: $0) }
                     let terminal: ResumeTerminal = manual ? .manualRequired : ResumeModelActivity.quotaError(error ?? "") ? .quotaStopped :
-                        status == "completed" ? .completed : status == "interrupted" ? .aborted : .failed
+                        error != nil ? .failed : status == "completed" ? .completed : status == "interrupted" ? .aborted : .failed
                     cancel()
-                    if !responded && terminal == .completed { update(.responded(id, Date())) }
                     update(.ended(id, terminal, error, Date())); return
                 }
             }
@@ -335,22 +336,59 @@ struct ResumePreflight {
     let usage: UsageSnapshot
     let session: SessionActivity
 
-    static func read(target: BlockedSession, provider: UsageProvider, codexHome: URL = CodexEnvironment.home) throws -> ResumePreflight {
-        var directory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: target.cwd, isDirectory: &directory), directory.boolValue,
-              !target.fileURL.pathComponents.contains("archived_sessions"),
-              let session = SessionWatcher.parse(url: target.fileURL, mtime: Date()), session.id == target.id,
-              !session.isSubagent,
-              (session.lastUserMessageAt ?? .distantPast) <= target.blockedAt,
-              (session.lastTaskStartedAt ?? .distantPast) <= target.blockedAt,
-              (session.lastAbortedAt ?? .distantPast) <= target.blockedAt,
-              (session.lastAssistantMessageAt ?? .distantPast) <= target.blockedAt,
-              !session.taskRunning else { throw CodexConnectionError.server("原任务已继续、被归档或工作目录已改变，取消续跑") }
-        let usage = try provider.read()
-        let blocked = try SessionWatcher.freshBlockedSessions(codexHome: codexHome, watchedIDs: [target.id])
-        guard blocked.contains(where: { target.matchesPause($0) }) else {
-            throw CodexConnectionError.server("原任务的额度停止记录已变化，取消续跑")
+    static func sessionBlockers(target: BlockedSession, session: SessionActivity?, stage: ResumePreflightDiagnostic.Stage) -> [ResumePreflightReason] {
+        var reasons: [ResumePreflightReason] = []
+        if stage == .sessionCheck {
+            var directory: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: target.cwd, isDirectory: &directory) || !directory.boolValue { reasons.append(.workspaceUnavailable) }
+            if target.fileURL.pathComponents.contains("archived_sessions") { reasons.append(.archived) }
         }
-        return ResumePreflight(usage: usage, session: session)
+        guard let session else { return reasons + [.sessionUnreadable] }
+        if session.id != target.id { reasons.append(.threadChanged) }
+        if stage == .sessionCheck, session.isSubagent { reasons.append(.subagent) }
+        if stage == .beforeSend, session.cwd != target.cwd { reasons.append(.workspaceChanged) }
+        if (session.lastUserMessageAt ?? .distantPast) > target.blockedAt { reasons.append(.userInputAfterPause) }
+        if (session.lastTaskStartedAt ?? .distantPast) > target.blockedAt { reasons.append(.taskStartedAfterPause) }
+        if (session.lastAbortedAt ?? .distantPast) > target.blockedAt { reasons.append(.taskAbortedAfterPause) }
+        if (session.lastAssistantMessageAt ?? .distantPast) > target.blockedAt { reasons.append(.modelResponseAfterPause) }
+        if session.taskRunning { reasons.append(.taskRunning) }
+        return reasons
+    }
+
+    static func quotaBlockers(target: BlockedSession, usage: UsageSnapshot, accountID: String?, now: Date, manual: Bool) -> [ResumePreflightReason] {
+        var reasons: [ResumePreflightReason] = []
+        let accountKnown = accountID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let observedKnown = usage.accountID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if !accountKnown || usage.accountID != accountID {
+            reasons.append(accountKnown && observedKnown && usage.isFresh(at: now) ? .accountChanged : .accountUnconfirmed)
+        }
+        if !usage.isFresh(at: now) { reasons.append(.usageNotFresh) }
+        if usage.capturedAt <= target.blockedAt { reasons.append(.usageBeforePause) }
+        if usage.fiveHour == nil && usage.weekly == nil { reasons.append(.quotaMissing) }
+        if target.fiveHourResetAt != nil && usage.fiveHour == nil { reasons.append(.fiveHourMissing) }
+        if target.weeklyResetAt != nil && usage.weekly == nil { reasons.append(.weeklyMissing) }
+        if !((usage.fiveHour?.usedPercent ?? 0) < 100) { reasons.append(.fiveHourExhausted) }
+        if !((usage.weekly?.usedPercent ?? 0) < 100) { reasons.append(.weeklyExhausted) }
+        if !manual, target.retryQuota?.provesRecovery(usage, after: target.blockedAt) == false { reasons.append(.recoveryUnconfirmed) }
+        return reasons
+    }
+
+    static func read(target: BlockedSession, provider: UsageProvider, codexHome: URL = CodexEnvironment.home, worker: SessionScanWorker? = nil, now: () -> Date = Date.init) throws -> ResumePreflight {
+        let session = SessionWatcher.parse(url: target.fileURL, mtime: now())
+        let reasons = sessionBlockers(target: target, session: session, stage: .sessionCheck)
+        if !reasons.isEmpty { throw ResumePreflightDiagnostic(stage: .sessionCheck, reasons: reasons, target: target, checkedAt: now()) }
+        let usage: UsageSnapshot
+        let started = ProcessInfo.processInfo.systemUptime
+        do { usage = try provider.read() }
+        catch { throw ResumePreflightDiagnostic(stage: .usageRead, reasons: [.preparationFailed], target: target, checkedAt: now(),
+            failure: UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - started)) }
+        let blocked: [BlockedSession]
+        do { blocked = try SessionWatcher.freshBlockedSessions(codexHome: codexHome, watchedIDs: [target.id], worker: worker) }
+        catch { throw ResumePreflightDiagnostic(stage: .sessionScan, reasons: [.sessionScanFailed], target: target, checkedAt: now(), usage: usage,
+            failure: UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - started)) }
+        guard blocked.contains(where: { target.matchesPause($0) }) else {
+            throw ResumePreflightDiagnostic(stage: .pauseCheck, reasons: [.pauseChanged], target: target, checkedAt: now(), usage: usage)
+        }
+        return ResumePreflight(usage: usage, session: session!)
     }
 }

@@ -30,9 +30,19 @@ import SQLite3
     check(activity.taskRunning && BlockedSessionDetector.detect(in: [activity]).isEmpty,
         "retrying quota error retains running state and cannot create a pause")
     let target = BlockedSession(id: id, project: "Test", cwd: root.path, blockedAt: Date().addingTimeInterval(-5), fiveHourResetAt: nil, weeklyResetAt: nil, fileURL: file)
+    try await checkResumeEvidenceAudit(root.appendingPathComponent("evidence-audit"), check)
+    try await checkResumeEvidenceBoundaries(root.appendingPathComponent("evidence-boundaries"), check)
+    try await checkResumePreflightAudit(root.appendingPathComponent("preflight-audit"), check)
+    try await checkPreparationFailureStages(root.appendingPathComponent("preparation-stages"), check)
+    try await checkResumeAppBlockers(root.appendingPathComponent("resume-app-blockers"), check)
+    try checkActionableMessageBoundaries(target, check)
+    checkConfirmationPresentation(target, check)
     try await checkResumeTransportLifecycle(target, check)
     try await checkResumeCoordinator(root.appendingPathComponent("coordinator"), check)
     try await checkResumePingAdmission(root.appendingPathComponent("ping-admission"), check)
+    try await checkResumeSelectionKeepAlive(root.appendingPathComponent("selection-keepalive"), check)
+    try await checkPingPreflightDiagnostics(root.appendingPathComponent("ping-preflight"), check)
+    try await checkResumePresentationPreflight(root.appendingPathComponent("presentation-preflight"), check)
     try await checkResumeRecoveryAdmission(root.appendingPathComponent("recovery-admission"), check)
     try await checkResumeIdentitySynchronization(root.appendingPathComponent("identity-sync"), check)
     try await checkResumeCurrentPauseRows(root.appendingPathComponent("current-pause"), check)
@@ -531,16 +541,172 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
     usage.pauseModel(); prefs.set(true, forKey: "enabled"); state.recompute(allowExecution: false)
     let target = state.availableTasks.first!
     let pending = state.choices.recoveryDecisions?[target.episodeKey]
-    coordinator.ping(schedule: state.schedule, accountID: state.displayAccountID, ignoredEpisodes: [target.episodeKey], ignoredTargets: [target], hasPending: { false })
+    coordinator.ping(schedule: state.schedule, accountID: state.displayAccountID, ignoredEpisodes: [target.episodeKey], ignoredTargets: [target], blockers: { [] })
     try await resumeWait { usage.modelReadCount > 0 && coordinator.running }
     state.resolveRecoveryDecision(.now, for: [target])
     check(pending != nil && state.choices.recoveryDecisions?[target.episodeKey] == pending && transports.isEmpty,
         "a now choice during keep-alive remains actionable instead of being consumed without submission")
     usage.releaseModel(); try await resumeWait { !coordinator.running }
-    state.resolveRecoveryDecision(.now, for: [target]); try await resumeWait { transports.first?.submitted == true }
+    state.resolveRecoveryDecision(.now, for: [target]); try await resumeWait { transports.first?.submitted == true && coordinator.latestOperation(for: target, accountID: state.displayAccountID)?.receivedAt != nil }
     check(coordinator.hasAttempted(target) && coordinator.latestOperation(for: target, accountID: state.displayAccountID)?.receivedAt != nil && transports.count == 1,
         "the preserved choice starts exactly once when keep-alive releases admission")
     transports[0].respond(); transports[0].finish(); try await resumeWait { !coordinator.hasBusyTasks }
+}
+
+@MainActor func checkResumeSelectionKeepAlive(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    let calendar = Calendar.current
+    let node = calendar.date(bySettingHour: 13, minute: 0, second: 0, of: Date())!
+    for scenario in ["deselected", "reselected", "new-pause", "auto-off", "auto-on", "auto-off-new-pause"] {
+        let directory = root.appendingPathComponent(scenario).resolvingSymlinksInPath()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); try resumeDatabase(directory)
+        var clock = node.addingTimeInterval(-300)
+        let first = try resumeFixture(root: directory, stop: clock.addingTimeInterval(-60), turn: "first-stop")
+        _ = try resumeFixture(root: directory, stop: clock.addingTimeInterval(-60), turn: "second-stop")
+        let suite = "keeper.selection-keepalive." + UUID().uuidString
+        let prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        prefs.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "ask", "dailyAnchorMinutes": 780, "resumeWorkspaceReminder": false])
+        var quota = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
+            capturedAt: clock, accountID: "selection-account", sourceFile: "app-server", zeroUseWindowActive: false)
+        let usage = RecoveryTestUsage(snapshot: quota); let pings = ReminderTestPing()
+        var transports: [ResumeTestTransport] = []
+        let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: {
+            let transport = ResumeTestTransport(); transports.append(transport); return transport
+        }, defaults: prefs, ledgerURL: directory.appendingPathComponent("support/resume-attempts.json"), pingTransport: pings, codexHome: directory, now: { clock })
+        let runtime = directory.appendingPathComponent("support/runtime.json")
+        try resumePendingChoice(first, account: "selection-account", runtime: runtime)
+        let state = AppState(provider: usage, defaults: prefs, runtimeURL: runtime, codexHome: directory, execution: coordinator, startMonitoring: false, now: { clock })
+        state.refresh(manual: true); try await resumeWait { state.availableTasks.count == 2 && !state.usage.refreshing }
+        let tasks = [state.availableTasks.first { $0.id == first.id }!, state.availableTasks.first { $0.id != first.id }!]
+        if scenario.hasPrefix("auto-") {
+            prefs.set(false, forKey: "autoResume"); state.recompute(allowExecution: false)
+            try await resumeWait { !state.usage.refreshing }; state.recompute(allowExecution: false)
+            check(state.selectedTasks.count == 2 && state.choices.recoveryDecisions?[first.episodeKey] != nil,
+                "global auto-resume off preserves task selection and recovery choice: \(scenario)")
+            prefs.set(true, forKey: "autoResume"); state.recompute(allowExecution: false)
+            try await resumeWait { !state.usage.refreshing }; state.recompute(allowExecution: false)
+            check(state.nextAction?.mode == .resume && state.selectedTasks.count == 2 && state.choices.recoveryDecisions?[first.episodeKey] != nil,
+                "re-enabling auto-resume restores the original continuation plan and pending choice: \(scenario)")
+            prefs.set(false, forKey: "autoResume"); state.recompute(allowExecution: false)
+            try await resumeWait { !state.usage.refreshing }; state.recompute(allowExecution: false)
+        } else {
+            state.setSelected(tasks[0], false)
+            check(state.nextAction?.mode == .resume && state.selectedTasks.count == 1,
+                "one deselected task leaves the other continuation plan intact: \(scenario)")
+            state.setSelected(tasks[1], false)
+            check(state.availableTasks.count == 2 && state.selectedTasks.isEmpty && state.choices.keepAliveEpisodes.isEmpty,
+                "task switches retain both tasks for later reselection: \(scenario)")
+            state.setSelected(tasks[1], true)
+            check(state.nextAction?.mode == .resume && state.selectedTasks.map(\.episodeKey) == [tasks[1].episodeKey],
+                "reselection restores only that task's continuation: \(scenario)")
+            state.setSelected(tasks[1], false)
+        }
+        check(state.nextAction?.mode == .keepAlive && state.nextAction?.date == node,
+            "no enabled continuation retains the next scheduled keep-alive: \(scenario)")
+        let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
+        let choices = try JSONDecoder().decode(ResumeChoices.self, from: JSONSerialization.data(withJSONObject: saved["choices"]!))
+        check(choices == state.choices, "keep-alive plan persists existing task choices without cancelling them: \(scenario)")
+
+        usage.pauseModel(); clock = node; quota.capturedAt = clock; quota.fiveHour?.resetsAt = node.addingTimeInterval(18000)
+        usage.set(quota); state.usage.refresh()
+        try await resumeWait { usage.modelReadCount > 0 && coordinator.running }
+        check(coordinator.running, "real coordinator prepares scheduled keep-alive: \(scenario)")
+        if scenario == "reselected" { state.setSelected(tasks[1], true) }
+        if scenario == "auto-on" { prefs.set(true, forKey: "autoResume"); state.recompute(allowExecution: false) }
+        if scenario.hasSuffix("new-pause") { _ = try resumeFixture(root: directory, stop: clock.addingTimeInterval(-1), turn: "new-stop") }
+        usage.releaseModel(); try await resumeWait { !coordinator.running }
+        let shouldPing = scenario == "deselected" || scenario == "auto-off"
+        check(pings.count == (shouldPing ? 1 : 0) && coordinator.confirmations.filter { $0.kind == .keepAlive }.count == (shouldPing ? 1 : 0),
+            "send-time task protection permits only the unchanged keep-alive snapshot: \(scenario)")
+        if scenario == "auto-on" {
+            try await resumeWait { !state.usage.refreshing }; state.recompute()
+            try await resumeWait { transports.first?.submitted == true }
+            check(transports.count == 1 && !coordinator.hasAttempted(tasks[0]) && coordinator.hasAttempted(tasks[1]),
+                "re-enabling auto-resume continues only the selected task without a pending recovery choice")
+        } else {
+            check(transports.isEmpty && tasks.allSatisfy { !coordinator.hasAttempted($0) },
+                "keep-alive never resumes a task or creates a continuation attempt: \(scenario)")
+        }
+        for transport in transports { transport.respond(); transport.finish() }
+        try await resumeWait { !coordinator.hasBusyTasks }
+    }
+
+    let task = BlockedSession(id: "fact", project: "Fact", cwd: root.path, blockedAt: node.addingTimeInterval(-60),
+        fiveHourResetAt: nil, weeklyResetAt: nil, fileURL: root.appendingPathComponent("fact.jsonl"))
+    check(ResumeTaskFact.make(task: task, operation: nil).text == L10n.text("等待自动继续"),
+        "normal task waiting status omits paused wording")
+    check(ResumeTaskFact.make(task: task, operation: nil, selected: false).text == L10n.text("已暂停，自动续跑已关闭") &&
+        ResumeTaskFact.make(task: task, operation: nil, cancelled: true).text == L10n.text("已取消本次自动继续"),
+        "deselected and cancelled tasks do not promise automatic continuation")
+    let stopped = ResumeOperation(id: "stopped", batchID: "batch", accountID: "selection-account", target: task,
+        actionAt: node, phase: .stopped, terminal: .quotaStopped, protectsThread: false)
+    check(ResumeTaskFact.make(task: task, operation: stopped, enabled: false).text == L10n.text("已暂停，Keeper 已停用") &&
+        ResumeTaskFact.make(task: task, operation: stopped, autoResume: false).text == L10n.text("已暂停，自动续跑已关闭"),
+        "a quota-stopped operation cannot claim automatic waiting while Keeper or auto-resume is off")
+    var active = stopped; active.phase = .sending
+    check(ResumeTaskFact.make(task: task, operation: active, enabled: false, autoResume: false, selected: false).text == L10n.text("正在确认中"),
+        "real sending facts retain priority over future automatic switches")
+    active.phase = .confirming
+    check(ResumeTaskFact.make(task: task, operation: active, enabled: false, autoResume: false, selected: false).text == L10n.text("正在确认中"),
+        "real confirmation facts retain priority over future automatic switches")
+    active.respondedAt = node
+    check(ResumeTaskFact.make(task: task, operation: active, enabled: false, autoResume: false, selected: false).text.contains(L10n.text("已继续")),
+        "confirmed continuation facts retain priority over future automatic switches")
+    var choices = ResumeChoices(); choices.requestRecoveryDecision(for: task, now: node); choices.deselectedEpisodes.insert(task.episodeKey)
+    var summary = MenuSummary()
+    summary.applyResumeTasks(operations: [], pending: [task], choices: choices)
+    check(summary.tasks == [L10n.format("%d 个任务已关闭自动继续", 1)] && !summary.tasksNeedAttention,
+        "deselected tasks remain accessible without claiming waiting or requiring a choice")
+    summary.applyRecoveryReminder(tasks: [task], choices: choices)
+    check(summary.reminderTitle.isEmpty, "deselected recovery choices do not request user action")
+    choices.deselectedEpisodes.remove(task.episodeKey)
+    summary.applyRecoveryReminder(tasks: [task], choices: choices)
+    check(!summary.reminderTitle.isEmpty, "reselecting restores a saved recovery choice")
+    for (enabled, autoResume) in [(false, true), (true, false)] {
+        var presentation = MenuPresentation()
+        let menu = presentation.build(plan: nil, usage: nil, schedule: ScheduleEngine(anchorMinutes: 780), tasks: [task],
+            availableTasks: [task], choices: choices, enabled: enabled, autoResume: autoResume, now: node)
+        check(menu.reminderTitle.isEmpty, "disabled Keeper or auto-resume suppresses recovery reminders: \(enabled), \(autoResume)")
+        summary.applyResumeTasks(operations: [], pending: [task], choices: choices, enabled: enabled, autoResume: autoResume)
+        check(summary.tasks == [L10n.format(enabled ? "%d 个任务已关闭自动继续" : "%d 个任务已暂停自动继续", 1)] && !summary.tasksNeedAttention,
+            "task summary reflects disabled Keeper or auto-resume instead of waiting: \(enabled), \(autoResume)")
+    }
+    var manual = stopped; manual.phase = .manualRequired; manual.terminal = .manualRequired; manual.endedAt = node
+    var disabled = MenuSummary(headline: "已停用")
+    disabled.applyResumeTasks(operations: [manual], pending: [], choices: ResumeChoices(), enabled: false)
+    check(disabled.headline == "已停用" && disabled.statusSymbol == "pause.circle" && disabled.taskCount == 1,
+        "a manual continuation record remains accessible without replacing the disabled primary state")
+
+    let retryRoot = root.appendingPathComponent("retry-explanation").resolvingSymlinksInPath()
+    try FileManager.default.createDirectory(at: retryRoot, withIntermediateDirectories: true); try resumeDatabase(retryRoot)
+    let clock = node.addingTimeInterval(-300)
+    let retryTask = try resumeFixture(root: retryRoot, stop: clock.addingTimeInterval(-60))
+    let retry = ResumeOperation(id: "retry", batchID: "retry", accountID: "selection-account", target: retryTask,
+        actionAt: clock, phase: .notSubmitted, failure: "preflight failed", protectsThread: false, manual: false)
+    let ledger = retryRoot.appendingPathComponent("support/resume-attempts.json")
+    try FileManager.default.createDirectory(at: ledger.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode([retry]))
+    try JSONSerialization.data(withJSONObject: ["version": 1, "keys": [], "operations": encoded]).write(to: ledger)
+    let suite = "keeper.retry-explanation." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": true, "autoResume": true, "dailyAnchorMinutes": 780])
+    let usage = RecoveryTestUsage(snapshot: UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: node.addingTimeInterval(18000)),
+        weekly: nil, capturedAt: clock, accountID: "selection-account", sourceFile: "app-server", zeroUseWindowActive: false))
+    let coordinator = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: ledger, codexHome: retryRoot, now: { clock })
+    let state = AppState(provider: usage, defaults: prefs, runtimeURL: retryRoot.appendingPathComponent("support/runtime.json"), codexHome: retryRoot,
+        execution: coordinator, startMonitoring: false, now: { clock })
+    state.refresh(); try await resumeWait { state.availableTasks.count == 1 && !state.usage.refreshing }
+    let current = state.availableTasks.first!
+    check(state.planExplanation(for: current) == L10n.text("条件恢复后自动重试"), "enabled automatic preflight failure retains its retry explanation")
+    state.setSelected(current, false)
+    check(state.planExplanation(for: current) == nil, "deselected task cannot promise automatic retry")
+    state.setSelected(current, true)
+    for key in ["autoResume", "enabled"] {
+        prefs.set(false, forKey: key)
+        check(state.planExplanation(for: current) == nil, "disabled \(key) cannot promise automatic retry")
+        prefs.set(true, forKey: key)
+        check(state.planExplanation(for: current) == L10n.text("条件恢复后自动重试"), "restoring \(key) restores the saved retry explanation")
+    }
 }
 
 @MainActor private func checkResumeCurrentPauseRows(_ root: URL, _ check: (Bool, String) -> Void) async throws {
@@ -871,7 +1037,7 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
     try await resumeWait { state.currentOperations.first?.needsManualContinuation == true }
     let operation = state.currentOperations.first!
     let fact = ResumeTaskFact.make(task: target, operation: operation)
-    check(fact.text == L10n.text("发送失败，请到 Codex 手动继续") && operation.respondedAt == nil && coordinator.confirmations.isEmpty,
+    check(fact.text == L10n.text("需要手动继续，请到 Codex 查看原任务。") && operation.respondedAt == nil && coordinator.confirmations.isEmpty,
         "manual stop before actual startup shows failed sending without inventing continued time")
     var menu = MenuSummary(headline: "23:06", action: "保持活动", isTime: true)
     menu.applyResumeTasks(operations: state.currentOperations, pending: state.availableTasks, choices: state.choices)
@@ -1021,4 +1187,669 @@ func resumeTestAttemptKeys(_ url: URL) throws -> [String] {
     let envelope = try JSONSerialization.jsonObject(with: data) as! [String: Any]
     let operations = try JSONDecoder().decode([ResumeOperation].self, from: JSONSerialization.data(withJSONObject: envelope["operations"]!))
     return (envelope["keys"] as? [String] ?? []) + operations.filter { $0.phase != .preparing && $0.phase != .notSubmitted }.map { $0.target.episodeKey }
+}
+
+@MainActor private func checkPingPreflightDiagnostics(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    let scenarios: [(String, Int, [String])] = [
+        ("generation", 1, ["generation_changed"]), ("disabled", 1, ["disabled"]), ("anchor", 1, ["anchor_changed"]),
+        ("account", 1, ["account_changed"]), ("missing-account", 1, ["account_unconfirmed"]), ("empty-account", 1, ["account_unconfirmed"]), ("stale-account", 1, ["account_unconfirmed"]),
+        ("generation", 2, ["generation_changed"]), ("disabled", 2, ["disabled"]), ("anchor", 2, ["anchor_changed"]),
+        ("pause", 2, ["new_pause"]), ("stale", 2, ["usage_not_fresh"]), ("future", 2, ["usage_not_fresh"]),
+        ("timezone", 2, ["timezone_changed"]), ("expired", 2, ["opportunity_expired"]),
+        ("drift-expired", 2, ["opportunity_expired"]), ("node", 2, ["node_changed"]),
+        ("mixed-hard", 1, ["critical_refresh", "account_changed"]),
+        ("multiple", 2, ["critical_refresh", "codex_task_running", "generation_changed", "disabled", "anchor_changed", "usage_not_fresh"])
+    ] + ["runtime_unhealthy", "sessions_unscanned", "session_scan_failed", "critical_refresh", "keeper_busy", "codex_task_running", "task_selection_changed", "app_state_unavailable"].flatMap { reason in
+        [(reason, 1, [reason]), (reason, 2, [reason])]
+    }
+    for (name, stage, expected) in scenarios {
+        let directory = root.appendingPathComponent("\(name)-\(stage)")
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("sessions"), withIntermediateDirectories: true)
+        try resumeDatabase(directory)
+        let suite = "keeper.preflight." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        prefs.register(defaults: ["enabled": true, "dailyAnchorMinutes": 480])
+        var schedule = ScheduleEngine(anchorMinutes: 480)
+        let nodes = schedule.nodes(on: Date())
+        let node = name == "drift-expired" ? nodes[1] : nodes[0]
+        if name == "drift-expired" {
+            schedule.accountID = "preflight-secret-account"
+            schedule.confirmedWindows = [KeepAliveWindowEvidence(accountID: "preflight-secret-account", node: nodes[0], windowReset: node.addingTimeInterval(90),
+                confirmedAt: nodes[0].addingTimeInterval(90), anchorMinutes: 480, timeZoneID: schedule.timeZoneID)]
+        }
+        let opportunity = schedule.keepAliveOpportunities(at: node).first { $0.node == node }!
+        var clock = name.hasSuffix("expired") ? opportunity.deadline.addingTimeInterval(-0.5) : node.addingTimeInterval(name == "node" ? 1 : 10)
+        let started = clock
+        func idle() -> UsageSnapshot {
+            UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
+                capturedAt: clock, accountID: "preflight-secret-account", sourceFile: "app-server", zeroUseWindowActive: false)
+        }
+        var before = idle()
+        if name == "account" || name == "stale-account" { before.accountID = "other-secret-account" }
+        if name == "stale-account" { before.capturedAt = clock.addingTimeInterval(-61) }
+        if name == "missing-account" { before.accountID = nil }
+        if name == "empty-account" { before.accountID = " " }
+        let usage = RecoveryTestUsage(snapshot: before)
+        let pings = ReminderTestPing()
+        let ledger = directory.appendingPathComponent("support/attempts.json")
+        let coordinator = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: ledger, pingTransport: pings, codexHome: directory, now: { clock })
+        let state = name == "critical_refresh" && stage == 1 ? AppState(provider: usage, defaults: prefs,
+            runtimeURL: directory.appendingPathComponent("support/runtime.json"), codexHome: directory, execution: coordinator, startMonitoring: false, now: { clock }) : nil
+        if name == "pause" { _ = try resumeFixture(root: directory, stop: started.addingTimeInterval(-1)) }
+        if name == "timezone" { schedule.timeZoneID = "fixture-other-timezone" }
+        var calls = 0
+        var recovered = false
+        let blockers: () -> [PingPreflightReason] = {
+            calls += 1
+            guard !recovered, calls == stage else { return [] }
+            switch name {
+            case "generation": coordinator.cancelCurrent()
+            case "disabled": prefs.set(false, forKey: "enabled"); return []
+            case "anchor": prefs.set(481, forKey: "dailyAnchorMinutes")
+            case "stale": clock = before.capturedAt.addingTimeInterval(60.001)
+            case "future": clock = before.capturedAt.addingTimeInterval(-5.001)
+            case "expired", "drift-expired": clock = opportunity.deadline.addingTimeInterval(0.001)
+            case "node": clock = node.addingTimeInterval(-0.001)
+            case "mixed-hard": return [.criticalRefresh, .accountChanged]
+            case "multiple":
+                coordinator.cancelCurrent(); prefs.set(false, forKey: "enabled"); prefs.set(481, forKey: "dailyAnchorMinutes")
+                clock = before.capturedAt.addingTimeInterval(61)
+                return [.criticalRefresh, .codexTaskRunning]
+            default: break
+            }
+            return PingPreflightReason(rawValue: name).map { [$0] } ?? []
+        }
+        coordinator.ping(schedule: schedule, accountID: "preflight-secret-account", blockers: blockers)
+        try await resumeWait { !coordinator.running }
+        if let state {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            check(usage.readCount == 1 && !state.usage.refreshing && !state.usage.criticalRefreshPending,
+                "ordinary ping preflight does not trigger AppState's successful-execution critical refresh")
+            state.usage.stop(); state.sessions.stop()
+        }
+        let events = directory.appendingPathComponent("support/execution-events.jsonl")
+        let log = try String(contentsOf: events, encoding: .utf8)
+        let rows = try log.split(separator: "\n").map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any] }
+        let diagnostic = rows.last?["preflight"] as? [String: Any]
+        check(diagnostic?["stage"] as? String == (stage == 1 ? "after_usage" : "before_send") && diagnostic?["reasons"] as? [String] == expected,
+            "production ping preflight retains every specific reason at checkpoint \(stage): \(name)")
+        check(pings.count == 0 && !rows.contains { $0["event"] as? String == "started" } && ((try? resumeTestAttemptKeys(ledger)) ?? []).isEmpty,
+            "preflight failure has no transport send, started event or attempt commitment: \(name)-\(stage)")
+        let deadline = (diagnostic?["opportunityDeadline"] as? String).flatMap(UsageDecoder.timestamp)
+        let opportunityStart = (diagnostic?["opportunityStartsAt"] as? String).flatMap(UsageDecoder.timestamp)
+        let checkedAt = (diagnostic?["checkedAt"] as? String).flatMap(UsageDecoder.timestamp)
+        let age = diagnostic?["usageAgeSeconds"] as? Double
+        let elapsed = diagnostic?["elapsedSeconds"] as? Double
+        check(deadline == opportunity.deadline && opportunityStart == opportunity.date && checkedAt.map { abs($0.timeIntervalSince(clock)) < 0.001 } == true &&
+            age.map { abs($0 - clock.timeIntervalSince(before.capturedAt)) < 0.00001 } == true && elapsed.map { $0 >= 0 } == true,
+            "preflight evidence preserves quota age and the original node's actual opportunity including drift: \(name)-\(stage)")
+        if name == "pause" { check(diagnostic?["newPauseCount"] as? Int == 1, "new pause diagnostics store only the blocking pause count") }
+        check(!log.contains("secret-account") && !log.contains(directory.path) && !log.contains("usage_limit_reached"),
+            "preflight diagnostics omit account identity, task content and workspace paths: \(name)-\(stage)")
+        check(coordinator.lastFailure != "状态已改变，取消本次保活" && coordinator.lastFailure != "保活条件已改变，等待重新确认",
+            "preflight UI uses a concrete reason: \(name)-\(stage)")
+
+        let attention = ["account", "missing-account", "empty-account", "stale-account", "runtime_unhealthy", "session_scan_failed", "app_state_unavailable", "mixed-hard"].contains(name)
+        check(coordinator.lastFailure != nil && (coordinator.visibleFailure != nil) == attention && (coordinator.visibleNotice != nil) != attention,
+            "ping waits preserve the internal outcome signal while only hard blockers appear as failures: \(name)-\(stage)")
+        if !attention {
+            var presentation = MenuPresentation()
+            let menu = presentation.build(plan: nil, usage: nil, schedule: schedule, tasks: [], availableTasks: [], choices: ResumeChoices(),
+                executionFailure: coordinator.visibleFailure, executionNotice: coordinator.visibleNotice, now: clock)
+            check(menu.note.contains(coordinator.status) && !menu.note.contains("失败") && menu.warning.isEmpty && menu.statusSymbol != "exclamationmark.circle",
+                "normal ping wait and missed opportunity remain visible as an ordinary note: \(name)-\(stage)")
+        }
+        if name == "mixed-hard" {
+            check(coordinator.lastFailure == CodexConnectionError.userMessage(reason: "account_changed"),
+                "a normal ping refresh cannot hide a simultaneous account blocker")
+        }
+        recovered = true; clock = started; prefs.set(true, forKey: "enabled"); prefs.set(480, forKey: "dailyAnchorMinutes")
+        schedule.timeZoneID = Calendar.current.timeZone.identifier; usage.set(idle())
+        if name == "pause" {
+            for file in try FileManager.default.contentsOfDirectory(at: directory.appendingPathComponent("sessions"), includingPropertiesForKeys: nil) {
+                try FileManager.default.removeItem(at: file)
+            }
+        }
+        coordinator.ping(schedule: schedule, accountID: "preflight-secret-account", blockers: blockers)
+        try await resumeWait { !coordinator.running }
+        coordinator.ping(schedule: schedule, accountID: "preflight-secret-account", blockers: blockers)
+        try await resumeWait { !coordinator.running }
+        check(pings.count == 1 && coordinator.confirmations.filter { $0.kind == .keepAlive }.count == 1 && (try? resumeTestAttemptKeys(ledger))?.count == 1,
+            "recovered preflight can retry once and successful original-node commitment prevents a duplicate: \(name)-\(stage)")
+    }
+    try await checkAppKeepAliveBlockers(root.appendingPathComponent("app-blockers"), check)
+}
+
+@MainActor private func checkAppKeepAliveBlockers(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true); try resumeDatabase(root)
+    let clock = Date()
+    let usage = RecoveryTestUsage(snapshot: UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
+        capturedAt: clock, accountID: "blocker-account", sourceFile: "app-server", zeroUseWindowActive: false))
+    let suite = "keeper.app-blockers." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": false, "autoResume": true, "dailyAnchorMinutes": 480])
+    let state = AppState(provider: usage, defaults: prefs, runtimeURL: root.appendingPathComponent("support/runtime.json"), codexHome: root, startMonitoring: false, now: { clock })
+    check(state.keepAliveBlockers(ignoring: []).contains(.sessionsUnscanned), "AppState reports an incomplete first session scan explicitly")
+    state.sessions.refresh(); try await resumeWait { state.sessions.hasScanned && !state.usage.refreshing }
+    usage.pause(); state.usage.refresh(critical: true)
+    try await resumeWait { state.usage.refreshing }
+    check(state.keepAliveBlockers(ignoring: []).contains(.criticalRefresh) && !state.keepAliveBlockers(ignoring: []).contains(.codexTaskRunning),
+        "real AppState distinguishes a required quota refresh from a running Codex task")
+    usage.release(); try await resumeWait { !state.usage.refreshing }
+    let target = try resumeFixture(root: root, stop: clock.addingTimeInterval(-1))
+    state.sessions.refresh(); try await resumeWait { !state.blockedSessions.isEmpty && !state.usage.refreshing }
+    check(state.keepAliveBlockers(ignoring: []).contains(.taskSelectionChanged), "real AppState identifies a pending pause outside the admitted task choices")
+    var trace = try Data(contentsOf: target.fileURL)
+    trace.append(try resumeEvent("task_started", turn: "running", at: clock)); try trace.write(to: target.fileURL)
+    let scanned = state.sessions.scannedAt; state.sessions.refresh()
+    try await resumeWait { state.sessions.scannedAt != scanned && !state.usage.refreshing }
+    check(state.keepAliveBlockers(ignoring: []).contains(.codexTaskRunning) && !state.keepAliveBlockers(ignoring: []).contains(.criticalRefresh),
+        "real AppState reports running Codex work after its quota refresh finishes")
+    usage.pause(); state.usage.refresh(critical: true)
+    check(Set(state.keepAliveBlockers(ignoring: [])).isSuperset(of: [.criticalRefresh, .codexTaskRunning]),
+        "AppState preserves simultaneous task-running and quota-refresh blockers")
+    usage.release(); try await resumeWait { !state.usage.refreshing }
+    let invalid = root.appendingPathComponent("sessions/rollout-\(UUID().uuidString).jsonl")
+    try Data([0xff]).write(to: invalid)
+    let prior = state.sessions.scannedAt; state.sessions.refresh(); try await resumeWait { state.sessions.scannedAt != prior }
+    check(state.keepAliveBlockers(ignoring: []).contains(.sessionScanFailed), "real AppState identifies a failed session scan independently")
+    let invalidParent = root.appendingPathComponent("invalid-runtime-parent")
+    try Data().write(to: invalidParent)
+    let unhealthy = AppState(provider: usage, defaults: prefs, runtimeURL: invalidParent.appendingPathComponent("runtime.json"), codexHome: root,
+        execution: state.execution, startMonitoring: false, now: { clock })
+    check(unhealthy.keepAliveBlockers(ignoring: []).contains(.runtimeUnhealthy), "real AppState preserves persistence-health admission as its own reason")
+    let busyRoot = root.appendingPathComponent("busy")
+    try FileManager.default.createDirectory(at: busyRoot, withIntermediateDirectories: true)
+    let busyLedger = busyRoot.appendingPathComponent("attempts.json")
+    try JSONEncoder().encode([target.episodeKey]).write(to: busyLedger)
+    let busyExecution = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: busyLedger, codexHome: root)
+    let busyState = AppState(provider: usage, defaults: prefs, runtimeURL: busyRoot.appendingPathComponent("runtime.json"), codexHome: root,
+        execution: busyExecution, startMonitoring: false, now: { clock })
+    check(busyState.keepAliveBlockers(ignoring: []).contains(.keeperBusy), "real AppState identifies existing Keeper continuation ownership")
+    state.usage.stop(); state.sessions.stop(); unhealthy.usage.stop(); unhealthy.sessions.stop(); busyState.usage.stop(); busyState.sessions.stop()
+}
+
+@MainActor private func checkResumeEvidenceAudit(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true); try resumeDatabase(root)
+    let target = try resumeFixture(root: root)
+    var empty = ResumeTurnMonitor(turnID: "audit-turn")
+    check(try !empty.consume(resumeEvent("task_complete", turn: "audit-turn", at: Date())) && empty.responseAt == nil,
+        "empty rollout completion cannot fabricate a real model response")
+    var nullError = ResumeTurnMonitor(turnID: "audit-turn")
+    do {
+        let responded = try nullError.consume(resumeEvent("task_complete", turn: "audit-turn", at: Date(), extras: ["error": NSNull(), "last_agent_message": "real output"]))
+        check(responded, "rollout completion with real response and error null is a successful model response")
+    } catch { check(false, "rollout completion with real response and error null is a successful model response") }
+    let client = ResumeTestClient(target)
+    let transport = AppServerResumeTransport(makeTransport: { client }, observationSeconds: 0.05)
+    let events = ResumeTestEvents(); try transport.prepare(target); try transport.submit(target, prompt: "test only", update: events.consume)
+    client.send("turn/completed", extras: ["turn": ["id": client.turnID, "status": "completed", "items": [], "error": NSNull()]])
+    try await resumeWait { client.closed }
+    check(events.responded == 0 && events.terminal == .completed, "empty app-server completion ends the carrier without fabricating startup")
+    let suite = "keeper.resume.audit." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": true, "autoResume": true, "resumeWorkspaceReminder": false])
+    let usage = ResumeTestUsage(); usage.setAccount("other-account")
+    let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: { ResumeTestTransport() }, defaults: prefs, ledgerURL: root.appendingPathComponent("support/attempts.json"), codexHome: root)
+    coordinator.resume([ResumeRequest(target: target, prompt: "test only", accountID: "original-account", workspace: nil)], schedule: ScheduleEngine(anchorMinutes: 480), manual: true)
+    try await resumeWait { !coordinator.running }
+    let log = try String(contentsOf: root.appendingPathComponent("support/execution-events.jsonl"), encoding: .utf8)
+    let rows = try log.split(separator: "\n").map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any] }
+    let preflight = rows.last?["preflight"] as? [String: Any]
+    check(preflight?["stage"] as? String == "quota_check" && preflight?["reasons"] as? [String] == ["account_changed"],
+        "resume preflight records reliable account mismatch at the quota checkpoint instead of a combined error")
+}
+
+@MainActor private func checkResumeEvidenceBoundaries(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true); try resumeDatabase(root)
+    for (name, extras, responds, terminal) in [
+        ("empty", [String: Any](), false, ResumeTerminal.completed),
+        ("null", ["error": NSNull()], false, .completed),
+        ("text", ["error": NSNull(), "last_agent_message": "real response"], true, .completed),
+        ("failure", ["error": ["message": "usage_limit_reached"]], false, .quotaStopped)
+    ] {
+        let target = try resumeFixture(root: root)
+        let desktop = FakeDesktopConnection()
+        desktop.onStart = {
+            let file = try FileHandle(forWritingTo: target.fileURL); defer { try? file.close() }; try file.seekToEnd()
+            try file.write(contentsOf: resumeEvent("task_complete", turn: "desktop-turn", at: Date(), extras: extras))
+        }
+        let fallback = ResumeTestTransport()
+        let transport = OwnedSessionResumeTransport(makeDesktop: { desktop }, fallback: fallback, observationSeconds: 0.2)
+        let events = ResumeTestEvents(); try transport.prepare(target); try transport.submit(target, prompt: "test only", update: events.consume)
+        try await resumeWait { responds ? events.responded == 1 : events.terminal != nil }
+        check(events.responded == (responds ? 1 : 0) && (responds || events.terminal == terminal) && !fallback.prepared && events.awaiting == 0,
+            "real owned transport handles completion evidence without waiting or changing channels: \(name)")
+    }
+    let target = try resumeFixture(root: root)
+    for (name, items, error, responds, terminal) in [
+        ("empty", [[String: Any]](), NSNull() as Any, false, ResumeTerminal.completed),
+        ("placeholder", [["type": "agentMessage", "id": "a", "text": " "]], NSNull() as Any, false, .completed),
+        ("message", [["type": "agentMessage", "id": "a", "text": "real response"]], NSNull() as Any, true, .completed),
+        ("reasoning", [["type": "reasoning", "id": "r", "summary": ["real reasoning"], "content": []]], NSNull() as Any, true, .completed),
+        ("tool", [["type": "mcpToolCall", "id": "m", "status": "completed", "error": NSNull()]], NSNull() as Any, true, .completed),
+        ("pending-tool", [["type": "dynamicToolCall", "id": "m", "status": "inProgress"]], NSNull() as Any, false, .completed),
+        ("missing-status", [["type": "mcpToolCall", "id": "m"]], NSNull() as Any, false, .completed),
+        ("failure", [], ["message": "real error"] as Any, false, .failed)
+    ] {
+        let client = ResumeTestClient(target); let transport = AppServerResumeTransport(makeTransport: { client }, observationSeconds: 0.05)
+        let events = ResumeTestEvents(); try transport.prepare(target); try transport.submit(target, prompt: "test only", update: events.consume)
+        client.send("turn/completed", extras: ["turn": ["id": client.turnID, "status": "completed", "items": items, "error": error]])
+        try await resumeWait { client.closed }
+        check(events.responded == (responds ? 1 : 0) && events.terminal == terminal, "real app-server transport requires actual completion content: \(name)")
+    }
+    let suite = "keeper.resume.evidence." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": true, "autoResume": true, "resumeWorkspaceReminder": false])
+    let usage = ResumeTestUsage(); let client = ResumeTestClient(target); var carriers = 0
+    let ledger = root.appendingPathComponent("support/attempts.json")
+    let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: { carriers += 1; return AppServerResumeTransport(makeTransport: { client }) }, defaults: prefs, ledgerURL: ledger, codexHome: root)
+    let request = ResumeRequest(target: target, prompt: "test only", accountID: usage.account, workspace: nil)
+    coordinator.resume([request], schedule: ScheduleEngine(anchorMinutes: 480), manual: true)
+    try await resumeWait { coordinator.operations.values.first?.receivedAt != nil }
+    client.send("turn/completed", extras: ["turn": ["id": client.turnID, "status": "completed", "items": [], "error": NSNull()]])
+    try await resumeWait { !coordinator.running }
+    coordinator.resume([request], schedule: ScheduleEngine(anchorMinutes: 480), manual: true)
+    check(coordinator.operations.values.first?.respondedAt == nil && coordinator.confirmations.isEmpty && carriers == 1 && coordinator.hasAttempted(target),
+        "empty real completion never creates startup confirmation and still preserves the submitted attempt guard")
+    let file = try FileHandle(forWritingTo: target.fileURL); try file.seekToEnd()
+    try file.write(contentsOf: resumeEvent("task_started", turn: client.turnID, at: Date()))
+    try file.write(contentsOf: resumeEvent("task_complete", turn: client.turnID, at: Date(), extras: ["error": NSNull()]))
+    try file.close()
+    let session = SessionWatcher.parse(url: target.fileURL, mtime: Date())!
+    check(session.turns[client.turnID]?.terminal == .completed && session.turns[client.turnID]?.responseAt == nil,
+        "session scan treats error null as successful termination without inventing model activity")
+    coordinator.reconcile(sessions: [session], scannedAt: Date(), healthy: true)
+    check(coordinator.confirmations.isEmpty && coordinator.operations.values.first?.respondedAt == nil,
+        "healthy restart reconciliation cannot turn an empty completion into startup confirmation")
+    let text = try FileHandle(forWritingTo: target.fileURL); try text.seekToEnd()
+    try text.write(contentsOf: resumeEvent("task_complete", turn: client.turnID, at: Date(), extras: ["last_agent_message": "real response", "error": NSNull()])); try text.close()
+    coordinator.reconcile(sessions: [SessionWatcher.parse(url: target.fileURL, mtime: Date())!], scannedAt: Date(), healthy: true)
+    check(coordinator.confirmations.count == 1, "exact-turn scan can recover real completion text without duplicate confirmation")
+}
+
+@MainActor private func checkResumePreflightAudit(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    let cases: [(String, String, [String])] = [
+        ("workspace", "session_check", ["workspace_unavailable"]), ("archived", "session_check", ["archived"]),
+        ("unreadable", "session_check", ["session_unreadable"]), ("thread", "session_check", ["thread_changed"]), ("subagent", "session_check", ["subagent"]),
+        ("user", "session_check", ["user_input_after_pause"]), ("started", "session_check", ["task_started_after_pause", "task_running"]),
+        ("aborted", "session_check", ["task_aborted_after_pause"]), ("response", "session_check", ["model_response_after_pause"]),
+        ("running", "session_check", ["task_running"]), ("pause", "pause_check", ["pause_changed"]),
+        ("missing-account", "quota_check", ["account_unconfirmed"]), ("empty-account", "quota_check", ["account_unconfirmed"]),
+        ("stale-account", "quota_check", ["account_unconfirmed", "usage_not_fresh", "usage_before_pause"]),
+        ("old-usage", "quota_check", ["usage_not_fresh", "usage_before_pause"]), ("future-usage", "quota_check", ["usage_not_fresh"]),
+        ("before-pause", "quota_check", ["usage_before_pause"]), ("quota-missing", "quota_check", ["quota_missing"]),
+        ("five-missing", "quota_check", ["five_hour_missing"]), ("week-missing", "quota_check", ["weekly_missing"]),
+        ("exhausted", "quota_check", ["five_hour_exhausted", "weekly_exhausted"]), ("recovery", "quota_check", ["recovery_unconfirmed"]),
+        ("generation", "before_send", ["generation_changed"]), ("slow-final-check", "before_send", ["usage_not_fresh"]),
+        ("timezone", "before_send", ["timezone_changed"]), ("policy", "before_send", ["policy_changed"]),
+        ("anchor", "before_send", ["anchor_changed"]), ("auto-off", "before_send", ["auto_resume_disabled"]), ("disabled", "before_send", ["disabled"]),
+        ("multiple", "before_send", ["generation_changed", "selection_changed", "prompt_changed", "policy_changed", "anchor_changed"])
+    ]
+    for (name, stage, expected) in cases {
+        let directory = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); try resumeDatabase(directory)
+        var clock = ScheduleEngine(anchorMinutes: 480).nodes(on: Date())[0].addingTimeInterval(10); let started = clock
+        let original = try resumeFixture(root: directory, stop: clock.addingTimeInterval(-5))
+        var target = original
+        let originalTrace = try Data(contentsOf: target.fileURL)
+        func copyTarget(cwd: String? = nil, file: URL? = nil, five: Bool = false, week: Bool = false) -> BlockedSession {
+            var value = BlockedSession(id: original.id, project: original.project, cwd: cwd ?? original.cwd, blockedAt: original.blockedAt,
+                fiveHourResetAt: five ? clock.addingTimeInterval(3600) : nil, weeklyResetAt: week ? clock.addingTimeInterval(3600) : nil, fileURL: file ?? original.fileURL)
+            value.stoppedTurnID = original.stoppedTurnID; value.pauseID = original.pauseID; value.startedBarrierAt = original.startedBarrierAt
+            return value
+        }
+        func append(_ type: String, extras: [String: Any] = [:]) throws {
+            var trace = try Data(contentsOf: original.fileURL); trace.append(try resumeEvent(type, turn: "new-turn", at: clock, extras: extras)); try trace.write(to: original.fileURL)
+        }
+        switch name {
+        case "workspace": target = copyTarget(cwd: directory.appendingPathComponent("missing").path)
+        case "archived":
+            let archive = directory.appendingPathComponent("archived_sessions/trace.jsonl"); try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try originalTrace.write(to: archive); target = copyTarget(file: archive)
+        case "unreadable": try Data([0xff]).write(to: original.fileURL)
+        case "thread", "subagent":
+            var lines = String(decoding: originalTrace, as: UTF8.self).split(separator: "\n").map { Data($0.utf8) }
+            var row = try JSONSerialization.jsonObject(with: lines[0]) as! [String: Any]; var payload = row["payload"] as! [String: Any]
+            if name == "thread" { payload["id"] = UUID().uuidString } else { payload["source"] = ["subagent": "test-only"] }
+            row["payload"] = payload; lines[0] = try JSONSerialization.data(withJSONObject: row)
+            var trace = Data(); for line in lines { trace.append(line); trace.append(10) }; try trace.write(to: original.fileURL)
+        case "user": try append("user_message", extras: ["message": "fixture-only-input"])
+        case "started": try append("task_started")
+        case "aborted": try append("turn_aborted")
+        case "response": try append("agent_message", extras: ["message": "fixture-only-output"])
+        case "running":
+            let prefix = String(decoding: originalTrace, as: UTF8.self).split(separator: "\n").dropLast().joined(separator: "\n") + "\n"
+            var trace = Data(prefix.utf8); trace.append(try resumeEvent("error", turn: "original", at: clock, extras: ["will_retry": true, "message": "service error"])); try trace.write(to: original.fileURL)
+        case "pause": _ = try resumeFixture(root: directory, id: original.id, stop: clock.addingTimeInterval(-1), turn: "different-stop")
+        case "five-missing": target = copyTarget(five: true)
+        case "week-missing": target = copyTarget(week: true)
+        default: break
+        }
+        var live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 20, windowMinutes: 300, resetsAt: clock.addingTimeInterval(3600)),
+            weekly: nil, capturedAt: clock, accountID: "audit-account", sourceFile: "app-server", zeroUseWindowActive: true)
+        switch name {
+        case "missing-account": live.accountID = nil
+        case "empty-account": live.accountID = " "
+        case "stale-account": live.accountID = "other-account"; live.capturedAt = clock.addingTimeInterval(-60.001)
+        case "old-usage": live.capturedAt = clock.addingTimeInterval(-60.001)
+        case "future-usage": live.capturedAt = clock.addingTimeInterval(5.001)
+        case "before-pause": live.capturedAt = target.blockedAt
+        case "quota-missing": live.fiveHour = nil
+        case "five-missing": live.weekly = live.fiveHour; live.fiveHour = nil
+        case "exhausted": live.fiveHour?.usedPercent = 100; live.weekly = live.fiveHour
+        case "recovery": target.retryQuota = ResumeQuotaEvidence(live)
+        default: break
+        }
+        let usage = RecoveryTestUsage(snapshot: live)
+        let suite = "keeper.preflight.audit." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        prefs.register(defaults: ["enabled": true, "autoResume": true, "dailyAnchorMinutes": 480, "resumeWorkspaceReminder": false])
+        var schedule = ScheduleEngine(anchorMinutes: 480); if name == "timezone" { schedule.timeZoneID = "fixture-other-zone" }
+        var transports: [ResumeTestTransport] = []
+        let ledger = directory.appendingPathComponent("support/attempts.json")
+        let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: { let transport = ResumeTestTransport(); transports.append(transport); return transport }, defaults: prefs,
+            ledgerURL: ledger, codexHome: directory, now: { clock })
+        var recovered = false
+        let blockers: (String) -> [ResumePreflightReason] = { _ in
+            guard !recovered else { return [] }
+            switch name {
+            case "generation": coordinator.cancelCurrent()
+            case "slow-final-check": clock = started.addingTimeInterval(60.001)
+            case "policy": prefs.set("keepPlan", forKey: "earlyRecoveryPolicy")
+            case "anchor": prefs.set(481, forKey: "dailyAnchorMinutes")
+            case "auto-off": prefs.set(false, forKey: "autoResume")
+            case "disabled": prefs.set(false, forKey: "enabled")
+            case "multiple": coordinator.cancelCurrent(); prefs.set("keepPlan", forKey: "earlyRecoveryPolicy"); prefs.set(481, forKey: "dailyAnchorMinutes"); return [.selectionChanged, .promptChanged]
+            default: break
+            }
+            return []
+        }
+        let request = ResumeRequest(target: target, prompt: "fixture-only-prompt", accountID: "audit-account", workspace: nil, observedRecovery: true)
+        coordinator.resume([request], schedule: schedule, manual: name != "recovery" && name != "auto-off", blockers: blockers)
+        try await resumeWait { !coordinator.running }
+        let operation = coordinator.operations.values.first
+        check(operation?.preflight?.stage.rawValue == stage && operation?.preflight?.reasons.map(\.rawValue) == expected,
+            "production resume admission distinguishes every failed condition: \(name)")
+        check(transports.count == 1 && !transports[0].submitted && !coordinator.hasAttempted(target) && ((try? resumeTestAttemptKeys(ledger)) ?? []).isEmpty,
+            "rejected resume never sends or commits attempt protection: \(name)")
+        let log = try String(contentsOf: directory.appendingPathComponent("support/execution-events.jsonl"), encoding: .utf8)
+        check(!log.contains("\"event\":\"started\"") && log.contains("\"preflight\""), "unsent resume persists structured diagnostics without started: \(name)")
+        let rows = try log.split(separator: "\n").map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any] }
+        guard let diagnostic = rows.first?["preflight"] as? [String: Any] else {
+            check(false, "missing preflight record for case: \(name); phase=\(operation?.phase.rawValue ?? "none")")
+            coordinator.stopOwnedTasks()
+            continue
+        }
+        let safe = String(decoding: try JSONSerialization.data(withJSONObject: diagnostic), as: UTF8.self)
+        check(!safe.contains(directory.path) && !safe.contains("audit-account") && !safe.contains("fixture-only"), "resume preflight fields contain only classification and time evidence: \(name)")
+        check(operation?.preflight?.elapsedSeconds.map { $0 >= 0 } == true && operation?.preflight?.pauseAt == target.blockedAt,
+            "resume diagnostic retains timing and exact pause provenance: \(name)")
+        if name == "slow-final-check" {
+            check(operation?.preflight?.usageAgeSeconds.map { abs($0 - 60.001) < 0.0001 } == true && operation?.preflight?.checkedAt == clock,
+                "slow final admission cannot borrow an earlier timestamp to pass the 60-second quota boundary")
+        }
+        recovered = true; clock = started; prefs.set(true, forKey: "enabled"); prefs.set(true, forKey: "autoResume"); prefs.set(480, forKey: "dailyAnchorMinutes"); prefs.removeObject(forKey: "earlyRecoveryPolicy")
+        schedule.timeZoneID = Calendar.current.timeZone.identifier
+        try originalTrace.write(to: original.fileURL)
+        live.fiveHour = QuotaWindow(usedPercent: 20, windowMinutes: 300, resetsAt: clock.addingTimeInterval(3600)); live.weekly = nil; live.accountID = "audit-account"; live.capturedAt = clock; usage.set(live)
+        let retry = ResumeRequest(target: original, prompt: "fixture-only-prompt", accountID: "audit-account", workspace: nil)
+        coordinator.resume([retry], schedule: schedule, manual: true, blockers: blockers)
+        try await resumeWait { transports.count == 2 && transports[1].submitted }
+        check(transports.count == 2 && transports[1].submitted, "recovered resume preflight can be retried normally: \(name)")
+        transports[1].respond(); transports[1].finish(); try await resumeWait { !coordinator.running }
+        coordinator.resume([retry], schedule: schedule, manual: true)
+        check(transports.count == 2 && coordinator.confirmations.count == 1, "successful recovered resume is confirmed once and never resent: \(name)")
+    }
+}
+
+private struct AuditFailureUsage: UsageProvider {
+    let snapshot: UsageSnapshot
+    let mode: String
+    func read() throws -> UsageSnapshot {
+        if mode == "usage" { throw UsageReadFailure(underlying: CodexConnectionError.timeout,
+            diagnostic: UsageReadDiagnostic(requestStage: "rate_limits", rpcAttempted: true, cooldown: false, elapsedMilliseconds: 10, reason: "request_timeout")) }
+        return snapshot
+    }
+    func pingModel() throws -> PingModel {
+        if mode == "model" { throw UsageReadFailure(underlying: CodexConnectionError.server("failed to connect Authorization: Bearer fixture-secret"),
+            diagnostic: UsageReadDiagnostic(requestStage: "provider", rpcAttempted: true, cooldown: false, elapsedMilliseconds: 10, reason: "connection_failed")) }
+        return PingModel(model: "gpt-6-luna", reasoningEffort: "low")
+    }
+}
+
+@MainActor private func checkPreparationFailureStages(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    for (mode, stage, reason) in [("model", "model_discovery", "model_discovery_failed"), ("usage", "usage_read", "usage_read_failed"), ("scan", "session_scan", "session_scan_failed")] {
+        let directory = root.appendingPathComponent(mode)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("sessions"), withIntermediateDirectories: true); try resumeDatabase(directory)
+        let schedule = ScheduleEngine(anchorMinutes: 480); let clock = schedule.nodes(on: Date())[0].addingTimeInterval(10)
+        let live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
+            capturedAt: clock, accountID: "audit-account", sourceFile: "app-server", zeroUseWindowActive: false)
+        let usage = AuditFailureUsage(snapshot: live, mode: mode)
+        if mode == "scan" { try Data([0xff]).write(to: directory.appendingPathComponent("sessions/rollout-\(UUID().uuidString).jsonl")) }
+        let suite = "keeper.preparation-stage." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        prefs.register(defaults: ["enabled": true, "dailyAnchorMinutes": 480])
+        let pings = ReminderTestPing(); let ledger = directory.appendingPathComponent("support/attempts.json")
+        let coordinator = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: ledger, pingTransport: pings, codexHome: directory, now: { clock })
+        coordinator.ping(schedule: schedule, accountID: "audit-account", blockers: { [] }); try await resumeWait { !coordinator.running }
+        let log = try String(contentsOf: directory.appendingPathComponent("support/execution-events.jsonl"), encoding: .utf8)
+        let row = try JSONSerialization.jsonObject(with: Data(log.split(separator: "\n").last!.utf8)) as! [String: Any]
+        let diagnostic = row["preflight"] as? [String: Any]; let failure = diagnostic?["failure"] as? [String: Any]
+        check(diagnostic?["stage"] as? String == stage && diagnostic?["reasons"] as? [String] == [reason] && failure?["reason"] != nil,
+            "ping preparation errors retain their actual checkpoint and sanitized classification: \(mode)")
+        check((mode == "usage" ? coordinator.status == L10n.text("正在确认中") && coordinator.visibleFailure == nil : coordinator.status.contains("，") && coordinator.visibleFailure != nil) &&
+            !coordinator.status.contains("\n") && (row["error"] as? String)?.contains("\n") == false,
+            "ping preparation separates transient waiting from actionable hints while retaining its original diagnostic: \(mode)")
+        check(mode == "usage" ? failure?["rpcAttempted"] as? Bool == true : failure?["rpcAttempted"] == nil,
+            "only explicit quota RPC evidence is retained; model discovery does not borrow quota RPC status: \(mode)")
+        check(pings.count == 0 && !log.contains("fixture-secret") && !log.contains("Authorization") && !FileManager.default.fileExists(atPath: ledger.path),
+            "preparation failures neither send nor persist raw errors or attempt keys: \(mode)")
+    }
+    let directory = root.appendingPathComponent("resume-read")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); try resumeDatabase(directory)
+    let target = try resumeFixture(root: directory)
+    for error in [CodexConnectionError.unavailable, .invalidResponse, .approvalRequired] {
+        let diagnostic = ResumePreflightDiagnostic(stage: .usageRead, reasons: [.preparationFailed], target: target, checkedAt: Date(),
+            failure: UsageReadFailure.describe(error, elapsed: 0))
+        check(diagnostic.errorDescription == error.errorDescription,
+            "resume preparation preserves the precise existing message: \(UsageReadFailure.describe(error, elapsed: 0).reason)")
+    }
+    let usage = AuditFailureUsage(snapshot: UsageSnapshot(fiveHour: nil, weekly: nil, capturedAt: Date(), accountID: "audit-account", sourceFile: "app-server"), mode: "usage")
+    let suite = "keeper.resume-read-stage." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": true, "resumeWorkspaceReminder": false])
+    let transport = ResumeTestTransport()
+    let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: { transport }, defaults: prefs, ledgerURL: directory.appendingPathComponent("support/attempts.json"), codexHome: directory)
+    coordinator.resume([ResumeRequest(target: target, prompt: "test only", accountID: "audit-account", workspace: nil)], schedule: ScheduleEngine(anchorMinutes: 480), manual: true)
+    try await resumeWait { !coordinator.running }
+    check(coordinator.operations.values.first?.preflight?.stage == .usageRead && coordinator.lastFailure?.contains("连接失败") == true && !transport.submitted,
+        "resume quota failures preserve a concrete timeout message and their real read checkpoint")
+}
+
+@MainActor private func checkResumeAppBlockers(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true); try resumeDatabase(root)
+    let target = try resumeFixture(root: root)
+    let suite = "keeper.resume-app-blockers." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": false, "autoResume": true, "resumeWorkspaceReminder": false])
+    let runtime = root.appendingPathComponent("support/runtime.json")
+    try resumePendingChoice(target, account: "resume-state-account", runtime: runtime)
+    let state = AppState(provider: ResumeTestUsage(), defaults: prefs, runtimeURL: runtime, codexHome: root, startMonitoring: false)
+    state.sessions.refresh(); try await resumeWait { state.sessions.hasScanned && !state.usage.refreshing }
+    let expected = ResumeRequest(target: target, prompt: L10n.text("继续"), accountID: "resume-state-account", workspace: nil, messageMode: .localizedDefault)
+    func blockers(_ value: AppState = state) -> [ResumePreflightReason] { value.resumeBlockers(key: target.episodeKey, intended: expected, admitted: true, manual: true) }
+    check(blockers().contains(.recoveryChoiceChanged), "AppState distinguishes an unapproved recovery choice from task selection")
+    state.setSelected(target, false)
+    check(blockers().contains(.selectionChanged), "AppState exposes task selection changes explicitly")
+    state.setSelected(target, true); state.setMessageMode(target, .fixed); state.setMessage(target, "fixture-only-new-prompt")
+    check(Set(blockers()).isSuperset(of: [.messageModeChanged, .promptChanged]), "AppState retains simultaneous message-option and message-body changes")
+    prefs.set(false, forKey: "autoResume")
+    check(blockers().contains(.autoResumeDisabled), "AppState exposes the automatic continuation switch independently")
+    try Data([0xff]).write(to: root.appendingPathComponent("sessions/rollout-\(UUID().uuidString).jsonl"))
+    let scanned = state.sessions.scannedAt; state.sessions.refresh(); try await resumeWait { state.sessions.scannedAt != scanned }
+    check(blockers().contains(.sessionScanFailed), "AppState exposes scan health rather than combining it with selection")
+    let parent = root.appendingPathComponent("invalid-runtime-parent"); try Data().write(to: parent)
+    let unhealthy = AppState(provider: ResumeTestUsage(), defaults: prefs, runtimeURL: parent.appendingPathComponent("runtime.json"), codexHome: root, execution: state.execution, startMonitoring: false)
+    check(blockers(unhealthy).contains(.runtimeUnhealthy), "AppState exposes persistence health as a distinct resume blocker")
+    state.usage.stop(); state.sessions.stop(); unhealthy.usage.stop(); unhealthy.sessions.stop()
+}
+
+@MainActor private func checkActionableMessageBoundaries(_ target: BlockedSession, _ check: (Bool, String) -> Void) throws {
+    for corruptLedger in [true, false] {
+        let directory = URL(fileURLWithPath: target.cwd).appendingPathComponent("message-storage-" + UUID().uuidString)
+        let ledger = directory.appendingPathComponent("resume-attempts.json")
+        if corruptLedger {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data("invalid ledger".utf8).write(to: ledger)
+        } else { try Data().write(to: directory) }
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let coordinator = ExecutionCoordinator(provider: ResumeTestUsage(), ledgerURL: ledger, codexHome: URL(fileURLWithPath: target.cwd))
+        check(!coordinator.canStartResume && coordinator.recordingFailure?.contains("反馈") == true &&
+            coordinator.recordingFailure?.contains("刷新") == false && coordinator.recordingFailure?.contains("已在运行") == false,
+            "unreadable records and unavailable lock files give a real recovery path without inventing another instance")
+    }
+    let legacy = ResumeOperation(id: "copy", batchID: "copy", accountID: nil, target: target, actionAt: Date(), phase: .notSubmitted,
+        failure: "fixture-only technical failure", protectsThread: false)
+    check(ResumeTaskFact.make(task: target, operation: legacy).text == L10n.text("发送未完成，请先在 Codex 检查原任务。"),
+        "legacy failed operations show a safe action rather than raw diagnostic text")
+    var draft = legacy
+    draft.preflight = ResumePreflightDiagnostic(stage: .promptRead, reasons: [.preparationFailed], target: target, checkedAt: Date())
+    check(ResumeTaskFact.make(task: target, operation: draft).text.contains("默认发送") && draft.failure == legacy.failure,
+        "unsent draft failure points to the real message option while retaining diagnostic history")
+    var pending = legacy; pending.phase = .checking; pending.protectsThread = true
+    let pendingText = ResumeTaskFact.make(task: target, operation: pending).text
+    check(pendingText == L10n.text("正在确认中") && pending.protectsThread, "uncertain submitted results wait without recommending a resend or releasing protection")
+    let unknown = PingDiagnostic(elapsedSeconds: 180, warningSeconds: 90, timeoutSeconds: 180)
+    check(unknown.failureMessage.contains("刷新查看额度") && !unknown.failureMessage.contains("重试") && !unknown.failureMessage.contains("网络") && !unknown.failureMessage.contains("OK"),
+        "unknown ping results suggest checking quota without inventing a network cause or a resend action")
+    do { try AppServerUsageProvider.requireChatGPT(["account": ["type": "apiKey"]]); check(false, "unsupported login must fail") }
+    catch {
+        check(error.localizedDescription.contains("ChatGPT") && !error.localizedDescription.contains("API") && CodexConnectionError.diagnosticDescription(for: error).contains("API key"),
+            "unsupported sign-in has a simple action while detailed login diagnostics remain available")
+    }
+    check(CodexConnectionError.server("unknown service problem").localizedDescription.contains("Codex") &&
+        !CodexConnectionError.server("unknown service problem").localizedDescription.contains("网络"), "unknown service errors do not guess a network fix")
+}
+
+private func checkConfirmationPresentation(_ target: BlockedSession, _ check: (Bool, String) -> Void) {
+    for (reason, received) in [(PingFailureReason.requestTimeout, false), (.unknown, false), (.unknown, true)] {
+        var diagnostic = PingDiagnostic(elapsedSeconds: 90, warningSeconds: 90, timeoutSeconds: 180)
+        diagnostic.reason = reason; diagnostic.okReceived = received
+        check(diagnostic.warning == L10n.text("正在确认中"), "every in-progress ping uses the same waiting message: \(reason)-\(received)")
+    }
+    let start = Date()
+    var operation = ResumeOperation(id: "presentation", batchID: "presentation", accountID: nil, target: target,
+        actionAt: start, phase: .preparing, protectsThread: false, manual: false)
+    for phase in [ResumePhase.preparing, .sending, .confirming, .checking] {
+        operation.phase = phase
+        let fact = ResumeTaskFact.make(task: target, operation: operation)
+        var menu = MenuSummary(); menu.applyResumeTasks(operations: [operation], pending: [], choices: ResumeChoices())
+        check(fact.text == L10n.text("正在确认中") && fact.isConfirming && !menu.tasksNeedAttention &&
+            menu.tasks == [L10n.format("%d 个任务正在确认中", 1)], "all ongoing resume phases share one neutral confirmation state: \(phase)")
+    }
+    operation.phase = .notSubmitted
+    for reason in [ResumePreflightReason.usageNotFresh, .fiveHourExhausted, .recoveryUnconfirmed, .anchorChanged, .promptChanged, .taskStartedAfterPause, .modelResponseAfterPause, .taskRunning] {
+        operation.preflight = ResumePreflightDiagnostic(stage: .beforeSend, reasons: [reason], target: target, checkedAt: start)
+        let fact = ResumeTaskFact.make(task: target, operation: operation)
+        var menu = MenuSummary(); menu.applyResumeTasks(operations: [operation], pending: [], choices: ResumeChoices())
+        check(fact.symbol != "exclamationmark.circle" && !menu.tasksNeedAttention && !menu.tasks.joined().contains("发送失败"),
+            "automatic waits, updated settings and existing task progress are ordinary states: \(reason)")
+    }
+    operation.preflight = ResumePreflightDiagnostic(stage: .quotaCheck, reasons: [.usageNotFresh, .accountChanged], target: target, checkedAt: start)
+    check(ResumeTaskFact.make(task: target, operation: operation).text == CodexConnectionError.userMessage(reason: "account_changed"),
+        "a normal resume wait never hides a simultaneous account blocker")
+    operation.preflight = ResumePreflightDiagnostic(stage: .sessionCheck, reasons: [.taskRunning, .taskAbortedAfterPause], target: target, checkedAt: start)
+    var stopped = MenuSummary(); stopped.applyResumeTasks(operations: [operation], pending: [], choices: ResumeChoices())
+    check(ResumeTaskFact.make(task: target, operation: operation).text.contains("已中断") && stopped.tasksNeedAttention,
+        "explicit task stop remains actionable even when mixed with ordinary progress")
+    operation.preflight = ResumePreflightDiagnostic(stage: .beforeSend, reasons: [.promptChanged], target: target, checkedAt: start)
+    var choices = ResumeChoices(); choices.deselectedEpisodes.insert(target.episodeKey)
+    var paused = MenuSummary(); paused.applyResumeTasks(operations: [operation], pending: [], choices: choices)
+    check(!paused.tasksNeedAttention && paused.tasks == [L10n.format("%d 个任务已关闭自动继续", 1)],
+        "an explicitly deselected task displays its real pause rather than promising a new plan")
+    check(ResumeTaskFact.make(task: target, operation: operation, selected: false, cancelled: true).text == L10n.text("已取消本次自动继续"),
+        "ordinary preparation cancellation retains the existing explicit cancel choice")
+    var cancelledChoices = ResumeChoices(); cancelledChoices.keepAliveEpisodes.insert(target.episodeKey)
+    var cancelledMenu = MenuSummary(); cancelledMenu.applyResumeTasks(operations: [operation], pending: [], choices: cancelledChoices)
+    check(!cancelledMenu.tasksNeedAttention && cancelledMenu.tasks == [L10n.format("%d 个任务已取消本次自动继续", 1)],
+        "ordinary preparation summary retains the existing explicit cancel choice")
+    operation.manual = true
+    operation.preflight = ResumePreflightDiagnostic(stage: .quotaCheck, reasons: [.usageNotFresh], target: target, checkedAt: start)
+    var manual = MenuSummary(); manual.applyResumeTasks(operations: [operation], pending: [], choices: ResumeChoices())
+    check(manual.tasksNeedAttention && ResumeTaskFact.make(task: target, operation: operation).text.contains("刷新后重试"),
+        "a stopped manual preparation never promises automatic recovery")
+    operation.manual = false
+    for reason in [ResumePreflightReason.pauseChanged, .alreadyAttempted, .taskRunning] {
+        operation.preflight = ResumePreflightDiagnostic(stage: .beforeSend, reasons: [reason], target: target, checkedAt: start)
+        var updated = MenuSummary(); updated.applyResumeTasks(operations: [operation], pending: [], choices: ResumeChoices())
+        check(!operation.notSubmittedNeedsAttention && !operation.canRetrySubmission && !updated.tasksNeedAttention &&
+            updated.tasks == [L10n.format("%d 个任务状态已更新", 1)] && !ResumeTaskFact.make(task: target, operation: operation).text.contains("已继续"),
+            "old-request guards show only an updated state and never offer a resend or claim success: \(reason)")
+    }
+    operation.manual = nil; operation.preflight = nil
+    var legacy = MenuSummary(); legacy.applyResumeTasks(operations: [operation], pending: [], choices: ResumeChoices())
+    check(legacy.tasksNeedAttention, "legacy unsent operations retain conservative failure presentation")
+    var ended = operation; ended.phase = .stopped; ended.endedAt = start
+    let terminals: [ResumeTerminal?] = [.aborted, .failed, .completed, .disconnected, nil]
+    let facts = terminals.map { terminal -> ResumeTaskFact in
+        ended.terminal = terminal
+        return ResumeTaskFact.make(task: target, operation: ended)
+    }
+    check(facts[0].text.contains("已中断") && facts[1].text.contains("继续失败") && facts[2].text.contains("未确认") &&
+        facts[3].text == facts[2].text && facts[4].text == facts[2].text &&
+        facts.allSatisfy { !$0.text.contains("手动") && !$0.text.contains("已继续") && !$0.isConfirming },
+        "unconfirmed terminal results distinguish interruption and failure without inferring a manual stop or successful startup")
+    check(terminals.allSatisfy { terminal in
+        ended.terminal = terminal; ended.respondedAt = start
+        let fact = ResumeTaskFact.make(task: target, operation: ended)
+        return fact.symbol == "checkmark.circle.fill" && fact.text.contains("已继续") && !fact.text.contains("未确认")
+    }, "confirmed startup remains visible regardless of the later terminal result")
+    ended.respondedAt = nil; ended.terminal = .quotaStopped
+    check(ResumeTaskFact.make(task: target, operation: ended).text == L10n.text("等待自动继续"),
+        "quota stops retain their existing automatic-wait presentation")
+    ended.respondedAt = start; ended.terminal = .manualRequired
+    let manualFact = ResumeTaskFact.make(task: target, operation: ended)
+    check(manualFact.symbol == "exclamationmark.circle" && manualFact.text.contains("已继续") && manualFact.text.contains("手动继续"),
+        "an explicit manual-continuation request keeps priority while preserving confirmed startup")
+}
+
+@MainActor private func checkResumePresentationPreflight(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    for (name, manual) in [("stale-auto", false), ("stale-manual", true), ("transient-auto", false), ("transient-manual", true), ("mixed-hard", false), ("plan-auto", false)] {
+        let directory = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); try resumeDatabase(directory)
+        let schedule = ScheduleEngine(anchorMinutes: 480); let clock = schedule.nodes(on: Date())[0].addingTimeInterval(name == "plan-auto" ? 181 : 10)
+        let target = try resumeFixture(root: directory, stop: clock.addingTimeInterval(-120))
+        let live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 20, windowMinutes: 300, resetsAt: clock.addingTimeInterval(3600)), weekly: nil,
+            capturedAt: name.hasPrefix("stale") ? clock.addingTimeInterval(-61) : clock, accountID: "audit-account", sourceFile: "app-server", zeroUseWindowActive: true)
+        let usage = AuditFailureUsage(snapshot: live, mode: name.hasPrefix("transient") ? "usage" : "")
+        let suite = "keeper.presentation-preflight." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        prefs.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "immediately", "resumeWorkspaceReminder": false])
+        let transport = ResumeTestTransport()
+        let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: { transport }, defaults: prefs,
+            ledgerURL: directory.appendingPathComponent("support/attempts.json"), codexHome: directory, now: { clock })
+        coordinator.resume([ResumeRequest(target: target, prompt: "test only", accountID: "audit-account", workspace: nil,
+            observedRecovery: true, heldForPlan: name == "plan-auto")], schedule: schedule,
+            manual: manual, blockers: { _ in name == "mixed-hard" ? [.usageNotFresh, .accountChanged] : [] })
+        try await resumeWait { !coordinator.running }
+        guard let operation = coordinator.operations.values.first else { check(false, "presentation fixture records an operation: \(name)"); continue }
+        let attention = manual || name == "mixed-hard"
+        var menu = MenuSummary(); menu.applyResumeTasks(operations: [operation], pending: [], choices: ResumeChoices())
+        check(coordinator.lastFailure != nil && (coordinator.visibleFailure != nil) == attention && operation.notSubmittedNeedsAttention == attention &&
+            menu.tasksNeedAttention == attention && operation.canRetrySubmission == attention && !transport.submitted && !coordinator.hasAttempted(target),
+            "real unsent preparation keeps internal outcome and consistent user presentation without sending: \(name)")
+        if name == "plan-auto" {
+            check(operation.preflight?.stage == .planCheck && operation.preflight?.reasons == [.preparationFailed] &&
+                coordinator.status == L10n.text("等待下次自动继续。") && operation.failure?.contains("按计划自动继续") == true,
+                "a real synchronous plan wait remains ordinary information and retains the original decision text")
+            var manualPlan = operation; manualPlan.manual = true
+            check(!manualPlan.notSubmittedNeedsAttention && manualPlan.canRetrySubmission &&
+                manualPlan.notSubmittedMessage == L10n.text("本次未发送，请查看当前计划。"),
+                "a stopped manual plan check gives an action without promising an automatic retry")
+        }
+        if name == "mixed-hard" {
+            check(coordinator.visibleFailure == CodexConnectionError.userMessage(reason: "account_changed"), "real automatic preparation prioritizes account blockers over normal freshness waits")
+        }
+    }
 }

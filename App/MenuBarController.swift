@@ -57,7 +57,7 @@ import UserNotifications
                   self.appState.execution.activeMode == .keepAlive, !self.notifiedCurrentPing else { return }
             self.notifiedCurrentPing = true
             let content = UNMutableNotificationContent()
-            content.title = L10n.text("Codex Keeper 保活仍在等待")
+            content.title = L10n.text("Codex Keeper 正在确认中")
             content.body = warning
             content.sound = .default
             notifications.add(UNNotificationRequest(identifier: "keeper-ping-wait-" + UUID().uuidString,
@@ -204,7 +204,7 @@ import UserNotifications
         host.layoutSubtreeIfNeeded()
         host.frame.size = NSSize(width: 304, height: host.fittingSize.height)
         cancelResumeItem?.title = L10n.text(appState.nextAction?.needsRecoveryDecision == true ? "选择续跑方式…" : "取消下一次自动继续")
-        cancelResumeItem?.isHidden = !enabled || appState.selectedTasks.isEmpty
+        cancelResumeItem?.isHidden = !enabled || !appState.automaticResumeEnabled || appState.selectedTasks.isEmpty
         cancelResumeItem?.isEnabled = !appState.selectedTasks.allSatisfy { appState.execution.isContentLocked($0, accountID: appState.displayAccountID) }
         quotaHost?.update(quotas: summary.quotas, accountID: summary.quotaAccountID)
         quotaItem.isHidden = summary.quotas.isEmpty
@@ -254,15 +254,18 @@ import UserNotifications
             usageError: appState.usage.lastError, usageErrorIsTransient: appState.usage.lastErrorIsTransient,
             sessionError: appState.sessions.detectionError,
             running: running ?? appState.execution.running, executionMode: appState.execution.activeMode,
-            executionFailure: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.lastFailure,
+            executionFailure: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleFailure,
             executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil,
             executionWarning: appState.execution.warning,
+            executionNotice: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleNotice,
             refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage)
-        if let failure = appState.execution.recordingFailure {
-            summary.error = [summary.error, failure].filter { !$0.isEmpty }.joined(separator: "\n")
+        let recordFailures = [appState.pendingStateFailure, appState.execution.recordingFailure].compactMap { $0 }
+        if !recordFailures.isEmpty {
+            summary.error = ([summary.error] + recordFailures).filter { !$0.isEmpty }.joined(separator: "\n")
             summary.hasStatusIssue = true
         }
-        summary.applyResumeTasks(operations: appState.currentOperations, pending: appState.availableTasks, choices: appState.choices)
+        summary.applyResumeTasks(operations: appState.currentOperations, pending: appState.availableTasks, choices: appState.choices,
+            enabled: appState.enabled, autoResume: appState.automaticResumeEnabled)
         summary.applyResumeHistory(appState.visibleOperations, accountID: appState.displayAccountID, confirmations: appState.execution.confirmations)
         return summary
     }

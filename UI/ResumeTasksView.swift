@@ -63,7 +63,7 @@ struct ResumeTasksView: View {
         .alert(L10n.text("忽略本轮续跑？"), isPresented: Binding(get: { ignoring != nil }, set: { if !$0 { ignoring = nil } }), presenting: ignoring) { task in
             Button(L10n.text("取消"), role: .cancel) { ignoring = nil }
             Button(L10n.text("忽略本轮"), role: .destructive) {
-                if !state.ignoreEpisode(task) { error = L10n.text("待续状态无法保存，暂停自动操作") }
+                if !state.ignoreEpisode(task) { error = state.pendingStateFailure ?? ResumePreflightReason.runtimeUnhealthy.userMessage }
                 ignoring = nil
             }
         } message: { task in
@@ -108,17 +108,20 @@ private struct ResumeTaskRow: View {
         !isHistory && operation?.needsManualContinuation != true && operation?.respondedAt == nil && operation?.phase != .stopped
     }
     private var needsChoice: Bool {
-        state.choices.recoveryDecisions?[task.episodeKey].map { $0.phase != .responded } ?? false
+        state.enabled && state.automaticResumeEnabled && selected && !state.choices.keepAliveEpisodes.contains(task.episodeKey) &&
+            (state.choices.recoveryDecisions?[task.episodeKey].map { $0.phase != .responded } ?? false)
     }
     private var statusColor: Color {
         if operation?.needsManualContinuation == true { return .red }
         if operation?.respondedAt != nil { return .green }
-        if operation?.phase == .notSubmitted || (operation?.phase == .stopped && operation?.terminal != .quotaStopped) || (!isHistory && needsChoice) { return .red }
+        if operation?.notSubmittedNeedsAttention == true || (operation?.phase == .stopped && operation?.terminal != .quotaStopped) || (!isHistory && needsChoice) { return .red }
         return ResumeTaskFact.make(task: task, operation: operation).isConfirming ? .blue : .secondary
     }
 
     var body: some View {
-        let fact = ResumeTaskFact.make(task: task, operation: operation, enabled: state.enabled, autoResume: state.automaticResumeEnabled)
+        let fact = ResumeTaskFact.make(task: task, operation: operation, enabled: isHistory || state.enabled,
+            autoResume: isHistory || state.automaticResumeEnabled, selected: isHistory || selected,
+            cancelled: !isHistory && state.choices.keepAliveEpisodes.contains(task.episodeKey))
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "text.bubble").font(.system(size: 15)).foregroundStyle(.secondary)
                 .frame(width: 16, height: 22).accessibilityHidden(true)
@@ -154,7 +157,8 @@ private struct ResumeTaskRow: View {
                             .fixedSize().disabled(!selected || locked)
                     }
                 }
-                if !isHistory, operation?.needsManualContinuation == true,
+                if !isHistory, operation?.needsManualContinuation == true ||
+                    (operation?.phase == .checking && operation?.respondedAt == nil),
                    let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
                     Button(L10n.text("打开 Codex")) {
                         let configuration = NSWorkspace.OpenConfiguration(); configuration.activates = true
@@ -174,7 +178,7 @@ private struct ResumeTaskRow: View {
                         if state.execution.isKeepingAlive {
                             Text(L10n.text("正在保活，完成后可选择现在继续")).font(.system(size: 13)).foregroundStyle(.secondary)
                         }
-                    } else if operation?.phase == .notSubmitted {
+                    } else if operation?.canRetrySubmission == true {
                         HStack {
                             Text(state.planExplanation(for: task) ?? "").font(.system(size: 13)).foregroundStyle(.secondary)
                             Spacer()

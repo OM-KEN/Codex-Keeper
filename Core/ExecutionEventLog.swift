@@ -84,7 +84,7 @@ struct ExecutionEventLog {
         }
     }
 
-    func record(_ event: String, kind: String, node: Date?, before: UsageSnapshot? = nil, after: UsageSnapshot? = nil, error: String? = nil, threadID: String? = nil, turnID: String? = nil, diagnostic: PingDiagnostic? = nil, schedule: ScheduleEngine? = nil, accountID: String? = nil, operationID: String? = nil, episodeKey: String? = nil, at: Date? = nil) throws {
+    func record(_ event: String, kind: String, node: Date?, before: UsageSnapshot? = nil, after: UsageSnapshot? = nil, error: String? = nil, threadID: String? = nil, turnID: String? = nil, diagnostic: PingDiagnostic? = nil, preflight: PingPreflightDiagnostic? = nil, resumePreflight: ResumePreflightDiagnostic? = nil, schedule: ScheduleEngine? = nil, accountID: String? = nil, operationID: String? = nil, episodeKey: String? = nil, at: Date? = nil) throws {
         ExecutionLogWrite.lock.lock(); defer { ExecutionLogWrite.lock.unlock() }
         let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var row: [String: Any] = ["event": event, "kind": kind, "at": iso.string(from: at ?? Date())]
@@ -109,6 +109,20 @@ struct ExecutionEventLog {
             row["diagnostic"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(diagnostic))
             if let id = diagnostic.threadID { row["thread_id"] = id }
             if let id = diagnostic.turnID { row["turn_id"] = id }
+        }
+        if let preflight {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .custom { date, encoder in
+                var value = encoder.singleValueContainer(); try value.encode(iso.string(from: date))
+            }
+            row["preflight"] = try JSONSerialization.jsonObject(with: encoder.encode(preflight))
+        }
+        if let resumePreflight {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .custom { date, encoder in
+                var value = encoder.singleValueContainer(); try value.encode(iso.string(from: date))
+            }
+            row["preflight"] = try JSONSerialization.jsonObject(with: encoder.encode(resumePreflight))
         }
         var data = try JSONSerialization.data(withJSONObject: row, options: .sortedKeys); data.append(10)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)

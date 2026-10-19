@@ -12,6 +12,12 @@ import Darwin
         }
         let appUpdateOnly = CommandLine.arguments.contains("--app-update-only")
         if !appUpdateOnly {
+            try await checkLogicRepairRegression(check)
+            if CommandLine.arguments.contains("--logic-repair-only") {
+                print("\(count - failed)/\(count) logic repair checks passed")
+                if failed > 0 { exit(1) }
+                return
+            }
             try await checkResumeStateRegression(check)
             if CommandLine.arguments.contains("--resume-state-only") {
                 print("\(count - failed)/\(count) resume state checks passed")
@@ -592,7 +598,7 @@ import Darwin
             ResumeMessagePreferences.content(saved: "", mode: customMode, localizedDefault: "Continue") == "Continue",
             "default selection ignores stored custom text and empty custom text does not send a blank prompt")
         for message in ["workspace routing discovery timed out", "workspace routing discovery timedout"] {
-            check(CodexConnectionError.server(message).localizedDescription == "Codex 服务连接超时，请检查网络或代理后重新同步。" &&
+            check(CodexConnectionError.server(message).localizedDescription == "连接失败，请检查网络后刷新。" &&
                 CodexConnectionError.serverFailureReason(message) == "workspace_routing_timeout",
                 "workspace routing timeout has Chinese UI text and stable diagnostic reason: \(message)")
         }
@@ -1090,7 +1096,7 @@ import Darwin
             "temporary failure without a fresh reading waits for sync instead of warning about execution")
         freshSyncFailure.applyIssues(usageError: "后台暂时连接失败", sessionError: "任务扫描不兼容", executionFailure: nil, executionAction: "保活",
             usageErrorIsTransient: true)
-        check(freshSyncFailure.statusSymbol == "exclamationmark.circle" && freshSyncFailure.error.contains("任务扫描不兼容") && freshSyncFailure.error.contains("后台暂时连接失败"),
+        check(freshSyncFailure.statusSymbol == "exclamationmark.circle" && freshSyncFailure.error.contains(L10n.text("任务读取失败，请打开 Codex 后刷新。")) && freshSyncFailure.error.contains("后台暂时连接失败"),
             "a temporary quota error cannot hide an actionable task scanning error")
 
         var authIdentity: Data? = Data("account-a".utf8)
@@ -1616,7 +1622,7 @@ import Darwin
         }
         let fake = FakeTransport(threadID: pending.id, cwd: pending.cwd)
         let receipt = try AppServerResumeTransport(makeTransport: { fake }).resume(pending, prompt: "继续")
-        check(receipt.turnID == "turn-1" && fake.closed, "resume observes matching completion")
+        check(receipt.turnID == "turn-1", "resume observes a real matching model response")
         check(fake.calls.map { $0.0 } == ["thread/resume", "turn/start"], "resume never creates new thread")
         check(fake.calls.first?.1["excludeTurns"] as? Bool == true, "resume requests metadata without historical turn payloads")
         check(fake.calls.allSatisfy { $0.1["approvalPolicy"] == nil && $0.1["sandboxPolicy"] == nil && $0.1["sandbox"] == nil }, "resume does not override user permissions")
@@ -1624,7 +1630,7 @@ import Darwin
         ownerConnection.onStart = {
             let handle = try FileHandle(forWritingTo: file); defer { try? handle.close() }
             try handle.seekToEnd()
-            try handle.write(contentsOf: Data(event("task_complete", Date(), ["turn_id": "desktop-turn"]).utf8))
+            try handle.write(contentsOf: Data(event("task_complete", Date(), ["turn_id": "desktop-turn", "last_agent_message": "real reply"]).utf8))
         }
         let unusedBackend = FakeTransport(threadID: pending.id, cwd: pending.cwd)
         let ownedReceipt = try OwnedSessionResumeTransport(makeDesktop: { ownerConnection }, fallback: AppServerResumeTransport(makeTransport: { unusedBackend })).resume(pending, prompt: "继续")
@@ -1643,7 +1649,7 @@ import Darwin
         check(try !turnMonitor.consume(Data(event("task_complete", now, ["turn_id": "other"]).utf8)), "another completed turn cannot confirm our resume")
         let finishedLine = Data(event("task_complete", now, ["turn_id": "ours"]).utf8)
         check(try !turnMonitor.consume(finishedLine.prefix(10)), "partial rollout line waits for remaining bytes")
-        check(try turnMonitor.consume(finishedLine.dropFirst(10)), "matching complete rollout line confirms resume")
+        check(try !turnMonitor.consume(finishedLine.dropFirst(10)), "matching empty completion cannot confirm a model response")
         var failedTurn = ResumeTurnMonitor(turnID: "ours")
         do {
             _ = try failedTurn.consume(Data(event("task_complete", now, ["turn_id": "ours", "error": ["message": "usage limit"]]).utf8))
@@ -1694,7 +1700,7 @@ import Darwin
             if method=='close-input': os.close(0)
             print(json.dumps({'id':request['id'],'result':result}),flush=True)
             if method=='turn/start':
-                print(json.dumps({'method':'turn/completed','params':{'threadId':resumeTarget['threadId'],'turn':{'id':'large-history-turn','status':'completed'}}}),flush=True)
+                print(json.dumps({'method':'turn/completed','params':{'threadId':resumeTarget['threadId'],'turn':{'id':'large-history-turn','status':'completed','items':[{'id':'reply','type':'agentMessage','text':'real reply'}]}}}),flush=True)
             if method=='close-input': time.sleep(10); break
             if method=='exit': break
         """
@@ -1721,7 +1727,7 @@ import Darwin
             _ = try oversizedClient.request("oversized-response", params: [:])
             check(false, "oversized JSONL response must stop at the existing buffer limit")
         } catch {
-            check(error.localizedDescription == L10n.text("Codex 返回的数据超过读取上限，已停止本次操作"), "buffer overflow reports response size rather than invalid format")
+            check(error.localizedDescription == L10n.text("暂时无法读取，请更新 Codex 后刷新。"), "buffer overflow reports response size rather than invalid format")
             check(UsageReadFailure.reason(for: error) == "response_too_large" && !UsageReadFailure.canRetry(error), "oversized responses have a distinct non-retryable diagnostic")
         }
         oversizedClient.close()
@@ -2252,7 +2258,7 @@ import Darwin
             _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: pingRoot, binary: fakeTUI).ping(before: pingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: FakePingUsage(account: pingBefore.accountID!))
             check(false, "config startup failure cannot report quota confirmation timeout")
         } catch {
-            check(error.localizedDescription.contains("无法读取保活配置"), "config startup failure cannot report quota confirmation timeout")
+            check(error.localizedDescription.contains("设置未就绪"), "config startup failure cannot report quota confirmation timeout")
         }
         let diagnosticHome = temp.appendingPathComponent("ping-log-fixture")
         try FileManager.default.createDirectory(at: diagnosticHome, withIntermediateDirectories: true)
@@ -2287,13 +2293,13 @@ import Darwin
         let safeEvent = try String(contentsOf: safeEventURL, encoding: .utf8)
         check(!safeEvent.contains("fixture-secret-token") && !safeEvent.contains("Authorization") && !safeEvent.contains("sampling_error") && safeEvent.contains(pingTurn),
             "execution diagnostic persists classifications and identity, never raw HTTP/log content")
-        check(safeDiagnostic.warning.contains("超时") && safeDiagnostic.warning.contains("180"), "90-second warning explains timeout and continuing deadline")
+        check(safeDiagnostic.warning == L10n.text("正在确认中"), "90-second progress shares the same waiting message without exposing the deadline")
         safeDiagnostic.okReceived = true; safeDiagnostic.taskCompleted = true
-        check(safeDiagnostic.warning.contains("已收到 OK") && !safeDiagnostic.warning.contains("重试"), "OK completion advances warning to window confirmation")
+        check(safeDiagnostic.warning == L10n.text("正在确认中"), "received completion continues the same waiting message")
         safeDiagnostic.okReceived = false; safeDiagnostic.taskCompleted = false; safeDiagnostic.reason = .unknown
         check(!safeDiagnostic.warning.contains("重试") && !safeDiagnostic.warning.contains("代理"), "unknown wait does not invent network evidence")
-        let warningMenu = MenuSummary(headline: "保活等待中", note: safeDiagnostic.warning, warning: safeDiagnostic.warning)
-        check(warningMenu.statusSymbol == "exclamationmark.circle" && warningMenu.error.isEmpty, "pending warning has visible icon without final failure")
+        let warningMenu = MenuSummary(headline: "正在确认中", note: safeDiagnostic.warning, warning: safeDiagnostic.warning)
+        check(warningMenu.statusSymbol != "exclamationmark.circle" && warningMenu.error.isEmpty, "a pending confirmation has no failure icon")
 
         // Shortened test timing exercises the same PTY loop without network access or real runtime data.
         let slowTUI = temp.appendingPathComponent("slow-fake-tui")
@@ -2375,7 +2381,7 @@ import Darwin
             check(failure.diagnostic.elapsedSeconds >= verificationTiming.timeout && failure.diagnostic.okReceived &&
                 failure.diagnostic.taskCompleted && !failure.diagnostic.windowConfirmed,
                 "persistent quota errors keep the original confirmation deadline after the completed PTY exits")
-            check(failure.localizedDescription.contains("保活已发送") && persistentProgress.contains {
+            check(failure.localizedDescription.contains("结果待确认") && failure.diagnostic.diagnosticMessage.contains("保活已发送") && persistentProgress.contains {
                 $0.outcome == "waiting" && $0.elapsedSeconds >= verificationTiming.warning && $0.quotaReadFailure != nil
             }, "read-only verification failure still warns at the configured threshold and distinguishes sent but unconfirmed")
         }
@@ -3095,11 +3101,11 @@ import Darwin
             }
             for (index, node) in nodes.enumerated() {
                 clockNow = node.addingTimeInterval(Double(50 + index * 90)); provider.set(idle())
-                coordinator!.ping(schedule: schedule, accountID: "grace-account", hasPending: { false })
+                coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] })
                 try await settle()
                 check(pings.count == index + 1, "four-node accumulated drift still executes keep-alive round \(index + 1) once")
                 clockNow = clockNow.addingTimeInterval(10); provider.set(idle())
-                coordinator!.ping(schedule: schedule, accountID: "grace-account", hasPending: { false })
+                coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] })
                 try await settle()
                 check(pings.count == index + 1, "refresh after drifted keep-alive round \(index + 1) cannot duplicate its original node")
             }
@@ -3109,7 +3115,7 @@ import Darwin
             coordinator = nil
             coordinator = ExecutionCoordinator(provider: provider, defaults: prefs, ledgerURL: ledger,
                 pingTransport: pings, codexHome: home, now: { clockNow })
-            coordinator!.ping(schedule: schedule, accountID: "grace-account", hasPending: { false }); try await settle()
+            coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] }); try await settle()
             check(pings.count == 4, "restarted coordinator cannot resend the final drifted scheduled round")
             coordinator = nil
             for (name, from, to, expected) in [("three-minute crossing", 179.0, 182.0, true), ("ten-minute crossing", 599.0, 600.001, false)] {
@@ -3117,7 +3123,7 @@ import Darwin
                 coordinator = ExecutionCoordinator(provider: provider, defaults: prefs, ledgerURL: root.appendingPathComponent(name + "/attempts.json"),
                     pingTransport: pings, codexHome: home, now: { clockNow })
                 let oldCount = pings.count
-                coordinator!.ping(schedule: schedule, accountID: "grace-account", hasPending: { false })
+                coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] })
                 try await Task.sleep(nanoseconds: 50_000_000)
                 clockNow = nodes[0].addingTimeInterval(to); provider.set(idle()); provider.release(); try await settle()
                 check(pings.count == oldCount + (expected ? 1 : 0), "final send guard honors \(name) without changing the attempt node")
@@ -3727,7 +3733,7 @@ final class FakeTransport: CodexTransport {
     func nextMessage(timeout: TimeInterval) throws -> [String: Any] {
         if !waited { waited = true; throw CodexConnectionError.timeout }
         if needsApproval && !approvalDelivered { approvalDelivered = true; return ["id": 100, "method": "item/commandExecution/requestApproval", "params": ["threadId": threadID, "turnId": "turn-1"]] }
-        return ["method": "turn/completed", "params": ["threadId": threadID, "turn": ["id": "turn-1", "status": interrupted ? "interrupted" : "completed"]]]
+        return ["method": "turn/completed", "params": ["threadId": threadID, "turn": ["id": "turn-1", "status": interrupted ? "interrupted" : "completed", "items": interrupted ? [] : [["type": "agentMessage", "id": "reply", "text": "real reply"]]]]]
     }
     func close() { closed = true }
 }
@@ -4217,9 +4223,9 @@ private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
         "reliable account changes during execution show only the new account's current quota and history")
     var warningState = MenuPresentation()
     _ = render(&warningState, usage: live, running: true, mode: .keepAlive)
-    let waiting = render(&warningState, usage: nil, running: true, mode: .keepAlive, warning: "本轮仍在等待真实确认")
+    let waiting = render(&warningState, usage: nil, running: true, mode: .keepAlive, warning: L10n.text("正在确认中"))
     let warningCleared = render(&warningState, usage: nil, running: true, mode: .keepAlive)
-    check(waiting.headline == "保活等待中" && waiting.statusSymbol == "exclamationmark.circle" &&
+    check(waiting.headline == "正在确认中" && waiting.statusSymbol != "exclamationmark.circle" &&
         !waiting.timeline.isEmpty && warningCleared.warning.isEmpty && warningCleared.note.isEmpty,
         "current wait warnings overlay retained history and disappear as soon as the real warning clears")
     var history = MenuPresentation()

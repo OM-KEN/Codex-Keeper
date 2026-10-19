@@ -100,11 +100,12 @@ struct ResumeChoices: Codable, Equatable {
     var messages: [String: String] = [:]
 
     var keepAliveIgnoredEpisodes: Set<String> {
-        keepAliveEpisodes.union(ignoredEpisodes ?? []).union(recoveryDecisions?.keys.map { $0 } ?? [])
+        keepAliveEpisodes.union(deselectedEpisodes).union(ignoredEpisodes ?? []).union(recoveryDecisions?.keys.map { $0 } ?? [])
     }
 
-    func permitsKeepAlive(for tasks: [BlockedSession], ignoring episodes: Set<String>) -> Bool {
-        episodes.isSubset(of: keepAliveIgnoredEpisodes) && tasks.allSatisfy { episodes.contains($0.episodeKey) }
+    func permitsKeepAlive(for tasks: [BlockedSession], ignoring episodes: Set<String>, autoResume: Bool = true) -> Bool {
+        let allowed = autoResume ? keepAliveIgnoredEpisodes : keepAliveIgnoredEpisodes.union(tasks.map(\.episodeKey))
+        return episodes.isSubset(of: allowed) && tasks.allSatisfy { episodes.contains($0.episodeKey) }
     }
 
     func available(_ tasks: [BlockedSession]) -> [BlockedSession] {

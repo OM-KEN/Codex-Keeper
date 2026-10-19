@@ -64,8 +64,8 @@ struct SettingsView: View {
                     HStack(spacing: 0) {
                         Text(L10n.text("额度恢复后自动继续"))
                         InfoHintButton(label: L10n.text("自动续跑说明"),
-                            hint: L10n.text("正常恢复后继续；其他恢复情况提醒你选择。"),
-                            detail: L10n.text("因额度用尽而暂停的任务，将在额度正常恢复后自动继续。提前恢复或恢复情况不明时，会提醒你选择。"))
+                            hint: L10n.text("正常恢复后继续；提前恢复时提醒你选择。"),
+                            detail: L10n.text("因额度用尽而暂停的任务，将在额度正常恢复后自动继续；提前恢复时先等你选择，未选择则等到确认正常恢复后自动继续。"))
                     }
                 }
                 VStack(alignment: .leading, spacing: 8) {

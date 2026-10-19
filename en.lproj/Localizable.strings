@@ -24,7 +24,7 @@
 "退出 Codex Keeper" = "Quit Codex Keeper";
 "设置你的每日计划" = "Set Your Daily Schedule";
 "每 5 小时让 Codex 自动保持活动，帮你更充分地利用每天的额度。" = "Keep Codex active every 5 hours to make better use of your daily quota.";
-"因额度用尽而暂停的任务，将在额度正常恢复后自动继续；提前恢复时提醒你选择，未选择时不会继续。" = "Tasks paused by quota exhaustion resume after normal recovery. For early recovery, Keeper reminds you and waits for your choice.";
+"因额度用尽而暂停的任务，将在额度正常恢复后自动继续；提前恢复时先等你选择，未选择则等到确认正常恢复后自动继续。" = "Tasks paused by quota exhaustion resume after normal recovery. If quota recovers early, Keeper waits for your choice; without a choice, it continues after normal recovery is confirmed.";
 "保持活动" = "Keep Active";
 "自动继续" = "Resume";
 "自动继续任务" = "Auto-resume Tasks";
@@ -65,8 +65,7 @@
 "计划预览：%@" = "Schedule Preview: %@";
 "额度恢复后自动继续" = "Resume After Quota Resets";
 "自动续跑说明" = "Auto-resume information";
-"正常恢复后继续；其他恢复情况提醒你选择。" = "Resume after normal recovery; otherwise, notify you and wait for your choice.";
-"因额度用尽而暂停的任务，将在额度正常恢复后自动继续。提前恢复或恢复情况不明时，会提醒你选择。" = "Tasks paused by quota exhaustion resume after normal recovery. For early or uncertain recovery, Keeper waits for your choice.";
+"正常恢复后继续；提前恢复时提醒你选择。" = "Resume after normal recovery; notify you to choose if quota recovers early.";
 "发送给 Codex 的内容" = "Message to Codex";
 "默认发送“%@”" = "Default: %@";
 "自定义内容" = "Custom Message";
@@ -136,7 +135,8 @@
 "等待下一可行计划节点" = "Waiting for the next available scheduled time";
 "请选择要继续的任务" = "Choose a task to resume";
 "账户已改变" = "Account changed";
-"待续状态无法保存，暂停自动操作" = "Could not save pending task state; automatic actions are paused";
+"继续操作已中断，请手动重试。" = "Continuation was interrupted. Retry manually.";
+"继续操作已中断，等待自动重试。" = "Continuation was interrupted. Waiting to retry automatically.";
 "等待计划" = "Waiting for schedule";
 "执行记录无法读取，已暂停自动操作" = "Could not read execution records; automatic actions are paused";
 "另一个 Keeper 实例正在管理执行" = "Another Keeper instance is managing execution";
@@ -293,7 +293,9 @@
 
 "未发送，%@" = "Not sent: %@";
 
-"已暂停，等待自动继续" = "Paused, waiting to continue automatically";
+"等待自动继续" = "Waiting to continue automatically";
+
+"已取消本次自动继续" = "Automatic continuation cancelled for this stop";
 
 "已暂停，Keeper 已停用" = "Paused, Keeper is disabled";
 
@@ -339,6 +341,12 @@
 
 "%d 个任务等待自动继续" = "%d tasks waiting to continue automatically";
 
+"%d 个任务已暂停自动继续" = "Automatic continuation is paused for %d tasks";
+
+"%d 个任务已关闭自动继续" = "Automatic continuation is off for %d tasks";
+
+"%d 个任务已取消本次自动继续" = "Automatic continuation cancelled for %d tasks";
+
 "续跑记录" = "Resume log";
 
 "%d 个任务续跑已停止" = "%d continuations stopped";
@@ -359,3 +367,153 @@
 "窗口开始" = "Window start";
 
 "已重置" = "Quota Reset";
+
+"保活未发送：本次准备已取消" = "Keep-alive not sent: this preparation was cancelled";
+"保活未发送：自动执行已关闭" = "Keep-alive not sent: automatic execution is off";
+"保活未发送：每日开始时间已改变" = "Keep-alive not sent: the daily start time changed";
+"保活未发送：账户已改变" = "Keep-alive not sent: the account changed";
+"保活未发送：账户暂时无法确认" = "Keep-alive not sent: the account cannot be verified yet";
+"保活未发送：待续状态无法保存" = "Keep-alive not sent: pending task state could not be saved";
+"保活未发送：等待首次任务扫描" = "Keep-alive not sent: waiting for the first task scan";
+"保活未发送：任务扫描失败" = "Keep-alive not sent: the task scan failed";
+"保活未发送：等待关键额度刷新" = "Keep-alive not sent: waiting for a required quota refresh";
+"保活未发送：Keeper 正在处理续跑任务" = "Keep-alive not sent: Keeper is handling a task continuation";
+"保活未发送：Codex 任务正在运行" = "Keep-alive not sent: a Codex task is running";
+"保活未发送：待续任务或选择已改变" = "Keep-alive not sent: pending tasks or task choices changed";
+"保活未发送：应用状态暂时无法确认" = "Keep-alive not sent: application state cannot be verified yet";
+"保活未发送：发现新的额度暂停任务" = "Keep-alive not sent: a new task paused at its quota limit";
+"保活未发送：额度读数需重新确认" = "Keep-alive not sent: the quota reading needs to be checked again";
+"保活未发送：系统时区已改变" = "Keep-alive not sent: the system time zone changed";
+"保活未发送：本次保活时间已过" = "Keep-alive not sent: the scheduled keep-alive time has passed";
+"保活未发送：当前计划节点已改变" = "Keep-alive not sent: the current scheduled node changed";
+
+"工作目录不可用" = "The workspace is unavailable";
+"原任务已归档" = "The original task was archived";
+"无法读取原任务记录" = "The original task record cannot be read";
+"原任务身份已改变" = "The original task identity changed";
+"子任务不支持自动续跑" = "Subagents cannot be continued automatically";
+"原任务已有新的用户输入" = "The original task has new user input";
+"原任务已再次开始" = "The original task started again";
+"原任务已被停止" = "The original task was stopped";
+"原任务已有新的模型响应" = "The original task has a new model response";
+"原任务正在运行" = "The original task is running";
+"原任务的额度停止记录已变化" = "The original quota pause changed";
+"账户暂时无法确认" = "The account cannot be verified yet";
+"额度读数需重新确认" = "The quota reading needs to be checked again";
+"额度采样未晚于本次暂停" = "The quota sample does not follow this pause";
+"额度窗口暂时无法确认" = "Quota windows cannot be verified yet";
+"5 小时额度暂时无法确认" = "The 5-hour quota cannot be verified yet";
+"每周额度暂时无法确认" = "The weekly quota cannot be verified yet";
+"5 小时额度尚未恢复" = "The 5-hour quota has not recovered";
+"每周额度尚未恢复" = "The weekly quota has not recovered";
+"本次额度恢复尚未确认" = "Quota recovery for this pause is not confirmed";
+"本次续跑准备已取消" = "This continuation preparation was cancelled";
+"执行记录无法保存" = "Execution records cannot be saved";
+"本次暂停已尝试续跑" = "This pause already has a continuation attempt";
+"任务选择已改变" = "The task selection changed";
+"待续状态无法保存" = "Pending task state cannot be saved";
+"任务扫描失败" = "The task scan failed";
+"发送内容选项已改变" = "The message option changed";
+"发送内容已改变" = "The message changed";
+"续跑恢复选择已改变" = "The recovery choice changed";
+"系统时区已改变" = "The system time zone changed";
+"提前恢复策略已改变" = "The early-recovery policy changed";
+"每日开始时间已改变" = "The daily start time changed";
+"Keeper 已停用" = "Keeper is disabled";
+"应用状态暂时无法确认" = "Application state cannot be verified yet";
+"原任务工作目录已改变" = "The original task workspace changed";
+"续跑准备失败" = "Continuation preparation failed";
+"续跑准备已中断" = "Continuation preparation was interrupted";
+
+"保活未发送：保活模型确认失败" = "Keep-alive not sent: model verification failed";
+"保活未发送：额度读取失败" = "Keep-alive not sent: quota could not be read";
+
+"找不到 Codex，请安装或更新 Codex 后刷新。" = "Codex was not found, install or update Codex, then refresh.";
+"连接失败，请检查网络后刷新。" = "Connection failed, check your network and refresh.";
+"连接中断，请刷新后查看。" = "Connection interrupted, refresh to check again.";
+"服务暂不可用，请稍后刷新。" = "The service is unavailable, refresh later.";
+"需要登录，请在 Codex 登录后刷新。" = "Sign-in is required, sign in to Codex, then refresh.";
+"账户已切换，请切回原账户后刷新。" = "The account changed, switch back to the original account, then refresh.";
+"暂时无法读取，请更新 Codex 后刷新。" = "The response could not be read, update Codex, then refresh.";
+"需要授权，请到 Codex 完成授权后继续。" = "Approval is required, complete the approval in Codex to continue.";
+"暂不支持，请更新 Codex，并用 ChatGPT 账户登录后刷新。" = "This is not supported yet, update Codex, sign in with a ChatGPT account, then refresh.";
+"暂时无法完成，请先到 Codex 检查后刷新。" = "The action could not be completed, check Codex, then refresh.";
+"登录方式不支持，请在 Codex 改用 ChatGPT 账户登录后刷新。" = "This sign-in method is not supported, sign in to Codex with a ChatGPT account, then refresh.";
+"当前模型不可用，请更新 Codex 后刷新。" = "The model is unavailable, update Codex, then refresh.";
+"账户待确认，请在 Codex 检查登录后刷新。" = "The account needs to be checked, check your Codex sign-in, then refresh.";
+"Keeper 已暂停，请在设置中启用 Keeper。" = "Keeper is paused, enable Keeper in Settings.";
+"记录不可用，请检查磁盘空间后刷新。" = "Records are unavailable, check your disk space, then refresh.";
+"任务正在运行，请等待当前任务完成。" = "A task is running, wait for it to finish.";
+"任务有变化，请查看任务列表后刷新。" = "Tasks have changed, check the task list, then refresh.";
+"计划已变化，请等待下一次计划。" = "The plan changed, wait for the next scheduled time.";
+"本次保活已错过。" = "This keep-alive was missed.";
+"暂时无法保活，请更新 Codex，并用 ChatGPT 账户登录后刷新。" = "Keep-alive is unavailable, update Codex, sign in with a ChatGPT account, then refresh.";
+"状态待更新，请刷新后查看。" = "The status needs updating, refresh to check again.";
+"额度待更新，请刷新后重试。" = "Quota needs updating, refresh, then retry.";
+"额度待恢复，请等待额度恢复后再试。" = "Quota has not recovered yet, wait for quota to recover, then retry.";
+"自动继续已暂停，请在设置中开启自动继续。" = "Automatic continuation is paused, enable automatic continuation in Settings.";
+"计划已变化，请按新设置继续。" = "The plan changed, continue using the new settings.";
+"选择已变化，请确认任务选项后重试。" = "Task options changed, check the task options, then retry.";
+"任务待处理，请先到 Codex 查看原任务。" = "The task needs attention, check the original task in Codex.";
+"发送内容不可用，请改用“默认发送”后重试。" = "The message is unavailable, choose “Default” and retry.";
+"发送未完成，请先在 Codex 检查原任务。" = "The message was not sent, check the original task in Codex first.";
+"结果待确认，请先到 Codex 查看原任务。" = "The result is unconfirmed, check the original task in Codex first.";
+"需要手动继续，请到 Codex 查看原任务。" = "Manual continuation is needed, check the original task in Codex.";
+"任务已停止，请先到 Codex 查看原任务。" = "The task stopped, check the original task in Codex first.";
+"正在确认结果，" = "Checking the result, ";
+"连接较慢，" = "The connection is slow, ";
+"仍在等待结果，" = "Still waiting for the result, ";
+"请继续等待，最多 %d 秒。" = "please keep waiting, up to %d seconds.";
+"设置未就绪，请更新 Codex。" = "Setup is not ready, update Codex.";
+"本次保活已停止。" = "This keep-alive attempt has stopped.";
+"结果待确认，请刷新查看额度。" = "The result is unconfirmed, refresh to check quota.";
+"Keeper 已在运行，请使用已打开的 Keeper。" = "Keeper is already running, use the Keeper that is already open.";
+"任务读取失败，请打开 Codex 后刷新。" = "Tasks could not be read, open Codex, then refresh.";
+
+"记录无法读取，请到关于页反馈问题。" = "Records could not be read, report the problem from About.";
+
+"确认中，请等待。" = "Confirming, please wait.";
+"等待状态更新。" = "Waiting for a status update.";
+"设置已更新，等待新计划。" = "Settings updated, waiting for the new plan.";
+"设置已更新，请查看当前计划。" = "Settings updated, check the current plan.";
+"续跑选择已更新，请查看当前计划。" = "Continuation choice updated, check the current plan.";
+"找不到项目文件夹，请检查位置或废纸篓。" = "Project folder not found, check its location or the Trash.";
+"原任务已归档，请到 Codex 查看原任务。" = "The original task is archived, check it in Codex.";
+"任务记录无法读取，请到 Codex 查看原任务。" = "The task record cannot be read, check the original task in Codex.";
+"原任务已停止，请到 Codex 手动继续。" = "The original task stopped, continue it manually in Codex.";
+"原任务已有新进展。" = "The original task has newer activity.";
+"任务状态已更新。" = "Task status updated.";
+"等待额度恢复。" = "Waiting for quota to recover.";
+"已暂停，未选择自动继续" = "Paused, automatic continuation is not selected";
+"%d 个任务状态已更新" = "%d tasks updated";
+"%d 个任务已暂停" = "%d tasks paused";
+"Codex Keeper 保活确认中" = "Codex Keeper is confirming keep-alive";
+
+"等待下一次计划。" = "Waiting for the next plan.";
+"本次未发送，请查看当前计划。" = "Nothing was sent, check the current plan.";
+
+"账户已切换，请切回原账户。" = "Account changed, switch back to the original account.";
+"连接失败，请检查网络。" = "Connection failed, check your network.";
+"服务暂不可用，请等待下次保活。" = "The service is unavailable, wait for the next scheduled keep-alive.";
+
+"正在确认中" = "Confirming";
+
+"%d 个任务正在确认中" = "%d tasks confirming";
+
+"本次保活已错过，请等待下次保活或手动保活。" = "This keep-alive was missed. Wait for the next keep-alive or run one manually.";
+
+"设置已更新，等待下次保活。" = "Settings updated, waiting for the next keep-alive.";
+
+"设置已更新，等待下次自动继续。" = "Settings updated, waiting for the next automatic continuation.";
+
+"等待下次自动继续。" = "Waiting for the next automatic continuation.";
+
+"原任务已手动继续。" = "The original task was continued manually.";
+
+"Codex Keeper 正在确认中" = "Codex Keeper is confirming";
+
+"任务已中断，请到 Codex 查看原任务。" = "The task was interrupted, check the original task in Codex.";
+
+"继续失败，请到 Codex 查看原任务。" = "Continuation failed, check the original task in Codex.";
+
+"结果未确认，请到 Codex 查看原任务。" = "The result is unconfirmed, check the original task in Codex.";

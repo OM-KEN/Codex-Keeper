@@ -64,8 +64,8 @@ final class SessionWatcher: ObservableObject {
     var watchedPaths: [URL] = []
     @Published private(set) var scannedAt: Date?
 
-    init(codexHome: URL = CodexEnvironment.home) {
-        worker = SessionScanWorker(codexHome: codexHome)
+    init(codexHome: URL = CodexEnvironment.home, worker: SessionScanWorker? = nil) {
+        self.worker = worker ?? SessionScanWorker(codexHome: codexHome)
     }
     func start(interval: TimeInterval = 20) {
         refresh()
@@ -99,9 +99,9 @@ final class SessionWatcher: ObservableObject {
         }
     }
 
-    nonisolated static func freshBlockedSessions(codexHome: URL = CodexEnvironment.home, watchedIDs: Set<String> = []) throws -> [BlockedSession] {
-        let worker = SessionScanWorker(codexHome: codexHome)
-        let result = worker.read(watchedIDs: watchedIDs)
+    nonisolated static func freshBlockedSessions(codexHome: URL = CodexEnvironment.home, watchedIDs: Set<String> = [], worker: SessionScanWorker? = nil) throws -> [BlockedSession] {
+        let scanner = worker ?? SessionScanWorker(codexHome: codexHome)
+        let result = scanner.read(watchedIDs: watchedIDs)
         if let error = result.1 { throw CodexConnectionError.server(error) }
         return BlockedSessionDetector.detect(in: result.0)
     }
@@ -192,7 +192,7 @@ final class SessionWatcher: ObservableObject {
                 if type == "task_complete" || type == "turn_aborted" {
                     if type == "turn_aborted" { evidence.endedAt = at; evidence.terminal = .aborted }
                     else { evidence.endedAt = evidence.endedAt ?? at; evidence.terminal = evidence.terminal ?? .completed }
-                    if let error = payload["error"] {
+                    if let error = payload["error"], !(error is NSNull) {
                         let text = String(describing: error)
                         evidence.terminal = ResumeModelActivity.quotaError(text) ? .quotaStopped : .failed
                     }
@@ -285,16 +285,20 @@ final class SessionWatcher: ObservableObject {
     }
 }
 
-/// Only one read is in flight. Metadata scanning is cheap; JSON parsing stays off the main actor.
-private final class SessionScanWorker {
+/// The watcher and preflight share one serialized parser cache, never a cached permission to send.
+final class SessionScanWorker: @unchecked Sendable {
     let codexHome: URL
-    let quotaLogs: QuotaErrorLogProvider
-    var cache: [URL: (mtime: Date, activity: SessionActivity)] = [:]
-    init(codexHome: URL) {
+    private let quotaLogs: QuotaErrorLogProvider
+    private let lock = NSLock()
+    private let parseRollout: (URL, Date) -> SessionActivity?
+    private var cache: [URL: (mtime: Date, size: UInt64, inode: UInt64, activity: SessionActivity)] = [:]
+    init(codexHome: URL, parseRollout: @escaping (URL, Date) -> SessionActivity? = { SessionWatcher.parse(url: $0, mtime: $1) }) {
         self.codexHome = codexHome
+        self.parseRollout = parseRollout
         quotaLogs = QuotaErrorLogProvider(codexHome: codexHome)
     }
     func read(watchedIDs: Set<String>, watchedPaths: [URL] = []) -> ([SessionActivity], String?) {
+        lock.lock(); defer { lock.unlock() }
         var stops: [String: QuotaStop] = [:]
         var errorMessage: String?
         var all = SessionWatcher.recentRollouts(codexHome: codexHome, limit: Int.max)
@@ -323,9 +327,13 @@ private final class SessionScanWorker {
         var activities: [SessionActivity] = []
         for file in files {
             var activity: SessionActivity?
-            if let cached = cache[file.url], cached.mtime == file.mtime { activity = cached.activity }
-            else if let parsed = SessionWatcher.parse(url: file.url, mtime: file.mtime) {
-                cache[file.url] = (file.mtime, parsed); activity = parsed
+            let attributes = try? FileManager.default.attributesOfItem(atPath: file.url.path)
+            let size = (attributes?[.size] as? NSNumber)?.uint64Value
+            let inode = (attributes?[.systemFileNumber] as? NSNumber)?.uint64Value
+            if let cached = cache[file.url], let size, let inode,
+               cached.mtime == file.mtime, cached.size == size, cached.inode == inode { activity = cached.activity }
+            else if let parsed = parseRollout(file.url, file.mtime) {
+                cache[file.url] = (file.mtime, size ?? 0, inode ?? 0, parsed); activity = parsed
             } else {
                 let name = file.url.deletingPathExtension().lastPathComponent
                 if cache[file.url] != nil || name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) != nil {

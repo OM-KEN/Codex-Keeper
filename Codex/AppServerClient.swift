@@ -15,7 +15,7 @@ extension CodexTransport { var lastSubmissionRequestID: Int? { nil } }
 
 enum CodexConnectionError: LocalizedError {
     case unavailable, timeout, ended, invalidResponse, responseTooLarge, server(String), localizedMessage(String), approvalRequired
-    var errorDescription: String? {
+    var diagnosticDescription: String? {
         switch self {
         case .unavailable: return L10n.text("找不到官方 Codex CLI")
         case .timeout: return L10n.text("Codex 连接超时，未自动重试")
@@ -33,6 +33,54 @@ enum CodexConnectionError: LocalizedError {
         case .localizedMessage(let message): return message
         case .approvalRequired: return L10n.text("需要用户授权；请在 Codex 中检查原任务后继续")
         }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: return Self.userMessage(reason: "cli_unavailable")
+        case .timeout: return Self.userMessage(reason: "request_timeout")
+        case .ended: return Self.userMessage(reason: "connection_ended")
+        case .invalidResponse, .responseTooLarge: return Self.userMessage(reason: "invalid_response")
+        case .approvalRequired: return Self.userMessage(reason: "approval_required")
+        case .server(let message):
+            let reason = UsageReadFailure.reason(for: self)
+            if reason != "server_error" { return Self.userMessage(reason: reason) }
+            // Existing Chinese safety instructions may describe a specific task or configuration problem.
+            return message.range(of: #"[\p{Han}]"#, options: .regularExpression) != nil ? L10n.text(message) : Self.userMessage(reason: reason)
+        case .localizedMessage(let message): return message
+        }
+    }
+
+    static func userMessage(reason: String) -> String {
+        switch reason {
+        case "request_timeout", "workspace_routing_timeout", "connection_failed": return L10n.text("连接失败，请检查网络后刷新。")
+        case "connection_ended": return L10n.text("连接中断，请刷新后查看。")
+        case "service_unavailable": return L10n.text("服务暂不可用，请稍后刷新。")
+        case "authentication_failed": return L10n.text("需要登录，请在 Codex 登录后刷新。")
+        case "account_changed": return L10n.text("账户已切换，请切回原账户后刷新。")
+        case "cli_unavailable": return L10n.text("找不到 Codex，请安装或更新 Codex 后刷新。")
+        case "invalid_response", "response_too_large": return L10n.text("暂时无法读取，请更新 Codex 后刷新。")
+        case "approval_required": return L10n.text("需要授权，请到 Codex 完成授权后继续。")
+        case "capability_or_authentication": return L10n.text("暂不支持，请更新 Codex，并用 ChatGPT 账户登录后刷新。")
+        default: return L10n.text("暂时无法完成，请先到 Codex 检查后刷新。")
+        }
+    }
+
+    static func capabilityMessage(for error: Error) -> String? {
+        if let error = error as? UsageReadFailure { return capabilityMessage(for: error.underlying) }
+        return (error as? CodexCapabilityError)?.errorDescription
+    }
+
+    /// Keep existing diagnostic descriptions while presentation uses short, actionable text.
+    static func diagnosticDescription(for error: Error) -> String {
+        if let error = error as? UsageReadFailure { return diagnosticDescription(for: error.underlying) }
+        if let error = error as? ResumeSubmissionError { return diagnosticDescription(for: error.underlying) }
+        if let error = error as? Self { return error.diagnosticDescription ?? error.localizedDescription }
+        if let error = error as? CodexCapabilityError { return L10n.text(error.message) }
+        if let error = error as? PingFailure { return error.diagnostic.diagnosticMessage }
+        if let error = error as? PingPreflightDiagnostic { return error.reasons.first?.message ?? error.localizedDescription }
+        if let error = error as? ResumePreflightDiagnostic { return error.diagnosticDescription ?? error.localizedDescription }
+        return error.localizedDescription
     }
 
     static func serverFailureReason(_ message: String) -> String {
@@ -237,7 +285,14 @@ extension UsageProvider {
 
 private struct CodexCapabilityError: LocalizedError {
     let message: String
-    var errorDescription: String? { L10n.text(message) }
+    var errorDescription: String? {
+        switch message {
+        case "请先在 Codex 中登录支持额度查询的 ChatGPT 账户": return CodexConnectionError.userMessage(reason: "authentication_failed")
+        case "当前 Codex 使用 API key 或其他登录方式；Keeper 需要 ChatGPT 账户额度": return L10n.text("登录方式不支持，请在 Codex 改用 ChatGPT 账户登录后刷新。")
+        case "当前账户未提供 gpt-6-luna；请确认 Codex 登录和模型权限后重试，Keeper 不会自动改用其他模型": return L10n.text("当前模型不可用，请更新 Codex 后刷新。")
+        default: return CodexConnectionError.userMessage(reason: "capability_or_authentication")
+        }
+    }
 }
 
 /// Describes Keeper's RPC calls, not the CLI's upstream network requests. No raw error is encoded.
@@ -457,7 +512,7 @@ final class AppServerUsageProvider: UsageProvider {
                 }
                 throw CodexCapabilityError(message: "当前账户未提供 gpt-6-luna；请确认 Codex 登录和模型权限后重试，Keeper 不会自动改用其他模型")
             } catch {
-                let failure = CodexCapabilityError(message: L10n.format("保活模型确认失败：%@；5 分钟后可重试", error.localizedDescription))
+                let failure = CodexCapabilityError(message: L10n.format("保活模型确认失败：%@；5 分钟后可重试", CodexConnectionError.diagnosticDescription(for: error)))
                 // Capability errors leave the healthy quota connection reusable.
                 if error is CodexCapabilityError {
                     modelFailure = failure

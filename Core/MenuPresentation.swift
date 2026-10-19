@@ -25,8 +25,10 @@ struct MenuSummary {
     var reminderTitle = ""
     var reminderBody = ""
 
-    mutating func applyRecoveryReminder(tasks: [BlockedSession], choices: ResumeChoices) {
-        let pending = tasks.compactMap { task -> (BlockedSession, RecoveryDecision)? in
+    mutating func applyRecoveryReminder(tasks: [BlockedSession], choices: ResumeChoices, enabled: Bool = true, autoResume: Bool = true) {
+        reminderTitle = ""; reminderBody = ""
+        guard enabled, autoResume else { return }
+        let pending = choices.selected(tasks).compactMap { task -> (BlockedSession, RecoveryDecision)? in
             choices.recoveryDecisions?[task.episodeKey].flatMap { $0.phase == .responded ? nil : (task, $0) }
         }.sorted { $0.0.blockedAt > $1.0.blockedAt }
         guard let first = pending.first else { return }
@@ -44,7 +46,7 @@ struct MenuSummary {
     var statusQuota: MenuQuota? { quotas.first { $0.name == "5小时" } }
     mutating func applyIssues(usageError: String?, sessionError: String?, executionFailure: String?, executionAction: String,
                              usageErrorIsTransient: Bool = false, executionFailureIsCurrent: Bool = false) {
-        error = [sessionError, usageError].compactMap { $0 }.joined(separator: "\n")
+        error = [sessionError.map { _ in L10n.text("任务读取失败，请打开 Codex 后刷新。") }, usageError].compactMap { $0 }.joined(separator: "\n")
         hasStatusIssue = sessionError != nil || (usageError != nil && !usageErrorIsTransient)
         if let executionFailure {
             let previous = L10n.format("上次%@失败：%@", L10n.text(executionAction), executionFailure)
@@ -63,10 +65,10 @@ struct MenuSummary {
     }
     var statusSymbol: String {
         if headline == "已停用" { return "pause.circle" }
-        if hasStatusIssue || !warning.isEmpty { return "exclamationmark.circle" }
+        if hasStatusIssue || (!warning.isEmpty && warning != L10n.text("正在确认中")) { return "exclamationmark.circle" }
         if isSyncing || headline == "待同步" { return "arrow.triangle.2.circlepath" }
         switch action.isEmpty ? headline : action {
-        case "保持活动", "正在保活": return "waveform.path.ecg"
+        case "保持活动", "正在保活", "正在确认中": return "waveform.path.ecg"
         case "自动继续", "正在继续": return "paperplane"
         case "额度重置": return "arrow.clockwise.circle.fill"
         default: return "clock"
@@ -394,7 +396,7 @@ struct MenuPresentation {
                         usageErrorIsTransient: Bool = false, sessionError: String? = nil,
                         running: Bool = false, executionMode: NextActionMode? = nil,
                         executionFailure: String? = nil, executionFailureIsCurrent: Bool = false,
-                        executionWarning: String? = nil, refreshing: Bool = false,
+                        executionWarning: String? = nil, executionNotice: String? = nil, refreshing: Bool = false,
                         refreshMessage: String = "", now: Date = Date()) -> MenuSummary {
         // Notification delivery and retired deadlines do not change the user's action plan.
         var currentChoices = choices
@@ -512,6 +514,7 @@ struct MenuPresentation {
             summary.applyIssues(usageError: usageError, sessionError: sessionError, executionFailure: executionFailure,
                 executionAction: executionMode == .resume ? "自动继续" : "保活", usageErrorIsTransient: usageErrorIsTransient,
                 executionFailureIsCurrent: executionFailureIsCurrent)
+            if !running, let executionNotice { summary.note = [summary.note, executionNotice].filter { !$0.isEmpty }.joined(separator: "\n") }
             if plan?.note == "账户已改变" {
                 summary.headline = "账户已改变"
                 summary.isSyncing = false
@@ -528,13 +531,13 @@ struct MenuPresentation {
                 if let executionWarning {
                     summary.warning = executionWarning
                     summary.note = executionWarning
-                    summary.headline = "保活等待中"
+                    summary.headline = "正在确认中"
                 }
             } else {
                 summary.applyUsageRefreshState(refreshing: refreshing, error: usageError)
             }
         }
-        summary.applyRecoveryReminder(tasks: availableTasks, choices: choices)
+        summary.applyRecoveryReminder(tasks: availableTasks, choices: choices, enabled: enabled, autoResume: autoResume)
         summary.isRefreshing = refreshing
         if let capturedAt {
             let clock = DateFormatter()
@@ -547,29 +550,42 @@ struct MenuPresentation {
 }
 
 extension MenuSummary {
-    mutating func applyResumeTasks(operations: [ResumeOperation], pending: [BlockedSession], choices: ResumeChoices) {
+    mutating func applyResumeTasks(operations: [ResumeOperation], pending: [BlockedSession], choices: ResumeChoices,
+                                   enabled: Bool = true, autoResume: Bool = true) {
         let operations = operations.filter { !(choices.ignoredEpisodes?.contains($0.target.episodeKey) ?? false) }
         let recordedKeys = Set(operations.map { $0.target.episodeKey })
         var counts: [String: Int] = [:]
+        func waitingStatus(for task: BlockedSession) -> String {
+            if !enabled { return "%d 个任务已暂停自动继续" }
+            if choices.keepAliveEpisodes.contains(task.episodeKey) { return "%d 个任务已取消本次自动继续" }
+            if !autoResume || choices.deselectedEpisodes.contains(task.episodeKey) { return "%d 个任务已关闭自动继续" }
+            return "%d 个任务等待自动继续"
+        }
         for operation in operations {
             if operation.needsManualContinuation, !(choices.readManualEvents?.contains(operation.id) ?? false) {
                 counts["%d 个任务需到 Codex 手动继续", default: 0] += 1
             } else if operation.respondedAt == nil {
                 switch operation.phase {
-                case .preparing, .sending: counts["%d 个任务正在发送", default: 0] += 1
-                case .confirming, .checking: counts["%d 个任务确认中", default: 0] += 1
-                case .notSubmitted: counts["%d 个任务发送失败", default: 0] += 1
-                case .stopped: counts[operation.terminal == .quotaStopped ? "%d 个任务等待自动继续" : "%d 个任务续跑已停止", default: 0] += 1
+                case .preparing, .sending, .confirming, .checking: counts["%d 个任务正在确认中", default: 0] += 1
+                case .notSubmitted:
+                    let waiting = waitingStatus(for: operation.target)
+                    let key = operation.notSubmittedNeedsAttention ? "%d 个任务发送失败" :
+                        waiting != "%d 个任务等待自动继续" ? waiting :
+                        operation.waitsForAutomaticRetry ? waiting : "%d 个任务状态已更新"
+                    counts[key, default: 0] += 1
+                case .stopped: counts[operation.terminal == .quotaStopped ? waitingStatus(for: operation.target) : "%d 个任务续跑已停止", default: 0] += 1
                 default: break
                 }
             }
         }
         for target in pending where !recordedKeys.contains(target.episodeKey) {
             let choice = choices.recoveryDecisions?[target.episodeKey]
-            let key = target.identityUncertain == true ? "%d 个任务确认中" : choice != nil && choice?.phase != .responded ? "%d 个任务待选择" : "%d 个任务等待自动继续"
+            let waiting = waitingStatus(for: target)
+            let key = target.identityUncertain == true ? "%d 个任务正在确认中" : waiting != "%d 个任务等待自动继续" ? waiting :
+                choice != nil && choice?.phase != .responded ? "%d 个任务待选择" : waiting
             counts[key, default: 0] += 1
         }
-        let order = ["%d 个任务正在发送", "%d 个任务确认中", "%d 个任务发送失败", "%d 个任务续跑已停止", "%d 个任务需到 Codex 手动继续", "%d 个任务待选择", "%d 个任务等待自动继续"]
+        let order = ["%d 个任务正在确认中", "%d 个任务发送失败", "%d 个任务续跑已停止", "%d 个任务需到 Codex 手动继续", "%d 个任务待选择", "%d 个任务等待自动继续", "%d 个任务状态已更新", "%d 个任务已暂停自动继续", "%d 个任务已关闭自动继续", "%d 个任务已取消本次自动继续"]
         let labels = order.compactMap { key in counts[key].map { L10n.format(key, $0) } }
         tasks = labels.isEmpty ? [] : [labels.joined(separator: " · ")]
         taskCount = counts.values.reduce(0, +)
@@ -577,7 +593,7 @@ extension MenuSummary {
         let confirmed = operations.filter { $0.respondedAt != nil }.count
         taskProgress = !operations.isEmpty && confirmed < operations.count ? L10n.format("已继续 %d/%d", confirmed, operations.count) : ""
         reminderTitle = ""; reminderBody = ""
-        if counts["%d 个任务需到 Codex 手动继续"] != nil {
+        if enabled, counts["%d 个任务需到 Codex 手动继续"] != nil {
             headline = "需要手动继续"; action = ""; eyebrow = ""; isTime = false; isSyncing = false
             warning = L10n.text("需要手动继续")
         }
