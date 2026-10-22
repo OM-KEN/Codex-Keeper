@@ -30,6 +30,7 @@ import SQLite3
     check(activity.taskRunning && BlockedSessionDetector.detect(in: [activity]).isEmpty,
         "retrying quota error retains running state and cannot create a pause")
     let target = BlockedSession(id: id, project: "Test", cwd: root.path, blockedAt: Date().addingTimeInterval(-5), fiveHourResetAt: nil, weeklyResetAt: nil, fileURL: file)
+    try await checkRolloutReplacement(root.appendingPathComponent("rollout-replacement"), check)
     try await checkResumeEvidenceAudit(root.appendingPathComponent("evidence-audit"), check)
     try await checkResumeEvidenceBoundaries(root.appendingPathComponent("evidence-boundaries"), check)
     try await checkResumePreflightAudit(root.appendingPathComponent("preflight-audit"), check)
@@ -296,6 +297,149 @@ private func resumeDatabase(_ root: URL) throws {
     guard sqlite3_open(root.appendingPathComponent("logs_1.sqlite").path, &db) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
     defer { sqlite3_close(db) }
     guard sqlite3_exec(db, "CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+}
+
+@MainActor private func checkRolloutReplacement(_ root: URL, _ check: (Bool, String) -> Void) async throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try resumeDatabase(root)
+    let now = Date()
+    let id = UUID().uuidString
+    let old = try resumeFixture(root: root, id: id, stop: now.addingTimeInterval(-120), turn: "old-turn")
+    var oldTrace = try Data(contentsOf: old.fileURL)
+    oldTrace.append(try resumeEvent("task_started", turn: "aborted-turn", at: now.addingTimeInterval(-90)))
+    oldTrace.append(try resumeEvent("turn_aborted", turn: "aborted-turn", at: now.addingTimeInterval(-89)))
+    try oldTrace.write(to: old.fileURL)
+    let current = old.fileURL.deletingLastPathComponent().appendingPathComponent("rollout-\(id)_\(UUID().uuidString).jsonl")
+    var trace = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "timestamp": ISO8601DateFormatter().string(from: now.addingTimeInterval(-60)),
+        "payload": ["id": id, "cwd": root.path, "history_mode": "paginated", "history_base": ["thread_id": id, "end_ordinal_exclusive": 4, "end_byte_offset": 100]]])
+    trace.append(10)
+    trace.append(try resumeEvent("task_started", turn: "inherited-turn", at: now.addingTimeInterval(-100)))
+    trace.append(try resumeEvent("error", turn: "inherited-turn", at: now.addingTimeInterval(-90), extras: ["message": "usage_limit_reached"]))
+    trace.append(try resumeEvent("task_started", turn: "current-turn", at: now.addingTimeInterval(-59)))
+    trace.append(try resumeEvent("task_complete", turn: "current-turn", at: now.addingTimeInterval(-30), extras: ["error": ["codex_error_info": "usage_limit_exceeded"]]))
+    try trace.write(to: current)
+    let log = "session_loop{thread_id=\(id)}:turn{turn.id=\"current-turn\"}:session_task.run:run_turn: Turn error: You've hit your usage limit."
+    check(QuotaErrorLogProvider.turnID(in: log) == "current-turn", "current dotted turn.id log field is recognized")
+    check(QuotaErrorLogProvider.turnID(in: log.replacingOccurrences(of: "turn.id", with: "turn_id")) == "current-turn", "legacy turn_id log field remains supported")
+    let conflicting = log.replacingOccurrences(of: "turn{", with: "turn{turn_id=other ")
+    check(QuotaErrorLogProvider.turnID(in: conflicting) == nil, "conflicting log turn identifiers are not guessed")
+    var db: OpaquePointer?
+    sqlite3_open(root.appendingPathComponent("logs_1.sqlite").path, &db)
+    let escapedLog = log.replacingOccurrences(of: "'", with: "''")
+    let escapedConflict = conflicting.replacingOccurrences(of: "'", with: "''")
+    sqlite3_exec(db, "INSERT INTO logs VALUES(1, \(Int(now.addingTimeInterval(-30).timeIntervalSince1970)), 0, 'codex_core::session::turn', '\(id)', '\(escapedConflict)')", nil, nil, nil)
+    check(try QuotaErrorLogProvider(codexHome: root).read()[id] == nil, "conflicting log turns cannot become an unqualified quota stop")
+    sqlite3_exec(db, "UPDATE logs SET feedback_log_body = '\(escapedLog)'", nil, nil, nil)
+    sqlite3_close(db)
+    let stateDB = root.appendingPathComponent("state_5.sqlite")
+    sqlite3_open(stateDB.path, &db)
+    defer { sqlite3_close(db) }
+    sqlite3_exec(db, "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)", nil, nil, nil)
+    func pointTo(_ file: URL) {
+        let path = file.path.replacingOccurrences(of: "'", with: "''")
+        sqlite3_exec(db, "INSERT OR REPLACE INTO threads VALUES('\(id)', '\(path)')", nil, nil, nil)
+    }
+    pointTo(current)
+    let worker = SessionScanWorker(codexHome: root)
+    let first = worker.read(watchedIDs: [id])
+    let targets = BlockedSessionDetector.detect(in: first.0)
+    check(first.1 == nil && first.0.count == 1 && targets.count == 1 && targets.first?.stoppedTurnID == "current-turn" &&
+        targets.first?.fileURL.resolvingSymlinksInPath() == current.resolvingSymlinksInPath(), "a reverted thread exposes only the registered current rollout and its own quota stop")
+    check(first.0.first?.turns["inherited-turn"] == nil, "history_base without forked_from_id cannot attribute copied ancestor execution to the current segment")
+    if let raw = targets.first {
+        var uncertain = raw.stabilized(from: nil); uncertain.identityUncertain = true
+        let recovered = raw.stabilized(from: uncertain)
+        check(recovered.identityUncertain != true && recovered.episodeKey == uncertain.episodeKey,
+            "canonical same-turn evidence repairs persisted uncertainty without changing the attempt key")
+        let schedule = ScheduleEngine(anchorMinutes: 480)
+        let clock = schedule.nodes()[0].addingTimeInterval(1)
+        let idle = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
+            capturedAt: clock, accountID: "ignored-rollout-account", sourceFile: "app-server", zeroUseWindowActive: false)
+        let suite = "keeper.ignored-rollout." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        prefs.register(defaults: ["enabled": true, "dailyAnchorMinutes": 480])
+        let pings = ReminderTestPing()
+        let keeper = ExecutionCoordinator(provider: RecoveryTestUsage(snapshot: idle), defaults: prefs,
+            ledgerURL: root.appendingPathComponent("ignored-support/attempts.json"), pingTransport: pings, codexHome: root, now: { clock })
+        keeper.ping(schedule: schedule, accountID: idle.accountID, ignoredEpisodes: [uncertain.episodeKey], ignoredTargets: [recovered], blockers: { [] })
+        try await resumeWait { !keeper.running }
+        check(pings.count == 1 && keeper.lastFailure == nil,
+            "an ignored pause recovered from duplicate rollouts cannot block keepalive as a new pause")
+        var wrongTurn = old; wrongTurn.identityUncertain = true
+        check(raw.stabilized(from: wrongTurn).stoppedTurnID == "current-turn" && raw.stabilized(from: wrongTurn).identityUncertain == false,
+            "authoritative current evidence can replace an uncertain stop inherited from the obsolete file")
+    }
+    for _ in 0..<21 { _ = try resumeFixture(root: root) }
+    try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-300)], ofItemAtPath: current.path)
+    try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-200)], ofItemAtPath: old.fileURL.path)
+    let watched = worker.read(watchedIDs: [id], watchedPaths: [current])
+    check(watched.1 == nil && watched.0.filter { $0.id == id }.map { $0.fileURL.resolvingSymlinksInPath() } == [current.resolvingSymlinksInPath()],
+        "segmented watched rollout remains discoverable outside the newest twenty files regardless of old-file mtime")
+    pointTo(old.fileURL)
+    let changed = worker.read(watchedIDs: [id])
+    check(changed.0.first(where: { $0.id == id })?.fileURL.resolvingSymlinksInPath() == old.fileURL.resolvingSymlinksInPath() &&
+        !BlockedSessionDetector.detect(in: changed.0).contains(where: { $0.id == id }),
+        "current-path changes invalidate selection without attributing another turn's stop to the old file")
+    pointTo(root.appendingPathComponent("missing.jsonl"))
+    check(worker.read(watchedIDs: [id]).1 != nil, "missing registered rollout cannot silently fall back to an obsolete file")
+    sqlite3_exec(db, "DELETE FROM threads", nil, nil, nil)
+    check(worker.read(watchedIDs: [id]).1 != nil, "duplicate thread files without authoritative identity pause scanning")
+    pointTo(current)
+    let target = BlockedSessionDetector.detect(in: worker.read(watchedIDs: [id]).0).first { $0.id == id }!.stabilized(from: nil)
+    let suite = "keeper.rollout-replacement." + UUID().uuidString
+    let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": true, "autoResume": true, "resumeWorkspaceReminder": false])
+    let usage = ResumeTestUsage(); let client = ResumeTestClient(target)
+    let movedTransport = ResumeTestTransport()
+    movedTransport.prepareBody = { _ in pointTo(old.fileURL) }
+    let moved = ExecutionCoordinator(provider: usage, makeResumeTransport: { movedTransport }, defaults: prefs,
+        ledgerURL: root.appendingPathComponent("moved-support/attempts.json"), codexHome: root)
+    moved.resume([ResumeRequest(target: target, prompt: "synthetic test", accountID: usage.account, workspace: nil)], schedule: ScheduleEngine(anchorMinutes: 480), manual: true)
+    try await resumeWait { !moved.running }
+    check(!movedTransport.submitted && !moved.hasAttempted(target) && moved.operations.values.first?.preflight?.reasons.contains(.pauseChanged) == true,
+        "a rollout switch during channel preparation blocks submission without consuming the pause attempt")
+    pointTo(current)
+    let ledger = root.appendingPathComponent("support/attempts.json")
+    let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: { AppServerResumeTransport(makeTransport: { client }) },
+        defaults: prefs, ledgerURL: ledger, codexHome: root)
+    coordinator.resume([ResumeRequest(target: target, prompt: "synthetic test", accountID: usage.account, workspace: nil)], schedule: ScheduleEngine(anchorMinutes: 480), manual: true)
+    try await resumeWait { coordinator.operations.values.first?.receivedAt != nil }
+    let replacement = current.deletingLastPathComponent().appendingPathComponent("rollout-\(id)_\(UUID().uuidString).jsonl")
+    var response = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "payload": ["id": id, "cwd": root.path]])
+    response.append(10)
+    response.append(try resumeEvent("task_started", turn: client.turnID, at: Date()))
+    response.append(try resumeEvent("agent_message", turn: client.turnID, at: Date(), extras: ["message": "real synthetic response"]))
+    response.append(try resumeEvent("task_complete", turn: client.turnID, at: Date()))
+    try response.write(to: replacement)
+    let unverified = SessionWatcher.parse(url: replacement, mtime: Date())!
+    coordinator.reconcile(sessions: [unverified], scannedAt: Date(), healthy: true)
+    check(coordinator.confirmations.isEmpty, "an unverified alternate path cannot confirm an operation")
+    pointTo(replacement)
+    let verified = worker.read(watchedIDs: [id], watchedPaths: [current])
+    coordinator.reconcile(sessions: verified.0, scannedAt: Date(), healthy: verified.1 == nil)
+    check(coordinator.confirmations.count == 1 && !coordinator.running && coordinator.hasAttempted(target),
+        "registered replacement can confirm the exact submitted turn while preserving duplicate-send protection")
+    coordinator.cancelCurrent()
+    pointTo(current)
+    let stopped = worker.read(watchedIDs: [id])
+    for turn in ["current-turn", "earlier-unknown-turn"] {
+        let operation = ResumeOperation(id: turn, batchID: turn, accountID: usage.account, target: old,
+            actionAt: old.blockedAt, phase: .checking, turnID: turn, protectsThread: true)
+        let repeatedLedger = root.appendingPathComponent("repeated-\(turn)/attempts.json")
+        try FileManager.default.createDirectory(at: repeatedLedger.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let records = try JSONSerialization.jsonObject(with: JSONEncoder().encode([operation]))
+        try JSONSerialization.data(withJSONObject: ["version": 1, "keys": [], "operations": records]).write(to: repeatedLedger)
+        let restored = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: repeatedLedger, codexHome: root)
+        var changes = 0
+        let observation = restored.$operations.dropFirst().sink { _ in changes += 1 }
+        restored.reconcile(sessions: stopped.0, scannedAt: Date(), healthy: stopped.1 == nil)
+        let firstChanges = changes
+        restored.reconcile(sessions: stopped.0, scannedAt: Date(), healthy: stopped.1 == nil)
+        check(firstChanges > 0 && changes == firstChanges && !restored.hasBusyTasks && restored.operations[turn]?.respondedAt == nil,
+            "repeated canonical terminal or later-lifecycle scans cannot publish endlessly or invent a response: \(turn)")
+        observation.cancel()
+    }
 }
 
 private func resumePendingChoice(_ target: BlockedSession, account: String, runtime: URL) throws {
@@ -1197,6 +1341,7 @@ func resumeTestAttemptKeys(_ url: URL) throws -> [String] {
         ("pause", 2, ["new_pause"]), ("stale", 2, ["usage_not_fresh"]), ("future", 2, ["usage_not_fresh"]),
         ("timezone", 2, ["timezone_changed"]), ("expired", 2, ["opportunity_expired"]),
         ("drift-expired", 2, ["opportunity_expired"]), ("node", 2, ["node_changed"]),
+        ("expired", 1, ["opportunity_expired"]), ("drift-expired", 1, ["opportunity_expired"]),
         ("mixed-hard", 1, ["critical_refresh", "account_changed"]),
         ("multiple", 2, ["critical_refresh", "codex_task_running", "generation_changed", "disabled", "anchor_changed", "usage_not_fresh"])
     ] + ["runtime_unhealthy", "sessions_unscanned", "session_scan_failed", "critical_refresh", "keeper_busy", "codex_task_running", "task_selection_changed", "app_state_unavailable"].flatMap { reason in
@@ -1261,6 +1406,10 @@ func resumeTestAttemptKeys(_ url: URL) throws -> [String] {
         }
         coordinator.ping(schedule: schedule, accountID: "preflight-secret-account", blockers: blockers)
         try await resumeWait { !coordinator.running }
+        if name.hasSuffix("expired"), stage == 1 {
+            check(coordinator.visibleNotice == PingPreflightReason.opportunityExpired.userMessage,
+                "quota preparation crossing the opportunity deadline leaves a visible missed-keepalive result: \(name)")
+        }
         if let state {
             try await Task.sleep(nanoseconds: 50_000_000)
             check(usage.readCount == 1 && !state.usage.refreshing && !state.usage.criticalRefreshPending,

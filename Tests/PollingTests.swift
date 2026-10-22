@@ -249,7 +249,8 @@ import SQLite3
     let suite = "keeper.polling.tests." + UUID().uuidString
     let prefs = UserDefaults(suiteName: suite)!
     defer { prefs.removePersistentDomain(forName: suite) }
-    clock = Date()
+    // Snapshot aging must not also cross midnight and trigger the intentional daily refresh.
+    clock = calendar.date(bySettingHour: 12, minute: 0, second: 0, of: Date())!
     let parts = calendar.dateComponents([.hour, .minute], from: clock)
     prefs.register(defaults: ["enabled": true, "autoResume": true, "dailyAnchorMinutes": (parts.hour! * 60 + parts.minute! + 120) % 1440,
         "earlyRecoveryPolicy": "ask", "resumeWorkspaceReminder": false])

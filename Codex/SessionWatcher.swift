@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import SQLite3
 
 struct UserUsageEvidence: Equatable {
     let promptAt: Date
@@ -46,6 +47,7 @@ struct SessionActivity: Equatable {
     var quotaTurnID: String? = nil
     var turns: [String: SessionTurnEvidence] = [:]
     var lastRetryingErrorAt: Date? = nil
+    var currentRolloutVerified = false
 }
 
 /// 监听 ~/.codex/sessions 的 rollout 变化（方案 §27）。
@@ -129,6 +131,12 @@ final class SessionWatcher: ObservableObject {
 
     // MARK: - rollout 解析
 
+    nonisolated static func rolloutThreadID(_ url: URL) -> String? {
+        let name = url.deletingPathExtension().lastPathComponent
+        guard let range = name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?=_[0-9a-fA-F-]{36}$|$)"#, options: .regularExpression) else { return nil }
+        return String(name[range])
+    }
+
     nonisolated static func parse(url: URL, mtime: Date) -> SessionActivity? {
         guard let data = try? Data(contentsOf: url), let content = String(data: data, encoding: .utf8) else { return nil }
         var id = ""
@@ -169,8 +177,8 @@ final class SessionWatcher: ObservableObject {
                 cwd = payload["cwd"] as? String ?? ""
                 isSubagent = (payload["source"] as? [String: Any])?["subagent"] != nil
                 createdAt = UsageDecoder.timestamp(payload["timestamp"] as? String) ?? UsageDecoder.timestamp(entry["timestamp"] as? String)
-                if payload["forked_from_id"] == nil && !isSubagent { tokenTotal = 0 }
-                if payload["forked_from_id"] != nil || isSubagent {
+                if payload["forked_from_id"] == nil && payload["history_base"] == nil && !isSubagent { tokenTotal = 0 }
+                if payload["forked_from_id"] != nil || payload["history_base"] != nil || isSubagent {
                     // Copied history may be re-stamped at the fork's first-record time.
                     // Only subsequent events belong to the new session's execution.
                     inheritedThrough = timestamp
@@ -274,8 +282,7 @@ final class SessionWatcher: ObservableObject {
             blockedAt = at; quotaTurn = turn; running = false
         }
         if id.isEmpty {
-            let name = url.deletingPathExtension().lastPathComponent
-            if let range = name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) { id = String(name[range]) }
+            id = rolloutThreadID(url) ?? ""
         }
         guard UUID(uuidString: id) != nil else { return nil }
         return SessionActivity(id: id, project: cwd.isEmpty ? L10n.text("未知项目") : URL(fileURLWithPath: cwd).lastPathComponent,
@@ -301,8 +308,11 @@ final class SessionScanWorker: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         var stops: [String: QuotaStop] = [:]
         var errorMessage: String?
+        var currentPaths: [String: URL] = [:]
+        do { currentPaths = try Self.currentRolloutPaths(codexHome: codexHome) }
+        catch { errorMessage = error.localizedDescription }
         var all = SessionWatcher.recentRollouts(codexHome: codexHome, limit: Int.max)
-        for path in watchedPaths where !all.contains(where: { $0.url == path }) {
+        for path in watchedPaths where !all.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
             if let values = try? path.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]), values.isRegularFile == true,
                let mtime = values.contentModificationDate { all.append((path, mtime)) }
         }
@@ -314,7 +324,11 @@ final class SessionScanWorker: @unchecked Sendable {
         let runningIDs = Set(cache.values.filter { $0.activity.taskRunning }.map { $0.activity.id })
         let ids = watchedIDs.union(stops.keys).union(runningIDs)
         let recent = Set(all.prefix(20).map { $0.url })
-        let files = all.filter { file in recent.contains(file.url) || ids.contains { file.url.deletingPathExtension().lastPathComponent.hasSuffix($0) } }
+        let candidates = ids.union(recent.compactMap(SessionWatcher.rolloutThreadID))
+        let registered = Set(currentPaths.filter { candidates.contains($0.key) }.map { $0.value.resolvingSymlinksInPath() })
+        let watched = Set(watchedPaths.map { $0.resolvingSymlinksInPath() })
+        let files = all.filter { file in recent.contains(file.url) || watched.contains(file.url.resolvingSymlinksInPath()) ||
+            SessionWatcher.rolloutThreadID(file.url).map { candidates.contains($0) } == true || registered.contains(file.url.resolvingSymlinksInPath()) }
         var titles: [String: String] = [:]
         if let index = try? String(contentsOf: codexHome.appendingPathComponent("session_index.jsonl"), encoding: .utf8) {
             for line in index.split(separator: "\n") {
@@ -343,6 +357,24 @@ final class SessionScanWorker: @unchecked Sendable {
             }
             guard var activity else { continue }
             activity.title = titles[activity.id]
+            activities.append(activity)
+        }
+        // A revert keeps the thread ID but replaces its writable rollout. Never use mtime to pick a history.
+        activities = Dictionary(grouping: activities, by: \.id).values.compactMap { group in
+            if let path = currentPaths[group[0].id] {
+                guard var current = group.first(where: { $0.fileURL.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) else {
+                    errorMessage = L10n.text("无法读取 Codex 本地暂停记录"); return nil
+                }
+                current.currentRolloutVerified = true
+                return current
+            }
+            guard group.count == 1 else {
+                errorMessage = L10n.text("无法读取 Codex 本地暂停记录"); return nil
+            }
+            return group[0]
+        }
+        activities = activities.map { original in
+            var activity = original
             if let stop = stops[activity.id], !activity.isSubagent,
                (activity.createdAt ?? .distantPast) <= stop.at,
                (activity.lastUserMessageAt ?? .distantPast) <= stop.at,
@@ -361,14 +393,53 @@ final class SessionScanWorker: @unchecked Sendable {
                 activity.blockingFiveReset = activity.fiveHour?.usedPercent ?? 0 >= 100 ? activity.fiveHour?.resetsAt : nil
                 activity.blockingWeeklyReset = activity.weekly?.usedPercent ?? 0 >= 100 ? activity.weekly?.resetsAt : nil
             }
-            activities.append(activity)
+            return activity
         }
         let existing = Set(all.map { $0.url })
-        if cache.contains(where: { !existing.contains($0.key) && $0.value.activity.taskRunning }) {
+        let missing = cache.filter { entry in
+            !existing.contains(entry.key) && entry.value.activity.taskRunning &&
+            !activities.contains(where: { $0.id == entry.value.activity.id && $0.currentRolloutVerified })
+        }
+        if !missing.isEmpty {
             errorMessage = L10n.text("无法读取 Codex 本地暂停记录")
-            activities += cache.filter { !existing.contains($0.key) && $0.value.activity.taskRunning }.map { $0.value.activity }
+            activities += missing.map { $0.value.activity }
         }
         cache = cache.filter { existing.contains($0.key) || $0.value.activity.taskRunning }
+        if errorMessage != nil { activities = activities.map { var value = $0; value.currentRolloutVerified = false; return value } }
         return (activities.sorted { $0.lastActivityAt > $1.lastActivityAt }, errorMessage)
+    }
+
+    static func currentRolloutPaths(codexHome: URL) throws -> [String: URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: codexHome, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        func modified(_ url: URL) -> Date {
+            let main = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let wal = (try? URL(fileURLWithPath: url.path + "-wal").resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return max(main, wal)
+        }
+        guard let database = files.filter({ $0.lastPathComponent.range(of: #"^state(?:_[0-9]+)?\.sqlite$"#, options: .regularExpression) != nil })
+            .sorted(by: { modified($0) == modified($1) ? $0.lastPathComponent > $1.lastPathComponent : modified($0) > modified($1) }).first else { return [:] }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(database.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
+            if let db { sqlite3_close(db) }
+            throw CodexConnectionError.server("无法读取 Codex 本地暂停记录")
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 1000)
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT id, rollout_path FROM threads", -1, &statement, nil) == SQLITE_OK else {
+            sqlite3_finalize(statement)
+            throw CodexConnectionError.server("无法读取 Codex 本地暂停记录")
+        }
+        defer { sqlite3_finalize(statement) }
+        var result: [String: URL] = [:]
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            if let id = sqlite3_column_text(statement, 0), let path = sqlite3_column_text(statement, 1) {
+                result[String(cString: id)] = URL(fileURLWithPath: String(cString: path))
+            }
+            step = sqlite3_step(statement)
+        }
+        guard step == SQLITE_DONE else { throw CodexConnectionError.server("读取 Codex 暂停记录失败") }
+        return result
     }
 }

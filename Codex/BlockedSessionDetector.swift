@@ -25,6 +25,10 @@ struct BlockedSession: Equatable, Codable {
             result.pauseID = pauseID ?? stoppedTurnID.map { "\(id):turn:\($0)" } ?? episodeKey
             return result
         }
+        if identityUncertain == false, previous.identityUncertain == true,
+           let turn = stoppedTurnID, turn != previous.stoppedTurnID {
+            return stabilized(from: nil)
+        }
         let newStart = startedBarrierAt.map { $0 > previous.blockedAt && $0 != previous.startedBarrierAt } == true
         if newStart && (stoppedTurnID == nil || stoppedTurnID != previous.stoppedTurnID) {
             var result = self
@@ -76,7 +80,8 @@ enum BlockedSessionDetector {
         sessions.compactMap { s in
             guard let blockedAt = s.quotaBlockedAt, !s.taskRunning, !s.isSubagent else { return nil }
             return BlockedSession(id: s.id, project: s.project, cwd: s.cwd, blockedAt: blockedAt,
-                fiveHourResetAt: s.blockingFiveReset, weeklyResetAt: s.blockingWeeklyReset, fileURL: s.fileURL, stoppedTurnID: s.quotaTurnID, startedBarrierAt: s.lastTaskStartedAt, title: s.title)
+                fiveHourResetAt: s.blockingFiveReset, weeklyResetAt: s.blockingWeeklyReset, fileURL: s.fileURL, stoppedTurnID: s.quotaTurnID, startedBarrierAt: s.lastTaskStartedAt,
+                identityUncertain: s.currentRolloutVerified && s.quotaTurnID != nil ? false : nil, title: s.title)
         }.sorted { $0.blockedAt > $1.blockedAt }
     }
 }

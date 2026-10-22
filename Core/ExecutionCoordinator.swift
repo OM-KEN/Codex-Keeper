@@ -235,9 +235,9 @@ import Darwin
                     if stage == .beforeSend {
                         if !before.isFresh(at: checkedAt) { reasons.append(.usageNotFresh) }
                         if Calendar.current.timeZone.identifier != schedule.timeZoneID { reasons.append(.timeZoneChanged) }
-                        if schedule.currentKeepAliveNode(at: checkedAt) != node {
-                            reasons.append(opportunity.map { checkedAt > $0.deadline } == true ? .opportunityExpired : .nodeChanged)
-                        }
+                    }
+                    if schedule.currentKeepAliveNode(at: checkedAt) != node {
+                        reasons.append(opportunity.map { checkedAt > $0.deadline } == true ? .opportunityExpired : .nodeChanged)
                     }
                     guard reasons.isEmpty else {
                         throw PingPreflightDiagnostic(stage: stage, reasons: reasons, startedAt: startedAt, checkedAt: checkedAt,
@@ -399,6 +399,10 @@ import Darwin
             let appBlockers = blockers(target.episodeKey)
             let checkedAt = now()
             var reasons = ResumePreflight.sessionBlockers(target: target, session: current, stage: .beforeSend)
+            do {
+                if let path = try SessionScanWorker.currentRolloutPaths(codexHome: codexHome)[target.id],
+                   path.resolvingSymlinksInPath() != target.fileURL.resolvingSymlinksInPath() { reasons.append(.pauseChanged) }
+            } catch { reasons.append(.sessionScanFailed) }
             if operationGeneration != generation { reasons.append(.generationChanged) }
             if !ledgerHealthy { reasons.append(.ledgerUnhealthy) }
             if !preflight.usage.isFresh(at: checkedAt) { reasons.append(.usageNotFresh) }
@@ -499,22 +503,28 @@ import Darwin
         for operation in Array(operations.values) where operation.protectsThread ||
             (operation.respondedAt == nil && operation.turnID != nil && operation.phase != .notSubmitted) {
             guard scannedAt >= operation.actionAt,
-                  let session = sessions.first(where: { $0.id == operation.target.id && $0.fileURL == operation.target.fileURL }) else { continue }
+                  let session = sessions.first(where: { $0.id == operation.target.id && $0.cwd == operation.target.cwd &&
+                      ($0.fileURL.resolvingSymlinksInPath() == operation.target.fileURL.resolvingSymlinksInPath() || $0.currentRolloutVerified) }) else { continue }
             if let turn = operation.turnID, let evidence = session.turns[turn],
                (evidence.startedAt ?? .distantPast) >= operation.target.blockedAt {
                 if operation.respondedAt == nil, let at = evidence.responseAt {
                     consume(.responded(turn, at), operationID: operation.id)
                 }
                 if let terminal = evidence.terminal, let at = evidence.endedAt {
-                    consume(.ended(turn, operation.manualRequested == true ? .manualRequired : terminal, nil, at), operationID: operation.id)
+                    let resolved = operation.manualRequested == true ? .manualRequired : terminal
+                    if operation.terminal != resolved || operation.endedAt != at || operation.protectsThread {
+                        consume(.ended(turn, resolved, nil, at), operationID: operation.id)
+                    }
                 }
             }
             if let start = session.lastTaskStartedAt, start > operation.actionAt,
                session.currentTurnID != operation.turnID, session.currentTurnID != nil,
                operation.turnID != nil || (!session.taskRunning && ((session.lastCompletedAt ?? .distantPast) >= start || (session.quotaBlockedAt ?? .distantPast) >= start)) {
                 var resolved = operations[operation.id] ?? operation
-                resolved.protectsThread = false
-                try? save(resolved, afterSubmission: true)
+                if resolved.protectsThread {
+                    resolved.protectsThread = false
+                    try? save(resolved, afterSubmission: true)
+                }
             }
         }
     }

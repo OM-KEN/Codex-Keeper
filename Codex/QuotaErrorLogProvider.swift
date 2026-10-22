@@ -83,8 +83,11 @@ final class QuotaErrorLogProvider {
                 let thread = String(cString: threadRaw)
                 let body = String(cString: bodyRaw)
                 if Self.isQuotaTurnError(body), UUID(uuidString: thread) != nil {
-                    let time = Double(sqlite3_column_int64(statement, 1)) + Double(sqlite3_column_int64(statement, 2)) / 1_000_000_000
-                    stops[thread] = QuotaStop(threadID: thread, at: Date(timeIntervalSince1970: time), turnID: Self.turnID(in: body), sourceEventID: identity + ":" + String(id))
+                    let turns = Self.turnIDs(in: body)
+                    if turns.count <= 1 {
+                        let time = Double(sqlite3_column_int64(statement, 1)) + Double(sqlite3_column_int64(statement, 2)) / 1_000_000_000
+                        stops[thread] = QuotaStop(threadID: thread, at: Date(timeIntervalSince1970: time), turnID: turns.first, sourceEventID: identity + ":" + String(id))
+                    } else { stops.removeValue(forKey: thread) }
                 }
             }
             step = sqlite3_step(statement)
@@ -94,10 +97,16 @@ final class QuotaErrorLogProvider {
     }
 
     static func turnID(in body: String) -> String? {
-        guard let regex = try? NSRegularExpression(pattern: #"turn_id[=:]\s*["']?([A-Za-z0-9-]+)"#),
-              let match = regex.firstMatch(in: body, range: NSRange(body.startIndex..., in: body)),
-              let range = Range(match.range(at: 1), in: body) else { return nil }
-        return String(body[range])
+        let ids = turnIDs(in: body)
+        return ids.count == 1 ? ids.first : nil
+    }
+
+    private static func turnIDs(in body: String) -> Set<String> {
+        let span = body.range(of: ": Turn error: ", options: .backwards).map { String(body[..<$0.lowerBound]) } ?? body
+        guard let regex = try? NSRegularExpression(pattern: #"(?<![A-Za-z0-9_.])turn[_.]id[=:]\s*["']?([A-Za-z0-9-]+)"#) else { return [] }
+        return Set(regex.matches(in: span, range: NSRange(span.startIndex..., in: span)).compactMap {
+            Range($0.range(at: 1), in: span).map { String(span[$0]) }
+        })
     }
 
     static func isQuotaTurnError(_ body: String) -> Bool {
