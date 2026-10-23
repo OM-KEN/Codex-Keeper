@@ -5,9 +5,25 @@ protocol PingTransport {
     func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider) throws -> UsageSnapshot
     func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> UsageSnapshot
     func cancel()
+    var preparedModel: PingModel { get }
+    func prepareForSend() throws
+    func maintainPreparation(provider: UsageProvider, forceCheck: Bool)
+    func invalidatePreparation()
+    func relocatePreparation()
+    func perform(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> PingResult
 }
 
 extension PingTransport {
+    var preparedModel: PingModel { PingModel(model: "gpt-6-luna", reasoningEffort: nil) }
+    func prepareForSend() throws {}
+    func maintainPreparation(provider: UsageProvider, forceCheck: Bool) {}
+    func invalidatePreparation() {}
+    func relocatePreparation() { invalidatePreparation() }
+    func perform(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> PingResult {
+        let after = try ping(before: before, model: model, provider: provider, progress: progress)
+        return PingResult(after: after, diagnostic: PingDiagnostic(elapsedSeconds: 0, warningSeconds: 90, timeoutSeconds: 180,
+            taskCompleted: true, windowConfirmed: PingConfirmation.accepts(before: before, after: after, now: after.capturedAt)))
+    }
     func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> UsageSnapshot {
         try ping(before: before, model: model, provider: provider)
     }
@@ -17,11 +33,21 @@ extension PingTransport {
 enum PingConfirmation {
     static func accepts(before: UsageSnapshot, after: UsageSnapshot, now: Date) -> Bool {
         guard after.isFresh(at: now), let account = before.accountID, after.accountID == account,
-              before.fiveHour != nil, let new = after.fiveHour else { return false }
-        return before.activeFiveHourWindow == false && after.activeFiveHourWindow == true &&
-            new.resetsAt > now && abs(new.resetsAt.timeIntervalSince(now) - 5 * 3600) < 300 &&
+              let new = after.fiveHour else { return false }
+        return after.activeFiveHourWindow == true && new.resetsAt > now &&
             new.usedPercent < 100 && (after.weekly?.usedPercent ?? 0) < 100
     }
+
+    static func newWindow(before: UsageSnapshot, after: UsageSnapshot, now: Date, submittedAt: Date? = nil) -> Bool {
+        accepts(before: before, after: after, now: now) && before.isFresh(at: submittedAt ?? now) &&
+            before.fiveHour != nil && before.activeFiveHourWindow == false &&
+            abs(after.fiveHour!.resetsAt.timeIntervalSince(now) - 5 * 3600) < 300
+    }
+}
+
+struct PingResult {
+    let after: UsageSnapshot?
+    var diagnostic: PingDiagnostic
 }
 
 struct PingReceipt {
@@ -29,6 +55,8 @@ struct PingReceipt {
     var turnID: String?
     var replied = false
     var completed = false
+    var failure: PingFailureReason?
+    var errorCode: String?
 
     static func read(home: URL, excluding previous: Set<URL>) -> PingReceipt {
         let files = SessionWatcher.recentRollouts(codexHome: home, limit: 20).filter { !previous.contains($0.url) }
@@ -41,7 +69,7 @@ struct PingReceipt {
             if entry["type"] as? String == "session_meta", let id = payload["id"] as? String, UUID(uuidString: id) != nil { receipt.threadID = id }
             if payload["type"] as? String == "task_started" {
                 receipt.turnID = (payload["turn_id"] as? String).flatMap { UUID(uuidString: $0) == nil ? nil : $0 }
-                receipt.replied = false; receipt.completed = false
+                receipt.replied = false; receipt.completed = false; receipt.failure = nil; receipt.errorCode = nil
             }
             if payload["role"] as? String == "assistant", receipt.turnID != nil {
                 let text = (payload["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? ""
@@ -51,7 +79,16 @@ struct PingReceipt {
                payload["turn_id"] as? String == receipt.turnID {
                 receipt.completed = receipt.replied && (payload["error"] == nil || payload["error"] is NSNull)
             }
-            if payload["type"] as? String == "turn_aborted" { receipt.completed = false }
+            if payload["type"] as? String == "turn_aborted" { receipt.completed = false; receipt.failure = .cancelled }
+            let type = payload["type"] as? String
+            if ((type == "error" || type == "turn_failed") && payload["will_retry"] as? Bool != true) ||
+                (type == "task_complete" && payload["error"] != nil && !(payload["error"] is NSNull)) {
+                let detail = String(describing: payload["error"] ?? payload["message"] ?? payload).lowercased()
+                receipt.failure = ["model_not_found", "unsupported_model", "invalid_model", "model_not_available"].contains(where: detail.contains) ? .model : .request
+                let code = (payload["error"] as? [String: Any])?["code"] as? String ?? payload["code"] as? String
+                if let code, ["model_not_found", "unsupported_model", "invalid_model", "model_not_available", "usage_limit_reached", "usage_limit_exceeded", "request_timeout", "server_error"].contains(code) { receipt.errorCode = code }
+                receipt.completed = false
+            }
         }
         return receipt
     }
@@ -63,12 +100,22 @@ struct PingReceipt {
 
 final class PTYPingTransport: PingTransport {
     private let mainHome: URL
-    private let supportRoot: URL?
-    private let executable: URL?
+    private let preparation: PingPreparation
     private let timing: PingTiming
     init(codexHome: URL = CodexEnvironment.home, supportRoot: URL? = nil, binary: URL? = nil, timing: PingTiming = PingTiming()) {
-        mainHome = codexHome; self.supportRoot = supportRoot; executable = binary; self.timing = timing
+        mainHome = codexHome; self.timing = timing
+        let root = supportRoot ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/ping")
+        preparation = PingPreparation(mainHome: codexHome, root: root, locate: { try binary ?? CodexLocator.binary() })
     }
+    var preparedModel: PingModel { preparation.preparedModel }
+    func prepareForSend() throws {
+        lock.lock(); cancelled = false; lock.unlock()
+        do { try preparation.prepareForSend() }
+        catch { throw PingSubmissionError(underlying: error, stage: "configuration") }
+    }
+    func maintainPreparation(provider: UsageProvider, forceCheck: Bool) { preparation.maintain(provider: provider, forceCheck: forceCheck) }
+    func invalidatePreparation() { preparation.invalidate() }
+    func relocatePreparation() { preparation.invalidate(relocate: true) }
     private let lock = NSLock()
     private var active: Process?
     private var cancelled = false
@@ -111,21 +158,32 @@ final class PTYPingTransport: PingTransport {
     }
 
     func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> UsageSnapshot {
-        lock.lock(); cancelled = false; lock.unlock()
+        try prepareForSend()
+        let result = try perform(before: before, model: model, provider: provider, progress: progress)
+        guard let after = result.after else { throw PingFailure(diagnostic: result.diagnostic) }
+        return after
+    }
+
+    func perform(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void) throws -> PingResult {
+        var started = false
+        do { return try execute(before: before, model: model, provider: provider, progress: progress, didStart: { started = true }) }
+        catch { if !started, !(error is PingSubmissionError) { throw PingSubmissionError(underlying: error) }; throw error }
+    }
+
+    private func execute(before: UsageSnapshot, model: PingModel, provider: UsageProvider, progress: @escaping (PingDiagnostic) -> Void, didStart: () -> Void) throws -> PingResult {
+        lock.lock(); let stopped = cancelled; lock.unlock()
+        if stopped { throw PingFailure(diagnostic: PingDiagnostic(elapsedSeconds: 0, warningSeconds: timing.warning, timeoutSeconds: timing.timeout, reason: .cancelled, outcome: "cancelled")) }
         let fm = FileManager.default
         guard model.model == "gpt-6-luna" else { throw CodexConnectionError.server("保活模型未经确认") }
-        let root = supportRoot ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/ping")
-        let home = root.appendingPathComponent("home")
-        let work = root.appendingPathComponent("work")
-        try fm.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try fm.createDirectory(at: work, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let auth = try Data(contentsOf: mainHome.appendingPathComponent("auth.json"))
+        let binary = try preparation.prepareForSend(model: model)
+        let home = preparation.home; let work = preparation.work
+        let authentication: PingAuthentication
+        do { authentication = try PingAuthentication.read(home: mainHome) }
+        catch { throw PingSubmissionError(underlying: error, stage: "authentication") }
+        guard authentication.accountID == before.accountID else { throw CodexConnectionError.server("账户在刷新期间改变") }
         let authURL = home.appendingPathComponent("auth.json")
-        try auth.write(to: authURL, options: .atomic)
+        try authentication.data.write(to: authURL, options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authURL.path)
-        let config = try Self.configuration(work: work, model: model)
-        try config.write(to: home.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
-        let binary = try executable ?? CodexLocator.binary()
         var master: Int32 = -1
         var slave: Int32 = -1
         var size = winsize(ws_row: 30, ws_col: 120, ws_xpixel: 0, ws_ypixel: 0)
@@ -155,9 +213,13 @@ final class PTYPingTransport: PingTransport {
             lock.lock(); active = nil; lock.unlock()
         }
         let previousSessions = Set(SessionWatcher.recentRollouts(codexHome: home, limit: Int.max).map(\.url))
-        try process.run()
-        lock.lock(); active = process; lock.unlock()
-        let startedAt = Date()
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            throw PingFailure(diagnostic: PingDiagnostic(elapsedSeconds: 0, warningSeconds: timing.warning, timeoutSeconds: timing.timeout, reason: .cancelled, outcome: "cancelled"))
+        }
+        do { try process.run(); active = process; didStart(); lock.unlock() }
+        catch { lock.unlock(); preparation.invalidate(relocate: true); throw PingSubmissionError(underlying: error, stage: "process_launch") }
         let startedUptime = ProcessInfo.processInfo.systemUptime
         var nextRead = timing.pollInterval
         var terminalOutput = Data()
@@ -166,21 +228,19 @@ final class PTYPingTransport: PingTransport {
         var diagnostic = PingDiagnostic(elapsedSeconds: 0, warningSeconds: timing.warning, timeoutSeconds: timing.timeout)
         func refreshDiagnostic() {
             diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
-            let receipt = PingReceipt.read(home: home, excluding: previousSessions)
-            diagnostic.threadID = receipt.threadID; diagnostic.turnID = receipt.turnID
-            diagnostic.okReceived = receipt.replied; diagnostic.taskCompleted = receipt.completed
-            diagnostic.reason = .unknown; diagnostic.retryCount = nil; diagnostic.logStatus = "unavailable"
-            if let threadID = receipt.threadID {
-                let logs = PingDiagnosticLogReader(home: home).read(threadID: threadID, turnID: receipt.turnID, since: startedAt, until: Date())
-                diagnostic.logStatus = logs.status
-                diagnostic.reason = logs.evidence?.reason ?? .unknown
-                diagnostic.retryCount = logs.evidence?.retryCount
+            if !diagnostic.taskCompleted {
+                let receipt = PingReceipt.read(home: home, excluding: previousSessions)
+                diagnostic.threadID = receipt.threadID; diagnostic.turnID = receipt.turnID
+                diagnostic.okReceived = receipt.replied; diagnostic.taskCompleted = receipt.completed
+                diagnostic.reason = receipt.failure ?? .unknown; diagnostic.errorCode = receipt.errorCode
+                diagnostic.logStatus = "isolated_jsonl"
             }
         }
         func fail(_ reason: PingFailureReason? = nil) throws -> Never {
             diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
             if let reason { diagnostic.reason = reason }
             diagnostic.outcome = reason == .cancelled ? "cancelled" : "failed"
+            if reason == .model || reason == .configuration { preparation.invalidate() }
             progress(diagnostic)
             throw PingFailure(diagnostic: diagnostic)
         }
@@ -203,6 +263,7 @@ final class PTYPingTransport: PingTransport {
             let exited = !process.isRunning
             if elapsed >= nextRead || (exited && (diagnostic.threadID == nil || !diagnostic.taskCompleted)) || (lastWarning == nil && elapsed >= timing.warning) {
                 refreshDiagnostic()
+                if diagnostic.reason == .model || diagnostic.reason == .request { try fail(diagnostic.reason) }
                 // Publish the warning before a potentially slow quota query.
                 if diagnostic.elapsedSeconds >= timing.warning, lastWarning != diagnostic.warning {
                     lastWarning = diagnostic.warning; progress(diagnostic)
@@ -218,7 +279,12 @@ final class PTYPingTransport: PingTransport {
                         let failure = UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - readStarted)
                         diagnostic.quotaReadFailure = failure
                         if failure.reason == "account_changed" { try fail(.accountChanged) }
-                        guard UsageReadFailure.canRetry(error) else { try fail(.quotaRead) }
+                        if !UsageReadFailure.canRetry(error) {
+                            diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
+                            diagnostic.reason = .quotaRead; diagnostic.outcome = "completed_pending"
+                            progress(diagnostic)
+                            return PingResult(after: nil, diagnostic: diagnostic)
+                        }
                         if !failure.sameFailure(as: lastReadFailure) {
                             diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
                             progress(diagnostic); lastReadFailure = failure
@@ -232,7 +298,7 @@ final class PTYPingTransport: PingTransport {
                         diagnostic.elapsedSeconds = ProcessInfo.processInfo.systemUptime - startedUptime
                         diagnostic.windowConfirmed = true; diagnostic.outcome = "confirmed"
                         progress(diagnostic)
-                        return after
+                        return PingResult(after: after, diagnostic: diagnostic)
                     }
                 }
                 nextRead = ProcessInfo.processInfo.systemUptime - startedUptime + timing.pollInterval
@@ -243,6 +309,12 @@ final class PTYPingTransport: PingTransport {
             }
         }
         refreshDiagnostic()
+        if diagnostic.taskCompleted {
+            diagnostic.outcome = "completed_pending"
+            diagnostic.reason = diagnostic.quotaReadFailure == nil ? .unknown : .quotaRead
+            progress(diagnostic)
+            return PingResult(after: nil, diagnostic: diagnostic)
+        }
         try fail(diagnostic.quotaReadFailure == nil ? nil : .quotaRead)
     }
 }

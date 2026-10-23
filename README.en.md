@@ -40,7 +40,7 @@ Select **Review task** in the reminder at the top of the menu, or use the system
 
 If you do not choose during early recovery, the task waits. It resumes automatically once normal recovery is confirmed. Temporary sync failures retry automatically without asking you to choose a recovery method.
 
-The trash button at the top right of a current task lets you ignore its current pause after confirmation. The task disappears from the list, while the original task and records remain. If you continue it manually and it later pauses for quota again, Keeper treats that as a new pause. Click a past resume point in the timeline to view its read-only records.
+The trash button at the top right of a current task lets you ignore its current pause after confirmation. The task disappears from the list, while the original task and records remain. If you continue it manually and it later pauses for quota again, Keeper treats that as a new pause. Click a past keep-alive or resume point in the timeline to view its result.
 
 </details>
 
@@ -64,7 +64,7 @@ If project files changed or cannot be checked, Keeper adds a reminder before the
 
 The disk image is not notarized. If macOS blocks the first launch, verify the download source and follow [Apple's instructions for opening the app](https://support.apple.com/en-us/102445).
 
-If quota sync fails, Keeper retries automatically and keeps the last valid quota and plan visible. You can also click the refresh button beside the time. If it keeps failing, check your network, Codex sign-in, and version.
+If quota sync fails, Keeper retries automatically and keeps the last valid quota with its original update time. Scheduled keep-alives can still be attempted; auto-resume waits for a live confirmation. You can also click the refresh button beside the time. If it keeps failing, check your network, Codex sign-in, and version.
 
 If the official Codex CLI cannot be found, click the error message in the menu, enter or choose its executable file, then select **Save and Retry**. Paths with `~/` or spaces are supported. You only need to enter a path if automatic discovery fails.
 

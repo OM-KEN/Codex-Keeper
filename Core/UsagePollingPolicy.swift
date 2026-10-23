@@ -1,6 +1,6 @@
 import Foundation
 
-/// Reservations may use an older successful reading; they never authorize execution.
+/// Polling cadence never grants permission to resume a user task.
 struct UsagePollingPolicy: Equatable {
     static let activeInterval: TimeInterval = 20
     static let idleInterval: TimeInterval = 300
@@ -24,7 +24,7 @@ struct UsagePollingPolicy: Equatable {
         if enabled {
             for opportunity in schedule.keepAliveOpportunities(at: now) {
                 if now >= opportunity.node.addingTimeInterval(-preparation), now <= opportunity.deadline { return fast }
-                boundaries += [opportunity.node, opportunity.date]
+                boundaries.append(opportunity.node)
             }
         }
         for window in [usage.fiveHour, usage.weekly].compactMap({ $0 }) {
@@ -39,14 +39,7 @@ struct UsagePollingPolicy: Equatable {
         return UsagePollingPolicy(interval: idleInterval, wakeAt: wake)
     }
 
-    static func reservedKeepAliveDate(now: Date, schedule: ScheduleEngine, usage: UsageSnapshot, calendar: Calendar = .current) -> Date? {
-        let exhausted = [usage.fiveHour, usage.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
-        if let reset = exhausted.map(\.resetsAt).max() {
-            return reset > now ? schedule.firstKeepAliveNode(onOrAfter: reset, calendar: calendar) : nil
-        }
-        guard let five = usage.fiveHour, let active = usage.activeFiveHourWindow else { return nil }
-        return schedule.firstKeepAliveNode(onOrAfter: active && five.resetsAt > now ? five.resetsAt : schedule.nextKeepAliveNode(after: now, calendar: calendar), calendar: calendar)
-    }
+
 }
 
 /// The provider uses the original node as the identity of a bounded retry opportunity.

@@ -47,35 +47,23 @@ final class QuotaErrorLogProvider {
             stops = [:]
             databaseIdentity = identity
         }
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(databaseURL.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
-            if let db { sqlite3_close(db) }
-            throw CodexConnectionError.server("无法读取 Codex 本地暂停记录")
-        }
-        defer { sqlite3_close(db) }
-        sqlite3_busy_timeout(db, 1000)
-        // Validate the fields we actually consume; do not infer evidence from a filename/version.
-        var schema: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT id, ts, ts_nanos, thread_id, feedback_log_body, target FROM logs LIMIT 0", -1, &schema, nil) == SQLITE_OK else {
-            sqlite3_finalize(schema)
-            throw CodexConnectionError.server("Codex 本地日志格式不兼容；请更新 Keeper，自动继续已暂停")
-        }
+        let database = try ReadOnlyDatabase(url: databaseURL, kind: "logs")
+        // Validate only the fields actually consumed; non-schema errors retain their SQLite stage/codes.
+        let schema = try database.prepare("SELECT id, ts, ts_nanos, thread_id, feedback_log_body, target FROM logs LIMIT 0")
         sqlite3_finalize(schema)
-        var maximum: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT MAX(id) FROM logs", -1, &maximum, nil) == SQLITE_OK,
-           sqlite3_step(maximum) == SQLITE_ROW, sqlite3_column_int64(maximum, 0) < cursor {
+        let maximum = try database.prepare("SELECT MAX(id) FROM logs")
+        defer { sqlite3_finalize(maximum) }
+        if try database.step(maximum) == SQLITE_ROW, sqlite3_column_int64(maximum, 0) < cursor {
             cursor = 0
             stops = [:]
         }
-        sqlite3_finalize(maximum)
         stops = stops.filter { now.timeIntervalSince($0.value.at) <= 30 * 86400 }
-        var statement: OpaquePointer?
         let query = "SELECT id, ts, ts_nanos, thread_id, feedback_log_body FROM logs WHERE id > ? AND ts >= ? AND target = 'codex_core::session::turn' ORDER BY id"
-        guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK else { throw CodexConnectionError.server("Codex 本地暂停记录格式不兼容，自动继续已暂停") }
+        let statement = try database.prepare(query)
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_int64(statement, 1, cursor)
         sqlite3_bind_int64(statement, 2, Int64(now.addingTimeInterval(-30 * 86400).timeIntervalSince1970))
-        var step = sqlite3_step(statement)
+        var step = try database.step(statement)
         while step == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
             cursor = max(cursor, id)
@@ -90,9 +78,8 @@ final class QuotaErrorLogProvider {
                     } else { stops.removeValue(forKey: thread) }
                 }
             }
-            step = sqlite3_step(statement)
+            step = try database.step(statement)
         }
-        guard step == SQLITE_DONE else { throw CodexConnectionError.server("读取 Codex 暂停记录失败") }
         return stops
     }
 

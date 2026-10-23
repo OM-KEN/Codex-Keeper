@@ -1,6 +1,26 @@
 import Foundation
 import Combine
 import SQLite3
+import CryptoKit
+
+private enum SessionRolloutReadError: Error { case invalidUTF8 }
+
+struct SessionScanDiagnostic: Equatable {
+    var stage: String
+    var code: Int? = nil
+    var domain: String? = nil
+    var primaryCode: Int? = nil
+    var fileFingerprint: String? = nil
+
+    var logValue: [String: Any] {
+        var value: [String: Any] = ["stage": stage]
+        if let code { value["code"] = code }
+        if let domain { value["domain"] = domain }
+        if let primaryCode { value["sqlite_primary_code"] = primaryCode }
+        if let fileFingerprint { value["file_fingerprint"] = fileFingerprint }
+        return value
+    }
+}
 
 struct UserUsageEvidence: Equatable {
     let promptAt: Date
@@ -60,6 +80,7 @@ final class SessionWatcher: ObservableObject {
     @Published private(set) var sessions: [SessionActivity] = []
 
     @Published private(set) var detectionError: String?
+    private(set) var scanFailures: [SessionScanDiagnostic] = []
     @Published private(set) var authentication: AuthenticationObservation = .unreadable
     private let worker: SessionScanWorker
     private var timer: Timer?
@@ -87,16 +108,17 @@ final class SessionWatcher: ObservableObject {
         let ids = watchedIDs
         let paths = watchedPaths
         Task {
-            let result = await Task.detached { () -> ([SessionActivity], String?, AuthenticationObservation) in
+            let result = await Task.detached { () -> ([SessionActivity], String?, AuthenticationObservation, [SessionScanDiagnostic]) in
                 let sessions = worker.read(watchedIDs: ids, watchedPaths: paths)
                 let auth: AuthenticationObservation
                 do { auth = .known(try AppServerUsageProvider.authenticationIdentity(home: worker.codexHome)) }
                 catch { auth = .unreadable }
-                return (sessions.0, sessions.1, auth)
+                return (sessions.0, sessions.1, auth, sessions.2)
             }.value
             authentication = result.2
             scannedAt = Date()
             hasScanned = true
+            scanFailures = result.3
             detectionError = result.1
             sessions = result.0
             refreshing = false
@@ -141,7 +163,14 @@ final class SessionWatcher: ObservableObject {
     }
 
     nonisolated static func parse(url: URL, mtime: Date) -> SessionActivity? {
-        guard let data = try? Data(contentsOf: url), let content = String(data: data, encoding: .utf8) else { return nil }
+        try? readRollout(url: url, mtime: mtime)
+    }
+
+    nonisolated fileprivate static func readRollout(url: URL, mtime: Date) throws -> SessionActivity? {
+        let data = try Data(contentsOf: url)
+        guard let content = String(data: data, encoding: .utf8) else {
+            throw SessionRolloutReadError.invalidUTF8
+        }
         var id = ""
         var cwd = ""
         var activity = mtime
@@ -300,20 +329,34 @@ final class SessionScanWorker: @unchecked Sendable {
     let codexHome: URL
     private let quotaLogs: QuotaErrorLogProvider
     private let lock = NSLock()
-    private let parseRollout: (URL, Date) -> SessionActivity?
+    private let parseRollout: (URL, Date) throws -> SessionActivity?
     private var cache: [URL: (mtime: Date, size: UInt64, inode: UInt64, activity: SessionActivity)] = [:]
-    init(codexHome: URL, parseRollout: @escaping (URL, Date) -> SessionActivity? = { SessionWatcher.parse(url: $0, mtime: $1) }) {
+    init(codexHome: URL, parseRollout: @escaping (URL, Date) throws -> SessionActivity? = { try SessionWatcher.readRollout(url: $0, mtime: $1) }) {
         self.codexHome = codexHome
         self.parseRollout = parseRollout
         quotaLogs = QuotaErrorLogProvider(codexHome: codexHome)
     }
-    func read(watchedIDs: Set<String>, watchedPaths: [URL] = []) -> ([SessionActivity], String?) {
+    func read(watchedIDs: Set<String>, watchedPaths: [URL] = []) -> ([SessionActivity], String?, [SessionScanDiagnostic]) {
         lock.lock(); defer { lock.unlock() }
         var stops: [String: QuotaStop] = [:]
         var errorMessage: String?
+        var failures: [SessionScanDiagnostic] = []
+        func diagnose(_ stage: String, error: Error? = nil, file: URL? = nil) {
+            let fingerprint = file.map { SHA256.hash(data: Data($0.path.utf8)).map { String(format: "%02x", $0) }.joined() }
+            var diagnostic = SessionScanDiagnostic(stage: stage, fileFingerprint: fingerprint)
+            if let database = error as? CodexDatabaseError {
+                diagnostic.stage += "." + database.stage
+                diagnostic.code = Int(database.extendedCode); diagnostic.primaryCode = Int(database.code); diagnostic.domain = "SQLite"
+            } else if error is SessionRolloutReadError {
+                diagnostic.stage += ".decode_utf8"
+            } else if let error = error as NSError? {
+                diagnostic.code = error.code; diagnostic.domain = error.domain
+            }
+            if !failures.contains(diagnostic) { failures.append(diagnostic) }
+        }
         var currentPaths: [String: URL] = [:]
         do { currentPaths = try Self.currentRolloutPaths(codexHome: codexHome) }
-        catch { errorMessage = error.localizedDescription }
+        catch { errorMessage = error.localizedDescription; diagnose("state_database", error: error) }
         var all = SessionWatcher.recentRollouts(codexHome: codexHome, limit: Int.max)
         for path in watchedPaths where !all.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
             if let values = try? path.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]), values.isRegularFile == true,
@@ -322,7 +365,7 @@ final class SessionScanWorker: @unchecked Sendable {
         do { stops = try quotaLogs.read() }
         catch {
             // A new installation with no sessions has no candidates to resume.
-            if !all.isEmpty || !watchedIDs.isEmpty { errorMessage = error.localizedDescription }
+            if !all.isEmpty || !watchedIDs.isEmpty { errorMessage = errorMessage ?? error.localizedDescription; diagnose("quota_log_database", error: error) }
         }
         let runningIDs = Set(cache.values.filter { $0.activity.taskRunning }.map { $0.activity.id })
         let ids = watchedIDs.union(stops.keys).union(runningIDs)
@@ -330,8 +373,18 @@ final class SessionScanWorker: @unchecked Sendable {
         let candidates = ids.union(recent.compactMap(SessionWatcher.rolloutThreadID))
         let registered = Set(currentPaths.filter { candidates.contains($0.key) }.map { $0.value.resolvingSymlinksInPath() })
         let watched = Set(watchedPaths.map { $0.resolvingSymlinksInPath() })
-        let files = all.filter { file in recent.contains(file.url) || watched.contains(file.url.resolvingSymlinksInPath()) ||
-            SessionWatcher.rolloutThreadID(file.url).map { candidates.contains($0) } == true || registered.contains(file.url.resolvingSymlinksInPath()) }
+        let files = all.filter { file in
+            let path = file.url.resolvingSymlinksInPath()
+            if let id = SessionWatcher.rolloutThreadID(file.url), let current = currentPaths[id],
+               current.resolvingSymlinksInPath() != path { return false }
+            return recent.contains(file.url) || watched.contains(path) ||
+                SessionWatcher.rolloutThreadID(file.url).map { candidates.contains($0) } == true || registered.contains(path)
+        }
+        // Validate registered current files after excluding replaced history, before parsing candidates.
+        for (id, path) in currentPaths where candidates.contains(id) && !files.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
+            errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
+            diagnose("canonical_rollout_missing", file: path)
+        }
         var titles: [String: String] = [:]
         if let index = try? String(contentsOf: codexHome.appendingPathComponent("session_index.jsonl"), encoding: .utf8) {
             for line in index.split(separator: "\n") {
@@ -349,14 +402,20 @@ final class SessionScanWorker: @unchecked Sendable {
             let inode = (attributes?[.systemFileNumber] as? NSNumber)?.uint64Value
             if let cached = cache[file.url], let size, let inode,
                cached.mtime == file.mtime, cached.size == size, cached.inode == inode { activity = cached.activity }
-            else if let parsed = parseRollout(file.url, file.mtime) {
-                cache[file.url] = (file.mtime, size ?? 0, inode ?? 0, parsed); activity = parsed
-            } else {
-                let name = file.url.deletingPathExtension().lastPathComponent
-                if cache[file.url] != nil || name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) != nil {
-                    errorMessage = L10n.text("无法读取 Codex 本地暂停记录")
+            else {
+                var parseError: Error?
+                do { activity = try parseRollout(file.url, file.mtime) }
+                catch { parseError = error }
+                if let parsed = activity {
+                    cache[file.url] = (file.mtime, size ?? 0, inode ?? 0, parsed)
+                } else {
+                    let name = file.url.deletingPathExtension().lastPathComponent
+                    if cache[file.url] != nil || name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) != nil {
+                        errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
+                        diagnose("rollout_parse", error: parseError, file: file.url)
+                    }
+                    activity = cache[file.url]?.activity
                 }
-                activity = cache[file.url]?.activity
             }
             guard var activity else { continue }
             activity.title = titles[activity.id]
@@ -366,13 +425,13 @@ final class SessionScanWorker: @unchecked Sendable {
         activities = Dictionary(grouping: activities, by: \.id).values.compactMap { group in
             if let path = currentPaths[group[0].id] {
                 guard var current = group.first(where: { $0.fileURL.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) else {
-                    errorMessage = L10n.text("无法读取 Codex 本地暂停记录"); return nil
+                    errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录"); diagnose("canonical_rollout_missing", file: path); return nil
                 }
                 current.currentRolloutVerified = true
                 return current
             }
             guard group.count == 1 else {
-                errorMessage = L10n.text("无法读取 Codex 本地暂停记录"); return nil
+                errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录"); diagnose("ambiguous_rollout", file: group[0].fileURL); return nil
             }
             return group[0]
         }
@@ -404,12 +463,14 @@ final class SessionScanWorker: @unchecked Sendable {
             !activities.contains(where: { $0.id == entry.value.activity.id && $0.currentRolloutVerified })
         }
         if !missing.isEmpty {
-            errorMessage = L10n.text("无法读取 Codex 本地暂停记录")
+            errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
+            for file in missing.keys { diagnose("running_rollout_missing", file: file) }
             activities += missing.map { $0.value.activity }
         }
         cache = cache.filter { existing.contains($0.key) || $0.value.activity.taskRunning }
         if errorMessage != nil { activities = activities.map { var value = $0; value.currentRolloutVerified = false; return value } }
-        return (activities.sorted { $0.lastActivityAt > $1.lastActivityAt }, errorMessage)
+        return (activities.sorted { $0.lastActivityAt > $1.lastActivityAt }, errorMessage,
+            failures.sorted { ($0.stage, $0.fileFingerprint ?? "") < ($1.stage, $1.fileFingerprint ?? "") })
     }
 
     static func currentRolloutPaths(codexHome: URL) throws -> [String: URL] {
@@ -421,28 +482,17 @@ final class SessionScanWorker: @unchecked Sendable {
         }
         guard let database = files.filter({ $0.lastPathComponent.range(of: #"^state(?:_[0-9]+)?\.sqlite$"#, options: .regularExpression) != nil })
             .sorted(by: { modified($0) == modified($1) ? $0.lastPathComponent > $1.lastPathComponent : modified($0) > modified($1) }).first else { return [:] }
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(database.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
-            if let db { sqlite3_close(db) }
-            throw CodexConnectionError.server("无法读取 Codex 本地暂停记录")
-        }
-        defer { sqlite3_close(db) }
-        sqlite3_busy_timeout(db, 1000)
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT id, rollout_path FROM threads", -1, &statement, nil) == SQLITE_OK else {
-            sqlite3_finalize(statement)
-            throw CodexConnectionError.server("无法读取 Codex 本地暂停记录")
-        }
+        let reader = try ReadOnlyDatabase(url: database, kind: "state")
+        let statement = try reader.prepare("SELECT id, rollout_path FROM threads")
         defer { sqlite3_finalize(statement) }
         var result: [String: URL] = [:]
-        var step = sqlite3_step(statement)
+        var step = try reader.step(statement)
         while step == SQLITE_ROW {
             if let id = sqlite3_column_text(statement, 0), let path = sqlite3_column_text(statement, 1) {
                 result[String(cString: id)] = URL(fileURLWithPath: String(cString: path))
             }
-            step = sqlite3_step(statement)
+            step = try reader.step(statement)
         }
-        guard step == SQLITE_DONE else { throw CodexConnectionError.server("读取 Codex 暂停记录失败") }
         return result
     }
 }

@@ -518,3 +518,38 @@
 "继续失败，请到 Codex 查看原任务。" = "Continuation failed, check the original task in Codex.";
 
 "结果未确认，请到 Codex 查看原任务。" = "The result is unconfirmed, check the original task in Codex.";
+
+"计划节点，尝试保活" = "Scheduled node, attempting keepalive";
+
+"保活请求已完成，窗口有效。" = "Keepalive request completed; the window is active.";
+
+"保活请求已完成，窗口待确认。" = "Keepalive request completed; window confirmation is pending.";
+
+"上轮原因：%@" = "Previous reason: %@";
+
+"新窗口已确认" = "New window confirmed";
+
+"请求完成，窗口有效" = "Completed, window active";
+
+"请求完成，窗口待确认" = "Completed, window pending";
+
+"保活失败" = "Keepalive failed";
+
+"结果待确认" = "Result pending";
+
+"本轮未执行" = "Not executed this round";
+
+"已有有效窗口" = "Window already active";
+
+"保活记录" = "Keepalive history";
+
+"保活结果" = "Keepalive result";
+
+"自动继续暂不可用" = "Auto-resume is temporarily unavailable";
+
+"保活请求失败，请等待下次保活。" = "The keepalive request failed. Wait for the next scheduled keepalive.";
+
+"保活请求已报错；本轮不再重试" = "The keepalive request returned an error; this round will not retry.";
+
+"无法启动 Codex，请更新后刷新。" = "Codex could not start. Update it, then refresh.";
+"保活未发送：Codex 无法启动" = "Keepalive was not sent: Codex could not start";

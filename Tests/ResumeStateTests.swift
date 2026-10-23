@@ -361,7 +361,8 @@ private func resumeDatabase(_ root: URL) throws {
         let pings = ReminderTestPing()
         let keeper = ExecutionCoordinator(provider: RecoveryTestUsage(snapshot: idle), defaults: prefs,
             ledgerURL: root.appendingPathComponent("ignored-support/attempts.json"), pingTransport: pings, codexHome: root, now: { clock })
-        keeper.ping(schedule: schedule, accountID: idle.accountID, ignoredEpisodes: [uncertain.episodeKey], ignoredTargets: [recovered], blockers: { [] })
+        try writeKeepAliveAuthentication(home: root, account: idle.accountID!)
+        keeper.ping(schedule: schedule, usage: idle, blockers: { [] })
         try await resumeWait { !keeper.running }
         check(pings.count == 1 && keeper.lastFailure == nil,
             "an ignored pause recovered from duplicate rollouts cannot block keepalive as a new pause")
@@ -602,9 +603,9 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
     clock = clock.addingTimeInterval(71); state.usage.refresh()
     try await resumeWait { !state.usage.refreshing }
     state.recompute(allowExecution: false)
-    check(state.usage.snapshot?.accountID == nil && state.usage.snapshot?.sourceFile != "app-server" &&
+    check(state.usage.snapshot?.accountID == account && state.usage.snapshot?.sourceFile == "app-server" && !state.usage.hasReliableReading &&
         state.displayAccountID == account && state.nextAction?.note != "账户已改变" && transports.isEmpty && pings.count == 0,
-        "an expired live reading replaced by an anonymous rollout cannot declare an account change or authorize sending")
+        "a failed refresh retains the expired real interface fact without declaring an account change or authorizing original-task sends")
     live.capturedAt = clock; provider.set(live); state.usage.refresh()
     try await resumeWait { !state.usage.refreshing && state.usage.lastError == nil && state.usage.hasReliableReading }
     state.recompute(allowExecution: false)
@@ -676,21 +677,23 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
     let usage = RecoveryTestUsage(snapshot: UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: now.addingTimeInterval(18000)), weekly: nil,
         capturedAt: now, accountID: "ping-admission-account", sourceFile: "app-server"))
     var transports: [ResumeTestTransport] = []
+    let pings = PreparationGatePing()
+    try writeKeepAliveAuthentication(home: root, account: "ping-admission-account")
     let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: {
         let transport = ResumeTestTransport(); transports.append(transport); return transport
-    }, defaults: prefs, ledgerURL: root.appendingPathComponent("support/resume-attempts.json"), pingTransport: ReminderTestPing(), codexHome: root)
+    }, defaults: prefs, ledgerURL: root.appendingPathComponent("support/resume-attempts.json"), pingTransport: pings, codexHome: root)
     try resumePendingChoice(pendingTarget, account: "ping-admission-account", runtime: root.appendingPathComponent("support/runtime.json"))
     let state = AppState(provider: usage, defaults: prefs, runtimeURL: root.appendingPathComponent("support/runtime.json"), codexHome: root, execution: coordinator, startMonitoring: false)
     state.refresh(manual: true); try await resumeWait { state.availableTasks.count == 1 && !state.usage.refreshing }
-    usage.pauseModel(); prefs.set(true, forKey: "enabled"); state.recompute(allowExecution: false)
+    pings.holdPreparation(); prefs.set(true, forKey: "enabled"); state.recompute(allowExecution: false)
     let target = state.availableTasks.first!
     let pending = state.choices.recoveryDecisions?[target.episodeKey]
-    coordinator.ping(schedule: state.schedule, accountID: state.displayAccountID, ignoredEpisodes: [target.episodeKey], ignoredTargets: [target], blockers: { [] })
-    try await resumeWait { usage.modelReadCount > 0 && coordinator.running }
+    coordinator.ping(schedule: state.schedule, blockers: { [] })
+    try await resumeWait { pings.preparationCount > 0 && coordinator.running }
     state.resolveRecoveryDecision(.now, for: [target])
     check(pending != nil && state.choices.recoveryDecisions?[target.episodeKey] == pending && transports.isEmpty,
         "a now choice during keep-alive remains actionable instead of being consumed without submission")
-    usage.releaseModel(); try await resumeWait { !coordinator.running }
+    pings.releasePreparation(); try await resumeWait { !coordinator.running }
     state.resolveRecoveryDecision(.now, for: [target]); try await resumeWait { transports.first?.submitted == true && coordinator.latestOperation(for: target, accountID: state.displayAccountID)?.receivedAt != nil }
     check(coordinator.hasAttempted(target) && coordinator.latestOperation(for: target, accountID: state.displayAccountID)?.receivedAt != nil && transports.count == 1,
         "the preserved choice starts exactly once when keep-alive releases admission")
@@ -712,7 +715,8 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
         prefs.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "ask", "dailyAnchorMinutes": 780, "resumeWorkspaceReminder": false])
         var quota = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
             capturedAt: clock, accountID: "selection-account", sourceFile: "app-server", zeroUseWindowActive: false)
-        let usage = RecoveryTestUsage(snapshot: quota); let pings = ReminderTestPing()
+        let usage = RecoveryTestUsage(snapshot: quota); let pings = PreparationGatePing(clock: { clock })
+        try writeKeepAliveAuthentication(home: directory, account: "selection-account")
         var transports: [ResumeTestTransport] = []
         let coordinator = ExecutionCoordinator(provider: usage, makeResumeTransport: {
             let transport = ResumeTestTransport(); transports.append(transport); return transport
@@ -751,22 +755,22 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
         let choices = try JSONDecoder().decode(ResumeChoices.self, from: JSONSerialization.data(withJSONObject: saved["choices"]!))
         check(choices == state.choices, "keep-alive plan persists existing task choices without cancelling them: \(scenario)")
 
-        usage.pauseModel(); clock = node; quota.capturedAt = clock; quota.fiveHour?.resetsAt = node.addingTimeInterval(18000)
+        pings.holdPreparation(); clock = node; quota.capturedAt = clock; quota.fiveHour?.resetsAt = node.addingTimeInterval(18000)
         usage.set(quota); state.usage.refresh()
-        try await resumeWait { usage.modelReadCount > 0 && coordinator.running }
+        try await resumeWait { pings.preparationCount > 0 && coordinator.running }
         check(coordinator.running, "real coordinator prepares scheduled keep-alive: \(scenario)")
         if scenario == "reselected" { state.setSelected(tasks[1], true) }
         if scenario == "auto-on" { prefs.set(true, forKey: "autoResume"); state.recompute(allowExecution: false) }
         if scenario.hasSuffix("new-pause") { _ = try resumeFixture(root: directory, stop: clock.addingTimeInterval(-1), turn: "new-stop") }
-        usage.releaseModel(); try await resumeWait { !coordinator.running }
-        let shouldPing = scenario == "deselected" || scenario == "auto-off"
+        pings.releasePreparation(); try await resumeWait { !coordinator.running }
+        let shouldPing = true
         check(pings.count == (shouldPing ? 1 : 0) && coordinator.confirmations.filter { $0.kind == .keepAlive }.count == (shouldPing ? 1 : 0),
-            "send-time task protection permits only the unchanged keep-alive snapshot: \(scenario)")
-        if scenario == "auto-on" {
+            "task selection, auto-resume settings and new pauses do not block isolated keepalive: \(scenario)")
+        if scenario == "auto-on" || scenario == "reselected" {
             try await resumeWait { !state.usage.refreshing }; state.recompute()
             try await resumeWait { transports.first?.submitted == true }
             check(transports.count == 1 && !coordinator.hasAttempted(tasks[0]) && coordinator.hasAttempted(tasks[1]),
-                "re-enabling auto-resume continues only the selected task without a pending recovery choice")
+                "re-enabling or reselecting auto-resume continues only the selected task after the isolated executor is free")
         } else {
             check(transports.isEmpty && tasks.allSatisfy { !coordinator.hasAttempted($0) },
                 "keep-alive never resumes a task or creates a continuation attempt: \(scenario)")
@@ -1315,7 +1319,8 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
     let beforeReading = retainedPresentation.build(plan: plan, usage: snapshot, schedule: schedule, tasks: [], availableTasks: [],
         choices: ResumeChoices(), now: snapshot.capturedAt)
     var readChoices = ResumeChoices(); readChoices.readManualEvents = [operation.id]
-    let synchronizingPlan = NextAction(mode: .keepAlive, date: nil, decision: .wait(reason: "等待额度同步"), note: "等待额度同步")
+    let synchronizingPlan = DecisionEngine(schedule: schedule).plan(now: snapshot.capturedAt.addingTimeInterval(61), enabled: true,
+        autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: nil, blocked: [])
     let afterReading = retainedPresentation.build(plan: synchronizingPlan, usage: nil, schedule: schedule, tasks: [], availableTasks: [],
         choices: readChoices, usageError: "temporary connection failure", usageErrorIsTransient: true,
         now: snapshot.capturedAt.addingTimeInterval(61))
@@ -1334,137 +1339,61 @@ func resumeTestAttemptKeys(_ url: URL) throws -> [String] {
 }
 
 @MainActor private func checkPingPreflightDiagnostics(_ root: URL, _ check: (Bool, String) -> Void) async throws {
-    let scenarios: [(String, Int, [String])] = [
-        ("generation", 1, ["generation_changed"]), ("disabled", 1, ["disabled"]), ("anchor", 1, ["anchor_changed"]),
-        ("account", 1, ["account_changed"]), ("missing-account", 1, ["account_unconfirmed"]), ("empty-account", 1, ["account_unconfirmed"]), ("stale-account", 1, ["account_unconfirmed"]),
-        ("generation", 2, ["generation_changed"]), ("disabled", 2, ["disabled"]), ("anchor", 2, ["anchor_changed"]),
-        ("pause", 2, ["new_pause"]), ("stale", 2, ["usage_not_fresh"]), ("future", 2, ["usage_not_fresh"]),
-        ("timezone", 2, ["timezone_changed"]), ("expired", 2, ["opportunity_expired"]),
-        ("drift-expired", 2, ["opportunity_expired"]), ("node", 2, ["node_changed"]),
-        ("expired", 1, ["opportunity_expired"]), ("drift-expired", 1, ["opportunity_expired"]),
-        ("mixed-hard", 1, ["critical_refresh", "account_changed"]),
-        ("multiple", 2, ["critical_refresh", "codex_task_running", "generation_changed", "disabled", "anchor_changed", "usage_not_fresh"])
-    ] + ["runtime_unhealthy", "sessions_unscanned", "session_scan_failed", "critical_refresh", "keeper_busy", "codex_task_running", "task_selection_changed", "app_state_unavailable"].flatMap { reason in
-        [(reason, 1, [reason]), (reason, 2, [reason])]
-    }
-    for (name, stage, expected) in scenarios {
-        let directory = root.appendingPathComponent("\(name)-\(stage)")
-        try FileManager.default.createDirectory(at: directory.appendingPathComponent("sessions"), withIntermediateDirectories: true)
-        try resumeDatabase(directory)
+    for name in ["generation", "disabled", "anchor", "account", "missing-account", "timezone", "expired", "node", "keeper_busy"] {
+        let directory = root.appendingPathComponent(name)
+        try writeKeepAliveAuthentication(home: directory, account: "preflight-account")
         let suite = "keeper.preflight." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         prefs.register(defaults: ["enabled": true, "dailyAnchorMinutes": 480])
         var schedule = ScheduleEngine(anchorMinutes: 480)
-        let nodes = schedule.nodes(on: Date())
-        let node = name == "drift-expired" ? nodes[1] : nodes[0]
-        if name == "drift-expired" {
-            schedule.accountID = "preflight-secret-account"
-            schedule.confirmedWindows = [KeepAliveWindowEvidence(accountID: "preflight-secret-account", node: nodes[0], windowReset: node.addingTimeInterval(90),
-                confirmedAt: nodes[0].addingTimeInterval(90), anchorMinutes: 480, timeZoneID: schedule.timeZoneID)]
-        }
-        let opportunity = schedule.keepAliveOpportunities(at: node).first { $0.node == node }!
-        var clock = name.hasSuffix("expired") ? opportunity.deadline.addingTimeInterval(-0.5) : node.addingTimeInterval(name == "node" ? 1 : 10)
+        let node = schedule.nodes()[0]
+        var clock = node.addingTimeInterval(10)
         let started = clock
-        func idle() -> UsageSnapshot {
-            UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
-                capturedAt: clock, accountID: "preflight-secret-account", sourceFile: "app-server", zeroUseWindowActive: false)
-        }
-        var before = idle()
-        if name == "account" || name == "stale-account" { before.accountID = "other-secret-account" }
-        if name == "stale-account" { before.capturedAt = clock.addingTimeInterval(-61) }
-        if name == "missing-account" { before.accountID = nil }
-        if name == "empty-account" { before.accountID = " " }
+        let before = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: node.addingTimeInterval(18000)), weekly: nil,
+            capturedAt: clock, accountID: "preflight-account", sourceFile: "app-server", zeroUseWindowActive: false)
         let usage = RecoveryTestUsage(snapshot: before)
         let pings = ReminderTestPing()
         let ledger = directory.appendingPathComponent("support/attempts.json")
         let coordinator = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: ledger, pingTransport: pings, codexHome: directory, now: { clock })
-        let state = name == "critical_refresh" && stage == 1 ? AppState(provider: usage, defaults: prefs,
-            runtimeURL: directory.appendingPathComponent("support/runtime.json"), codexHome: directory, execution: coordinator, startMonitoring: false, now: { clock }) : nil
-        if name == "pause" { _ = try resumeFixture(root: directory, stop: started.addingTimeInterval(-1)) }
-        if name == "timezone" { schedule.timeZoneID = "fixture-other-timezone" }
-        var calls = 0
         var recovered = false
+        if name == "timezone" { schedule.timeZoneID = "fixture-other-timezone" }
         let blockers: () -> [PingPreflightReason] = {
-            calls += 1
-            guard !recovered, calls == stage else { return [] }
+            guard !recovered else { return [] }
             switch name {
             case "generation": coordinator.cancelCurrent()
-            case "disabled": prefs.set(false, forKey: "enabled"); return []
+            case "disabled": prefs.set(false, forKey: "enabled")
             case "anchor": prefs.set(481, forKey: "dailyAnchorMinutes")
-            case "stale": clock = before.capturedAt.addingTimeInterval(60.001)
-            case "future": clock = before.capturedAt.addingTimeInterval(-5.001)
-            case "expired", "drift-expired": clock = opportunity.deadline.addingTimeInterval(0.001)
+            case "account": try! writeKeepAliveAuthentication(home: directory, account: "other-account")
+            case "missing-account": try! FileManager.default.removeItem(at: directory.appendingPathComponent("auth.json"))
+            case "expired": clock = node.addingTimeInterval(600.001)
             case "node": clock = node.addingTimeInterval(-0.001)
-            case "mixed-hard": return [.criticalRefresh, .accountChanged]
-            case "multiple":
-                coordinator.cancelCurrent(); prefs.set(false, forKey: "enabled"); prefs.set(481, forKey: "dailyAnchorMinutes")
-                clock = before.capturedAt.addingTimeInterval(61)
-                return [.criticalRefresh, .codexTaskRunning]
+            case "keeper_busy": return [.keeperBusy]
             default: break
             }
-            return PingPreflightReason(rawValue: name).map { [$0] } ?? []
+            return []
         }
-        coordinator.ping(schedule: schedule, accountID: "preflight-secret-account", blockers: blockers)
+        coordinator.ping(schedule: schedule, usage: before, blockers: blockers)
         try await resumeWait { !coordinator.running }
-        if name.hasSuffix("expired"), stage == 1 {
-            check(coordinator.visibleNotice == PingPreflightReason.opportunityExpired.userMessage,
-                "quota preparation crossing the opportunity deadline leaves a visible missed-keepalive result: \(name)")
-        }
-        if let state {
-            try await Task.sleep(nanoseconds: 50_000_000)
-            check(usage.readCount == 1 && !state.usage.refreshing && !state.usage.criticalRefreshPending,
-                "ordinary ping preflight does not trigger AppState's successful-execution critical refresh")
-            state.usage.stop(); state.sessions.stop()
-        }
-        let events = directory.appendingPathComponent("support/execution-events.jsonl")
-        let log = try String(contentsOf: events, encoding: .utf8)
-        let rows = try log.split(separator: "\n").map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any] }
-        let diagnostic = rows.last?["preflight"] as? [String: Any]
-        check(diagnostic?["stage"] as? String == (stage == 1 ? "after_usage" : "before_send") && diagnostic?["reasons"] as? [String] == expected,
-            "production ping preflight retains every specific reason at checkpoint \(stage): \(name)")
-        check(pings.count == 0 && !rows.contains { $0["event"] as? String == "started" } && ((try? resumeTestAttemptKeys(ledger)) ?? []).isEmpty,
-            "preflight failure has no transport send, started event or attempt commitment: \(name)-\(stage)")
-        let deadline = (diagnostic?["opportunityDeadline"] as? String).flatMap(UsageDecoder.timestamp)
-        let opportunityStart = (diagnostic?["opportunityStartsAt"] as? String).flatMap(UsageDecoder.timestamp)
-        let checkedAt = (diagnostic?["checkedAt"] as? String).flatMap(UsageDecoder.timestamp)
-        let age = diagnostic?["usageAgeSeconds"] as? Double
-        let elapsed = diagnostic?["elapsedSeconds"] as? Double
-        check(deadline == opportunity.deadline && opportunityStart == opportunity.date && checkedAt.map { abs($0.timeIntervalSince(clock)) < 0.001 } == true &&
-            age.map { abs($0 - clock.timeIntervalSince(before.capturedAt)) < 0.00001 } == true && elapsed.map { $0 >= 0 } == true,
-            "preflight evidence preserves quota age and the original node's actual opportunity including drift: \(name)-\(stage)")
-        if name == "pause" { check(diagnostic?["newPauseCount"] as? Int == 1, "new pause diagnostics store only the blocking pause count") }
-        check(!log.contains("secret-account") && !log.contains(directory.path) && !log.contains("usage_limit_reached"),
-            "preflight diagnostics omit account identity, task content and workspace paths: \(name)-\(stage)")
-        check(coordinator.lastFailure != "状态已改变，取消本次保活" && coordinator.lastFailure != "保活条件已改变，等待重新确认",
-            "preflight UI uses a concrete reason: \(name)-\(stage)")
-
-        let attention = ["account", "missing-account", "empty-account", "stale-account", "runtime_unhealthy", "session_scan_failed", "app_state_unavailable", "mixed-hard"].contains(name)
-        check(coordinator.lastFailure != nil && (coordinator.visibleFailure != nil) == attention && (coordinator.visibleNotice != nil) != attention,
-            "ping waits preserve the internal outcome signal while only hard blockers appear as failures: \(name)-\(stage)")
-        if !attention {
-            var presentation = MenuPresentation()
-            let menu = presentation.build(plan: nil, usage: nil, schedule: schedule, tasks: [], availableTasks: [], choices: ResumeChoices(),
-                executionFailure: coordinator.visibleFailure, executionNotice: coordinator.visibleNotice, now: clock)
-            check(menu.note.contains(coordinator.status) && !menu.note.contains("失败") && menu.warning.isEmpty && menu.statusSymbol != "exclamationmark.circle",
-                "normal ping wait and missed opportunity remain visible as an ordinary note: \(name)-\(stage)")
-        }
-        if name == "mixed-hard" {
-            check(coordinator.lastFailure == CodexConnectionError.userMessage(reason: "account_changed"),
-                "a normal ping refresh cannot hide a simultaneous account blocker")
-        }
-        recovered = true; clock = started; prefs.set(true, forKey: "enabled"); prefs.set(480, forKey: "dailyAnchorMinutes")
-        schedule.timeZoneID = Calendar.current.timeZone.identifier; usage.set(idle())
-        if name == "pause" {
-            for file in try FileManager.default.contentsOfDirectory(at: directory.appendingPathComponent("sessions"), includingPropertiesForKeys: nil) {
-                try FileManager.default.removeItem(at: file)
-            }
-        }
-        coordinator.ping(schedule: schedule, accountID: "preflight-secret-account", blockers: blockers)
+        let expected: PingPreflightReason = ["generation": .generationChanged, "disabled": .disabled, "anchor": .anchorChanged,
+            "account": .accountChanged, "missing-account": .accountUnconfirmed, "timezone": .timeZoneChanged,
+            "expired": .opportunityExpired, "node": .nodeChanged, "keeper_busy": .keeperBusy][name]!
+        let diagnostic = coordinator.lastPingResult?.preflight
+        check(diagnostic?.stage == .beforeSend && diagnostic?.reasons == [expected],
+            "local send checkpoint preserves its remaining specific admission reason: \(name)")
+        check(pings.count == 0 && ((try? resumeTestAttemptKeys(ledger)) ?? []).isEmpty,
+            "local admission failure has no send or attempt commitment: \(name)")
+        check(diagnostic?.opportunityDeadline == node.addingTimeInterval(600) && diagnostic?.usageCapturedAt == before.capturedAt,
+            "local checkpoint records the fixed opportunity and original sampling time: \(name)")
+        recovered = true; clock = started
+        prefs.set(true, forKey: "enabled"); prefs.set(480, forKey: "dailyAnchorMinutes")
+        schedule.timeZoneID = Calendar.current.timeZone.identifier
+        try writeKeepAliveAuthentication(home: directory, account: "preflight-account")
+        coordinator.ping(schedule: schedule, usage: before, blockers: blockers)
         try await resumeWait { !coordinator.running }
-        coordinator.ping(schedule: schedule, accountID: "preflight-secret-account", blockers: blockers)
+        coordinator.ping(schedule: schedule, usage: before, blockers: blockers)
         try await resumeWait { !coordinator.running }
-        check(pings.count == 1 && coordinator.confirmations.filter { $0.kind == .keepAlive }.count == 1 && (try? resumeTestAttemptKeys(ledger))?.count == 1,
-            "recovered preflight can retry once and successful original-node commitment prevents a duplicate: \(name)-\(stage)")
+        check(pings.count == 1 && coordinator.confirmations.count == 1 && (try? resumeTestAttemptKeys(ledger))?.count == 1,
+            "repaired unsent preparation retries once and original node remains deduplicated: \(name)")
     }
     try await checkAppKeepAliveBlockers(root.appendingPathComponent("app-blockers"), check)
 }
@@ -1478,35 +1407,35 @@ func resumeTestAttemptKeys(_ url: URL) throws -> [String] {
     defer { prefs.removePersistentDomain(forName: suite) }
     prefs.register(defaults: ["enabled": false, "autoResume": true, "dailyAnchorMinutes": 480])
     let state = AppState(provider: usage, defaults: prefs, runtimeURL: root.appendingPathComponent("support/runtime.json"), codexHome: root, startMonitoring: false, now: { clock })
-    check(state.keepAliveBlockers(ignoring: []).contains(.sessionsUnscanned), "AppState reports an incomplete first session scan explicitly")
+    check(state.keepAliveBlockers().isEmpty, "an incomplete first scan does not block isolated keepalive")
     state.sessions.refresh(); try await resumeWait { state.sessions.hasScanned && !state.usage.refreshing }
     usage.pause(); state.usage.refresh(critical: true)
     try await resumeWait { state.usage.refreshing }
-    check(state.keepAliveBlockers(ignoring: []).contains(.criticalRefresh) && !state.keepAliveBlockers(ignoring: []).contains(.codexTaskRunning),
-        "real AppState distinguishes a required quota refresh from a running Codex task")
+    check(state.keepAliveBlockers().isEmpty,
+        "a critical quota refresh does not block isolated keepalive")
     usage.release(); try await resumeWait { !state.usage.refreshing }
     let target = try resumeFixture(root: root, stop: clock.addingTimeInterval(-1))
     state.sessions.refresh(); try await resumeWait { !state.blockedSessions.isEmpty && !state.usage.refreshing }
-    check(state.keepAliveBlockers(ignoring: []).contains(.taskSelectionChanged), "real AppState identifies a pending pause outside the admitted task choices")
+    check(state.keepAliveBlockers().isEmpty, "pending user tasks retain their choices without blocking isolated keepalive")
     var trace = try Data(contentsOf: target.fileURL)
     trace.append(try resumeEvent("task_started", turn: "running", at: clock)); try trace.write(to: target.fileURL)
     let scanned = state.sessions.scannedAt; state.sessions.refresh()
     try await resumeWait { state.sessions.scannedAt != scanned && !state.usage.refreshing }
-    check(state.keepAliveBlockers(ignoring: []).contains(.codexTaskRunning) && !state.keepAliveBlockers(ignoring: []).contains(.criticalRefresh),
-        "real AppState reports running Codex work after its quota refresh finishes")
+    check(state.keepAliveBlockers().isEmpty,
+        "external Codex work does not block isolated keepalive")
     usage.pause(); state.usage.refresh(critical: true)
-    check(Set(state.keepAliveBlockers(ignoring: [])).isSuperset(of: [.criticalRefresh, .codexTaskRunning]),
-        "AppState preserves simultaneous task-running and quota-refresh blockers")
+    check(state.keepAliveBlockers().isEmpty,
+        "simultaneous quota refresh and external work leave isolated admission free")
     usage.release(); try await resumeWait { !state.usage.refreshing }
     let invalid = root.appendingPathComponent("sessions/rollout-\(UUID().uuidString).jsonl")
     try Data([0xff]).write(to: invalid)
     let prior = state.sessions.scannedAt; state.sessions.refresh(); try await resumeWait { state.sessions.scannedAt != prior }
-    check(state.keepAliveBlockers(ignoring: []).contains(.sessionScanFailed), "real AppState identifies a failed session scan independently")
+    check(state.keepAliveBlockers().isEmpty, "a failed session scan is confined to resume admission")
     let invalidParent = root.appendingPathComponent("invalid-runtime-parent")
     try Data().write(to: invalidParent)
     let unhealthy = AppState(provider: usage, defaults: prefs, runtimeURL: invalidParent.appendingPathComponent("runtime.json"), codexHome: root,
         execution: state.execution, startMonitoring: false, now: { clock })
-    check(unhealthy.keepAliveBlockers(ignoring: []).contains(.runtimeUnhealthy), "real AppState preserves persistence-health admission as its own reason")
+    check(unhealthy.keepAliveBlockers().isEmpty, "damaged resume runtime does not block the healthy shared sending ledger")
     let busyRoot = root.appendingPathComponent("busy")
     try FileManager.default.createDirectory(at: busyRoot, withIntermediateDirectories: true)
     let busyLedger = busyRoot.appendingPathComponent("attempts.json")
@@ -1514,7 +1443,7 @@ func resumeTestAttemptKeys(_ url: URL) throws -> [String] {
     let busyExecution = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: busyLedger, codexHome: root)
     let busyState = AppState(provider: usage, defaults: prefs, runtimeURL: busyRoot.appendingPathComponent("runtime.json"), codexHome: root,
         execution: busyExecution, startMonitoring: false, now: { clock })
-    check(busyState.keepAliveBlockers(ignoring: []).contains(.keeperBusy), "real AppState identifies existing Keeper continuation ownership")
+    check(busyState.keepAliveBlockers().contains(.keeperBusy), "real AppState identifies existing Keeper continuation ownership")
     state.usage.stop(); state.sessions.stop(); unhealthy.usage.stop(); unhealthy.sessions.stop(); busyState.usage.stop(); busyState.sessions.stop()
 }
 
@@ -1768,32 +1697,27 @@ private struct AuditFailureUsage: UsageProvider {
 }
 
 @MainActor private func checkPreparationFailureStages(_ root: URL, _ check: (Bool, String) -> Void) async throws {
-    for (mode, stage, reason) in [("model", "model_discovery", "model_discovery_failed"), ("usage", "usage_read", "usage_read_failed"), ("scan", "session_scan", "session_scan_failed")] {
+    for mode in ["model", "usage", "scan"] {
         let directory = root.appendingPathComponent(mode)
-        try FileManager.default.createDirectory(at: directory.appendingPathComponent("sessions"), withIntermediateDirectories: true); try resumeDatabase(directory)
-        let schedule = ScheduleEngine(anchorMinutes: 480); let clock = schedule.nodes(on: Date())[0].addingTimeInterval(10)
+        try writeKeepAliveAuthentication(home: directory, account: "audit-account")
+        let schedule = ScheduleEngine(anchorMinutes: 480); let clock = schedule.nodes()[0].addingTimeInterval(10)
         let live = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clock.addingTimeInterval(18000)), weekly: nil,
             capturedAt: clock, accountID: "audit-account", sourceFile: "app-server", zeroUseWindowActive: false)
         let usage = AuditFailureUsage(snapshot: live, mode: mode)
-        if mode == "scan" { try Data([0xff]).write(to: directory.appendingPathComponent("sessions/rollout-\(UUID().uuidString).jsonl")) }
+        let sessions = directory.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        if mode == "scan" { try Data([0xff]).write(to: sessions.appendingPathComponent("rollout-\(UUID().uuidString).jsonl")) }
         let suite = "keeper.preparation-stage." + UUID().uuidString; let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         prefs.register(defaults: ["enabled": true, "dailyAnchorMinutes": 480])
-        let pings = ReminderTestPing(); let ledger = directory.appendingPathComponent("support/attempts.json")
+        let pings = PreparationGatePing(clock: { clock }); let ledger = directory.appendingPathComponent("support/attempts.json")
         let coordinator = ExecutionCoordinator(provider: usage, defaults: prefs, ledgerURL: ledger, pingTransport: pings, codexHome: directory, now: { clock })
-        coordinator.ping(schedule: schedule, accountID: "audit-account", blockers: { [] }); try await resumeWait { !coordinator.running }
+        coordinator.ping(schedule: schedule, blockers: { [] }); try await resumeWait { !coordinator.running }
         let log = try String(contentsOf: directory.appendingPathComponent("support/execution-events.jsonl"), encoding: .utf8)
-        let row = try JSONSerialization.jsonObject(with: Data(log.split(separator: "\n").last!.utf8)) as! [String: Any]
-        let diagnostic = row["preflight"] as? [String: Any]; let failure = diagnostic?["failure"] as? [String: Any]
-        check(diagnostic?["stage"] as? String == stage && diagnostic?["reasons"] as? [String] == [reason] && failure?["reason"] != nil,
-            "ping preparation errors retain their actual checkpoint and sanitized classification: \(mode)")
-        check((mode == "usage" ? coordinator.status == L10n.text("正在确认中") && coordinator.visibleFailure == nil : coordinator.status.contains("，") && coordinator.visibleFailure != nil) &&
-            !coordinator.status.contains("\n") && (row["error"] as? String)?.contains("\n") == false,
-            "ping preparation separates transient waiting from actionable hints while retaining its original diagnostic: \(mode)")
-        check(mode == "usage" ? failure?["rpcAttempted"] as? Bool == true : failure?["rpcAttempted"] == nil,
-            "only explicit quota RPC evidence is retained; model discovery does not borrow quota RPC status: \(mode)")
-        check(pings.count == 0 && !log.contains("fixture-secret") && !log.contains("Authorization") && !FileManager.default.fileExists(atPath: ledger.path),
-            "preparation failures neither send nor persist raw errors or attempt keys: \(mode)")
+        check(pings.count == 1 && coordinator.lastPingResult?.outcome == .windowActive && coordinator.lastFailure == nil,
+            "online model/quota discovery and full scan failures do not gate isolated submission: \(mode)")
+        check(!log.contains("fixture-secret") && !log.contains("Authorization") && (try? resumeTestAttemptKeys(ledger))?.count == 1,
+            "isolated submission records exactly one safe account/node intent: \(mode)")
     }
     let directory = root.appendingPathComponent("resume-read")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); try resumeDatabase(directory)

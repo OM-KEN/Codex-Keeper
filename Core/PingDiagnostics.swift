@@ -1,5 +1,4 @@
 import Foundation
-import SQLite3
 
 enum PingPreflightReason: String, Codable {
     case modelDiscoveryFailed = "model_discovery_failed", usageReadFailed = "usage_read_failed"
@@ -100,31 +99,55 @@ struct PingTiming {
     var pollInterval: TimeInterval = 5
 }
 
-enum PingFailureReason: String, Codable {
-    case unknown, requestTimeout = "request_timeout", connection, proxy, server
-    case configuration, processExit = "process_exit", quotaRead = "quota_read", accountChanged = "account_changed", cancelled
+enum PingOutcome: String, Codable {
+    case submitted, newWindow = "new_window", windowActive = "window_active", windowPending = "window_pending"
+    case failed, unknown, notExecuted = "not_executed", skipped
 }
 
-/// Only allowlisted classifications leave the in-memory runtime log reader.
-struct PingLogEvidence: Equatable {
-    let reason: PingFailureReason
-    let retryCount: Int?
-    static func classify(_ body: String) -> PingLogEvidence? {
-        let event = body.components(separatedBy: "}: ").last ?? body
-        guard event.hasPrefix("stream disconnected - retrying sampling request "),
-              let marker = event.range(of: "sampling_error=") else { return nil }
-        let error = String(event[marker.upperBound...]).lowercased()
-        let reason: PingFailureReason
-        if error.contains("proxy authentication required") || error.contains("proxy connect") || error.contains("proxy tunnel") { reason = .proxy }
-        else if error.range(of: #"(?:unexpected status(?: code)?[: ]+|http(?:/\d(?:\.\d)?)? )5\d\d\b"#, options: .regularExpression) != nil { reason = .server }
-        else if error.contains("request timed out") { reason = .requestTimeout }
-        else if ["connection refused", "connection reset", "dns error", "failed to lookup", "tls handshake", "certificate verify failed"].contains(where: error.contains) { reason = .connection }
-        else { reason = .unknown }
-        let expression = try! NSRegularExpression(pattern: #"\((\d+)/\d+"#)
-        let match = expression.firstMatch(in: event, range: NSRange(event.startIndex..., in: event))
-        let retry = match.flatMap { Range($0.range(at: 1), in: event) }.flatMap { Int(event[$0]) }
-        return PingLogEvidence(reason: reason, retryCount: retry)
+/// The latest event for an account/node is its one execution fact, shared by history and alerts.
+struct PingNodeResult: Codable {
+    let node: Date
+    let accountID: String?
+    let at: Date
+    let outcome: PingOutcome
+    var diagnostic: PingDiagnostic? = nil
+    var preflight: PingPreflightDiagnostic? = nil
+    var detail: String? = nil
+    var acknowledgedAt: Date? = nil
+
+    var message: String {
+        switch outcome {
+        case .submitted: return L10n.text("正在确认中")
+        case .newWindow: return L10n.text("已确认新的 5 小时窗口")
+        case .windowActive: return L10n.text("保活请求已完成，窗口有效。")
+        case .windowPending: return L10n.text("保活请求已完成，窗口待确认。")
+        case .skipped: return L10n.text("已有有效 5 小时窗口")
+        case .notExecuted:
+            let message = L10n.text("本次保活已错过，请等待下次保活或手动保活。")
+            guard let detail, !detail.isEmpty, detail != L10n.text("正在确认中") else { return message }
+            return message + "\n" + L10n.format("上轮原因：%@", detail)
+        case .failed, .unknown: return preflight?.errorDescription ?? diagnostic?.failureMessage ?? detail ?? L10n.text("结果待确认，请刷新查看额度。")
+        }
     }
+    var succeeded: Bool { outcome == .newWindow || outcome == .windowActive }
+    var needsAttention: Bool { acknowledgedAt == nil && [.failed, .unknown, .windowPending, .notExecuted].contains(outcome) }
+    var historyLabel: String {
+        switch outcome {
+        case .submitted: return "正在确认中"
+        case .newWindow: return "新窗口已确认"
+        case .windowActive: return "请求完成，窗口有效"
+        case .windowPending: return "请求完成，窗口待确认"
+        case .failed: return "保活失败"
+        case .unknown: return "结果待确认"
+        case .notExecuted: return "本轮未执行"
+        case .skipped: return "已有有效窗口"
+        }
+    }
+}
+
+enum PingFailureReason: String, Codable {
+    case unknown, requestTimeout = "request_timeout", connection, proxy, server
+    case model, request, launch, configuration, processExit = "process_exit", quotaRead = "quota_read", accountChanged = "account_changed", cancelled
 }
 
 struct PingDiagnostic: Codable {
@@ -141,10 +164,15 @@ struct PingDiagnostic: Codable {
     var windowConfirmed = false
     var outcome = "waiting"
     var quotaReadFailure: UsageReadDiagnostic?
+    var errorCode: String?
+    var stage: String = "confirmation"
 
     var warning: String { L10n.text("正在确认中") }
     var failureMessage: String {
         switch reason {
+        case .launch: return L10n.text("无法启动 Codex，请更新后刷新。")
+        case .model: return L10n.text("当前模型不可用，请更新 Codex 后刷新。")
+        case .request: return L10n.text("保活请求失败，请等待下次保活。")
         case .configuration: return L10n.text("设置未就绪，请更新 Codex。")
         case .accountChanged: return L10n.text("账户已切换，请切回原账户。")
         case .connection, .proxy, .requestTimeout: return L10n.text("连接失败，请检查网络。")
@@ -155,6 +183,8 @@ struct PingDiagnostic: Codable {
     }
     var diagnosticMessage: String {
         switch reason {
+        case .launch: return L10n.text("保活未发送：Codex 无法启动")
+        case .model, .request: return L10n.text("保活请求已报错；本轮不再重试")
         case .configuration: return L10n.text("保活未发送：Codex 无法读取保活配置")
         case .processExit: return L10n.text("保活进程提前退出，未确认新窗口；本轮不再重试")
         case .quotaRead: return L10n.text("保活已发送，但额度读取失败，未确认新窗口；本轮不再重试")
@@ -176,48 +206,10 @@ struct PingFailure: LocalizedError {
     var errorDescription: String? { diagnostic.failureMessage }
 }
 
-/// Scope evidence to the newly created ping session and the current attempt, including nanoseconds.
-struct PingDiagnosticLogReader {
-    let home: URL
-    func read(threadID: String, turnID: String? = nil, since: Date, until: Date) -> (evidence: PingLogEvidence?, status: String) {
-        guard UUID(uuidString: threadID) != nil else { return (nil, "unavailable") }
-        let files = (try? FileManager.default.contentsOfDirectory(at: home, includingPropertiesForKeys: nil)) ?? []
-        let databases = files.filter { $0.lastPathComponent.range(of: #"^logs(?:_[0-9]+)?\.sqlite$"#, options: .regularExpression) != nil }
-        var latest: (Double, PingLogEvidence)?
-        var readable = false
-        for file in databases {
-            var db: OpaquePointer?
-            guard sqlite3_open_v2(file.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
-                if let db { sqlite3_close(db) }; continue
-            }
-            defer { sqlite3_close(db) }
-            sqlite3_busy_timeout(db, 100)
-            var statement: OpaquePointer?
-            let query = "SELECT ts, ts_nanos, feedback_log_body FROM logs WHERE thread_id = ? AND ts >= ? AND ts <= ? AND target = 'codex_core::responses_retry' ORDER BY ts DESC, ts_nanos DESC LIMIT 100"
-            guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK else { sqlite3_finalize(statement); continue }
-            defer { sqlite3_finalize(statement) }
-            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            sqlite3_bind_text(statement, 1, threadID, -1, transient)
-            sqlite3_bind_int64(statement, 2, Int64(since.timeIntervalSince1970))
-            sqlite3_bind_int64(statement, 3, Int64(until.timeIntervalSince1970))
-            var step = sqlite3_step(statement)
-            while step == SQLITE_ROW {
-                let at = Double(sqlite3_column_int64(statement, 0)) + Double(sqlite3_column_int64(statement, 1)) / 1_000_000_000
-                if at >= since.timeIntervalSince1970, at <= until.timeIntervalSince1970,
-                   let raw = sqlite3_column_text(statement, 2) {
-                    let body = String(cString: raw)
-                    let event = body.components(separatedBy: "}: ").last ?? body
-                    let pattern = #"(?:^|\s)turn_id=([0-9a-fA-F-]{36})(?:\s|$)"#
-                    let regex = try! NSRegularExpression(pattern: pattern)
-                    let match = regex.firstMatch(in: event, range: NSRange(event.startIndex..., in: event))
-                    let eventTurn = match.flatMap { Range($0.range(at: 1), in: event) }.map { String(event[$0]) }
-                    if (turnID == nil || eventTurn == turnID), let evidence = PingLogEvidence.classify(body),
-                       latest == nil || at > latest!.0 { latest = (at, evidence) }
-                }
-                step = sqlite3_step(statement)
-            }
-            if step == SQLITE_DONE { readable = true }
-        }
-        return (latest?.1, readable ? "readable" : "unavailable")
-    }
+
+/// Local preparation/Process.run failed before a request process existed.
+struct PingSubmissionError: LocalizedError {
+    let underlying: Error
+    var stage = "preparation"
+    var errorDescription: String? { underlying.localizedDescription }
 }

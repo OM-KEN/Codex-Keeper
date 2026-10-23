@@ -63,6 +63,20 @@ import UserNotifications
             notifications.add(UNNotificationRequest(identifier: "keeper-ping-wait-" + UUID().uuidString,
                 content: content, trigger: nil))
         }.store(in: &cancellables)
+        appState.execution.$lastPingResult.dropFirst().receive(on: DispatchQueue.main).sink { result in
+            guard let result else { return }
+            let identifier = "keeper-ping-result-" + String(result.node.timeIntervalSince1970)
+            if result.succeeded || result.acknowledgedAt != nil {
+                notifications.removePendingNotificationRequests(withIdentifiers: [identifier])
+                notifications.removeDeliveredNotifications(withIdentifiers: [identifier])
+                return
+            }
+            guard result.needsAttention else { return }
+            let content = UNMutableNotificationContent()
+            content.title = L10n.text("保活结果")
+            content.body = result.message
+            notifications.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+        }.store(in: &cancellables)
         appState.$recoveryReminderTasks.receive(on: DispatchQueue.main).sink { [weak self] tasks in
             self?.sendRecoveryReminders(for: tasks)
         }.store(in: &cancellables)
@@ -94,6 +108,7 @@ import UserNotifications
     }
     func menuDidClose(_ menu: NSMenu) {
         menuIsTracking = false
+        appState.execution.acknowledgePingResult()
         statusQuotaView.setHighlighted(false); quotaHost?.menuDidClose()
         scheduleImportantUpdatePrompt()
     }
@@ -253,20 +268,24 @@ import UserNotifications
             earlyRecoveryPolicy: defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask",
             confirmations: appState.execution.confirmations,
             usageError: appState.usage.lastError, usageErrorIsTransient: appState.usage.lastErrorIsTransient,
-            sessionError: appState.sessions.detectionError,
+            sessionError: appState.nextAction?.mode == .resume ? appState.sessions.detectionError : nil,
             running: running ?? appState.execution.running, executionMode: appState.execution.activeMode,
             executionFailure: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleFailure,
             executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil,
             executionWarning: appState.execution.warning,
             executionNotice: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleNotice,
-            refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage)
-        let recordFailures = [appState.pendingStateFailure, appState.execution.recordingFailure].compactMap { $0 }
+            refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage, accountContext: appState.authenticatedAccountID)
+        let recordFailures = [appState.execution.recordingFailure].compactMap { $0 }
         if !recordFailures.isEmpty {
             summary.error = ([summary.error] + recordFailures).filter { !$0.isEmpty }.joined(separator: "\n")
             summary.hasStatusIssue = true
         }
         summary.applyResumeTasks(operations: appState.currentOperations, pending: appState.availableTasks, choices: appState.choices,
             enabled: appState.enabled, autoResume: appState.automaticResumeEnabled)
+        if appState.automaticResumeEnabled, appState.pendingStateFailure != nil || appState.sessions.detectionError != nil {
+            summary.tasks = [L10n.text("自动继续暂不可用")]; summary.tasksNeedAttention = true
+        }
+        summary.applyPingHistory(appState.execution.pingResults, accountID: appState.authenticatedAccountID ?? appState.displayAccountID ?? appState.execution.lastPingResult?.accountID)
         summary.applyResumeHistory(appState.visibleOperations, accountID: appState.displayAccountID, confirmations: appState.execution.confirmations)
         return summary
     }
@@ -338,6 +357,14 @@ import UserNotifications
     }
     @objc private func openTasks() { openTasks(history: nil) }
     private func openTasks(history: MenuTimelinePoint?) {
+        if let result = history?.pingResult {
+            let alert = NSAlert()
+            alert.messageText = L10n.text("保活记录")
+            alert.informativeText = result.message
+            alert.addButton(withTitle: L10n.text("好"))
+            NSApp.activate(ignoringOtherApps: true); alert.runModal()
+            return
+        }
         if tasksWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 572, height: 340), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = L10n.text("自动继续任务")

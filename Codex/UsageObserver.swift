@@ -41,7 +41,7 @@ struct UsageSnapshot: Equatable {
     }
 }
 
-/// Independent read-only account polling. Rollout data is bounded, explicitly stale fallback evidence.
+/// Independent read-only account polling. A failure preserves the last real interface reading and its time.
 @MainActor
 final class UsageObserver: ObservableObject {
     // Called on the main actor after the reading and critical-refresh gate have both settled.
@@ -57,7 +57,6 @@ final class UsageObserver: ObservableObject {
     private let provider: UsageProvider
     private let now: () -> Date
 
-    private let codexHome: URL
     private let logURL: URL
     private var timer: Timer?
     private var pendingManualSource: String?
@@ -70,11 +69,10 @@ final class UsageObserver: ObservableObject {
 
     var lastErrorIsTransient: Bool { lastReadFailure?.isTransient == true }
 
-    init(codexHome: URL = CodexEnvironment.home, provider: UsageProvider = AppServerUsageProvider(), logURL: URL? = nil,
+    init(provider: UsageProvider = AppServerUsageProvider(), logURL: URL? = nil,
          now: @escaping () -> Date = Date.init) {
         self.provider = provider
         self.now = now
-        self.codexHome = codexHome
         let support = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "CodexKeeper", directoryHint: .isDirectory)
@@ -96,6 +94,7 @@ final class UsageObserver: ObservableObject {
 
     func invalidate(clearAccount: Bool = false) {
         hasReliableReading = false
+        if clearAccount { snapshot = nil }
         // Keep the original reading and its capture time as facts. Critical refresh gates execution.
         // Only a reliable new account response may change the display account.
 
@@ -151,12 +150,11 @@ final class UsageObserver: ObservableObject {
         }
         refreshing = true
         let provider = provider
-        let home = codexHome
         Task {
             let result = await Task.detached { () -> (UsageSnapshot?, String?, UsageReadDiagnostic?) in
                 do { return (try (manual ? provider.readForUserRefresh() : provider.read()), nil, nil) }
                 catch {
-                    return (Self.readLatestSnapshot(codexHome: home), error.localizedDescription,
+                    return (nil, error.localizedDescription,
                         UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - started))
                 }
             }.value
@@ -168,13 +166,9 @@ final class UsageObserver: ObservableObject {
                 appendLogEntry(entry)
             }
             hasReliableReading = result.1 == nil && result.0?.isFresh(at: now()) == true && result.0?.accountID?.isEmpty == false
-            if result.2?.isTransient == true, snapshot?.isFresh(at: now()) == true {
-                // Keep the recent live reading during a transient refresh failure.
-            } else if let new = result.0 {
+            if let new = result.0 {
                 if snapshot != new { appendTransitionLog(new) }
                 snapshot = new // Equal values still carry a new freshness timestamp.
-            } else if result.1 != nil {
-                snapshot = nil
             }
             lastError = result.1
             lastReadFailure = result.2
@@ -200,71 +194,6 @@ final class UsageObserver: ObservableObject {
             else { scheduleRefresh() }
             onRefreshCompleted?()
         }
-    }
-
-    // MARK: - 快照读取
-
-    /// 扫描最近修改的 rollout 文件，取最后一条带窗口数据的 rate_limits
-    nonisolated static func readLatestSnapshot(codexHome: URL) -> UsageSnapshot? {
-        let sessionsDir = codexHome.appending(path: "sessions", directoryHint: .isDirectory)
-        guard let enumerator = FileManager.default.enumerator(
-            at: sessionsDir,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return nil }
-
-        var files: [(url: URL, mtime: Date)] = []
-        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
-            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
-                  values.isRegularFile == true,
-                  let mtime = values.contentModificationDate else { continue }
-            files.append((url, mtime))
-        }
-        files.sort { $0.mtime > $1.mtime }
-
-        return files.prefix(12).compactMap { readSnapshot(from: $0) }.max { $0.capturedAt < $1.capturedAt }
-    }
-
-    /// 从单个 rollout 尾部找最新 rate_limits（从后往前扫，命中即停）
-    nonisolated private static func readSnapshot(from file: (url: URL, mtime: Date)) -> UsageSnapshot? {
-        guard let handle = try? FileHandle(forReadingFrom: file.url) else { return nil }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd() else { return nil }
-        try? handle.seek(toOffset: size > 512 * 1024 ? size - 512 * 1024 : 0)
-        guard let data = try? handle.readToEnd(), let content = String(data: data, encoding: .utf8) else { return nil }
-        let lines = content.split(separator: "\n", omittingEmptySubsequences: true)
-
-        var fiveHour: QuotaWindow?
-        var weekly: QuotaWindow?
-        var capturedAt: Date?
-
-        for rawLine in lines.reversed() {
-            guard rawLine.contains("rate_limits"),
-                  let lineData = rawLine.data(using: .utf8),
-                  let entry = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let payload = entry["payload"] as? [String: Any],
-                  let rateLimits = payload["rate_limits"] as? [String: Any]
-            else { continue }
-
-            (fiveHour, weekly) = UsageDecoder.windows(rateLimits)
-
-            if fiveHour != nil || weekly != nil {
-                if let ts = entry["timestamp"] as? String {
-                    let formatter = ISO8601DateFormatter()
-                    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    capturedAt = formatter.date(from: ts)
-                }
-                break
-            }
-        }
-
-        guard fiveHour != nil || weekly != nil else { return nil }
-        return UsageSnapshot(
-            fiveHour: fiveHour,
-            weekly: weekly,
-            capturedAt: capturedAt ?? file.mtime,
-            sourceFile: file.url.lastPathComponent
-        )
     }
 
     // MARK: - Transition 日志（P0-6 埋点）

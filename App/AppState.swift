@@ -20,6 +20,9 @@ import Network
     @Published private(set) var recoveryReminderTasks: [BlockedSession] = []
     private let defaults: UserDefaults
     private let runtimeURL: URL
+    private let codexHome: URL
+    private let monitoring: Bool
+    private var authenticationAccountID: String?
     private let now: () -> Date
     private let diagnoseScheduling: Bool
     private var savedRuntime: Data?
@@ -48,14 +51,16 @@ import Network
          execution: ExecutionCoordinator? = nil, startMonitoring: Bool = true, now: @escaping () -> Date = Date.init,
          diagnoseScheduling: Bool = ProcessInfo.processInfo.arguments.contains("--diagnose-scheduling")) {
         self.defaults = defaults
+        self.codexHome = codexHome
+        monitoring = startMonitoring
         self.now = now
         self.diagnoseScheduling = diagnoseScheduling
         self.runtimeURL = runtimeURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/pending-runtime.json")
-        usage = UsageObserver(codexHome: codexHome, provider: provider, logURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"), now: now)
+        usage = UsageObserver(provider: provider, logURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"), now: now)
         let scanWorker = SessionScanWorker(codexHome: codexHome)
         sessions = SessionWatcher(codexHome: codexHome, worker: scanWorker)
         self.execution = execution ?? ExecutionCoordinator(provider: provider, defaults: defaults,
-            ledgerURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), codexHome: codexHome, scanWorker: scanWorker)
+            ledgerURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("resume-attempts.json"), codexHome: codexHome, scanWorker: scanWorker, now: now)
         schedule = ScheduleEngine(anchorMinutes: defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480)
         do { try restoreRuntime() }
         catch {
@@ -77,7 +82,7 @@ import Network
         // Advance scheduling from a fully committed read, without waiting for UI notification delivery.
         usage.onRefreshCompleted = { [weak self] in
             guard let self else { return }
-            self.recompute(allowExecution: self.usage.hasReliableReading && self.usage.lastError == nil, source: "usage")
+            self.recompute(source: "usage")
         }
         sessions.onRefreshCompleted = { [weak self] in self?.recompute(source: "sessions") }
         self.execution.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
@@ -91,7 +96,7 @@ import Network
         sessions.watchedIDs = Set(confirmed.keys).union(self.execution.busyThreadIDs)
         sessions.watchedPaths = self.execution.protectedPaths
         observers.append(NotificationCenter.default.addObserver(forName: CodexLocator.fallbackPathChanged, object: defaults, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.usage.refresh(manual: true, source: "cli_path") }
+            Task { @MainActor in self?.execution.relocateKeepAlive(); self?.usage.refresh(manual: true, source: "cli_path") }
         })
         guard startMonitoring else { recompute(allowExecution: false); return }
         observers.append(NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -114,6 +119,7 @@ import Network
         }
         network.start(queue: DispatchQueue(label: "keeper.network"))
         sessions.watchedIDs = Set(confirmed.keys).union(self.execution.busyThreadIDs)
+        self.execution.maintainKeepAlive(forceCheck: true)
         usage.start()
         sessions.start()
         recompute()
@@ -162,12 +168,13 @@ import Network
         usage.refresh(manual: manual, source: source); sessions.refresh(); recompute(source: source)
     }
 
-    func environmentChanged(source: String = "environment") {
+    func environmentChanged(source: String = "environment", invalidateKeepAlive: Bool = true) {
+        if monitoring { execution.maintainKeepAlive(forceCheck: true) }
         environmentDay = Calendar.current.startOfDay(for: now())
         environmentTimeZone = Calendar.current.timeZone.identifier
         previousUsage = nil
         naturalRecoveries.removeAll()
-        execution.invalidatePreparations()
+        execution.invalidatePreparations(keepAlive: invalidateKeepAlive)
         usage.invalidate()
         requestAutomaticRefresh(source: source)
         sessions.refresh()
@@ -196,9 +203,11 @@ import Network
     }
 
     private func preferencesChanged() {
-        guard monitoringSettings != settingsFingerprint() else { return }
-        monitoringSettings = settingsFingerprint()
-        environmentChanged()
+        let settings = settingsFingerprint()
+        guard monitoringSettings != settings else { return }
+        let changesKeepAlive = monitoringSettings[0] != settings[0] || monitoringSettings[2] != settings[2]
+        monitoringSettings = settings
+        environmentChanged(invalidateKeepAlive: changesKeepAlive)
     }
 
     private func requestAutomaticRefresh(source: String, occurredAt: Date? = nil) {
@@ -210,12 +219,20 @@ import Network
 
     private func observeSessions() {
         let authentication = sessions.authentication
-        if let before = observedAuthentication, before != authentication {
-            previousUsage = nil
-            naturalRecoveries.removeAll()
-            execution.invalidatePreparations()
-            usage.invalidate()
-            requestAutomaticRefresh(source: "authentication")
+        if observedAuthentication != authentication {
+            let currentAccount = (try? PingAuthentication.read(home: codexHome))?.accountID
+            let changedAccount = currentAccount != nil && authenticationAccountID != nil && currentAccount != authenticationAccountID
+            if observedAuthentication != nil {
+                previousUsage = nil; naturalRecoveries.removeAll()
+                execution.invalidatePreparations(keepAlive: changedAccount)
+                usage.invalidate(clearAccount: changedAccount)
+                if monitoring {
+                    if changedAccount { execution.relocateKeepAlive() }
+                    else { execution.maintainKeepAlive() }
+                }
+                requestAutomaticRefresh(source: "authentication")
+            }
+            authenticationAccountID = currentAccount
         }
         observedAuthentication = authentication
         if let event = SessionUsageActivity.latestRefreshEvent(previous: observedSessions, current: sessions.sessions) {
@@ -288,6 +305,7 @@ import Network
 
     func recompute(allowExecution: Bool = true, source: String = "state") {
         let now = now()
+        if monitoring { execution.maintainKeepAlive() }
         defer {
             if diagnoseScheduling {
                 let kind: String
@@ -299,6 +317,7 @@ import Network
                     "usage_failed": usage.lastError != nil, "usage_refreshing": usage.refreshing,
                     "critical_refresh": usage.criticalRefreshPending,
                     "scanned": sessions.hasScanned, "scan_failed": sessions.detectionError != nil,
+                    "scan_failures": sessions.scanFailures.map(\.logValue),
                     "scan_recent": sessions.scannedAt.map { (-5...60).contains(now.timeIntervalSince($0)) } ?? false,
                     "blocked": blockedSessions.count, "selected": selectedTasks.count,
                     "executing": execution.running, "protected": execution.busyThreadIDs.count,
@@ -310,12 +329,14 @@ import Network
         let settings = settingsFingerprint()
         let day = Calendar.current.startOfDay(for: now)
         if monitoringSettings != settings || environmentDay != day || environmentTimeZone != Calendar.current.timeZone.identifier {
+            let changesKeepAlive = monitoringSettings[0] != settings[0] || monitoringSettings[2] != settings[2] ||
+                environmentDay != day || environmentTimeZone != Calendar.current.timeZone.identifier
             monitoringSettings = settings
             environmentDay = day
             environmentTimeZone = Calendar.current.timeZone.identifier
             previousUsage = nil
             naturalRecoveries.removeAll()
-            execution.invalidatePreparations()
+            execution.invalidatePreparations(keepAlive: changesKeepAlive)
             usage.invalidate()
             requestAutomaticRefresh(source: "plan_environment")
         }
@@ -326,8 +347,6 @@ import Network
             switchAccount(to: account)
         }
         schedule = ScheduleEngine(anchorMinutes: defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480)
-        schedule.accountID = displayAccountID
-        schedule.confirmedWindows = execution.confirmedWindows
         if sessions.hasScanned && sessions.detectionError == nil { confirmed = confirmed.filter { id, target in
             sessions.sessions.contains { $0.id == id && !$0.taskRunning && ($0.lastUserMessageAt ?? .distantPast) <= target.blockedAt && ($0.lastTaskStartedAt ?? .distantPast) <= target.blockedAt && ($0.lastAbortedAt ?? .distantPast) <= target.blockedAt && ($0.lastAssistantMessageAt ?? .distantPast) <= target.blockedAt }
         }
@@ -407,26 +426,27 @@ import Network
                 }
             }
         }
-        guard saveRuntime() else { return }
-        let reminders = defaults.bool(forKey: "enabled") && defaults.bool(forKey: "autoResume") && sessions.detectionError == nil ? selectedTasks.filter {
+        let runtimeSaved = saveRuntime()
+        let reminders = runtimeSaved && defaults.bool(forKey: "enabled") && defaults.bool(forKey: "autoResume") && sessions.detectionError == nil ? selectedTasks.filter {
             !(choices.ignoredEpisodes?.contains($0.episodeKey) ?? false) && choices.recoveryDecisions?[$0.episodeKey]?.phase != .responded &&
             choices.recoveryDecisions?[$0.episodeKey]?.notification == .pending &&
             UsageRecovery.hasAvailableQuota(for: $0, usage: usage.snapshot, boundAccount: accountBindings[$0.id], now: now)
         } : []
         if recoveryReminderTasks != reminders { recoveryReminderTasks = reminders }
-        let chosen = defaults.bool(forKey: "autoResume") ? selectedTasks : []
+        let pingAccount = schedule.currentKeepAliveNode(at: now) != nil ? (try? PingAuthentication.read(home: codexHome))?.accountID :
+            authenticationAccountID ?? (usage.hasReliableReading ? usage.snapshot?.accountID : nil)
+        let keepAliveUsage = usage.hasReliableReading && usage.lastError == nil && usage.snapshot?.accountID == pingAccount ? usage.snapshot : nil
+        let chosen = defaults.bool(forKey: "autoResume") && runtimeSaved && sessions.detectionError == nil ? selectedTasks : []
         let automatic = chosen.filter { choices.recoveryDecisions?[$0.episodeKey] == nil }
         let engine = DecisionEngine(schedule: schedule)
         func checkedPlan(for targets: [BlockedSession]) -> NextAction {
             var plan = engine.plan(now: now, enabled: defaults.bool(forKey: "enabled"), autoResume: defaults.bool(forKey: "autoResume"),
-                earlyRecoveryPolicy: earlyPolicy, usage: usage.snapshot, blocked: targets,
+                earlyRecoveryPolicy: earlyPolicy, usage: targets.isEmpty ? keepAliveUsage : usage.snapshot, blocked: targets,
                 observedRecovery: !targets.isEmpty && targets.allSatisfy { hasConfirmedRecovery(for: $0) },
                 heldForPlan: targets.contains { heldForPlan.contains($0.episodeKey) },
-                needsRecoveryDecision: targets.contains { choices.recoveryDecisions?[$0.episodeKey]?.phase != .responded && choices.recoveryDecisions?[$0.episodeKey] != nil },
-                reserveIdleDate: usage.hasReliableReading && usage.lastError == nil && targets.isEmpty &&
-                    sessions.hasScanned && sessions.detectionError == nil && sessions.authentication != .unreadable)
+                needsRecoveryDecision: targets.contains { choices.recoveryDecisions?[$0.episodeKey]?.phase != .responded && choices.recoveryDecisions?[$0.episodeKey] != nil })
             if defaults.bool(forKey: "enabled"), !targets.isEmpty, targets.allSatisfy({ choices.recoveryDecisions?[$0.episodeKey]?.phase == .responded }) {
-                plan = engine.plan(now: now, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: usage.snapshot, blocked: [], reserveIdleDate: true)
+                plan = engine.plan(now: now, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: usage.snapshot, blocked: [])
             }
             if defaults.bool(forKey: "enabled"), targets.contains(where: { target in
                 guard let snapshot = usage.snapshot, snapshot.isFresh(at: now) else { return false }
@@ -439,18 +459,13 @@ import Network
                targets.contains(where: { accountBindings[$0.id].map { $0 != account } == true }) {
                 plan = NextAction(mode: .resume, date: nil, decision: .wait(reason: "账户已改变"), note: "账户已改变")
             }
-            if defaults.bool(forKey: "enabled"), let error = sessions.detectionError {
+            if defaults.bool(forKey: "enabled"), !targets.isEmpty, let error = sessions.detectionError {
                 plan = NextAction(mode: plan.mode, date: nil, decision: .wait(reason: error), note: error)
             }
             if targets.contains(where: { $0.identityUncertain == true }) {
-                plan = engine.plan(now: now, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: usage.snapshot, blocked: [], reserveIdleDate: true)
+                plan = engine.plan(now: now, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: usage.snapshot, blocked: [])
                 if case .ping = plan.decision { plan.date = schedule.nextKeepAliveNode(after: now) }
                 plan.decision = .wait(reason: "正在确认中")
-            }
-            if targets.isEmpty, execution.hasBusyTasks || sessions.sessions.contains(where: { $0.taskRunning }),
-               case .ping = plan.decision {
-                plan = NextAction(mode: .keepAlive, date: schedule.nextKeepAliveNode(after: now),
-                    decision: .wait(reason: "等待下一可行计划节点"), note: "")
             }
             if targets.contains(where: { execution.busyThreadIDs.contains($0.id) }), case .resume = plan.decision {
                 plan = NextAction(mode: .keepAlive, date: schedule.nextKeepAliveNode(after: now),
@@ -461,6 +476,10 @@ import Network
                     let reset = [usage.snapshot?.fiveHour?.resetsAt, usage.snapshot?.weekly?.resetsAt].compactMap { $0 }.filter { $0 > now }.max()
                     plan = NextAction(mode: .resume, date: reset, decision: .wait(reason: "等待额度恢复确认"), note: "等待额度恢复确认")
                 }
+            }
+            if targets.isEmpty, let node = schedule.currentKeepAliveNode(at: now), execution.hasAttemptedKeepAlive(node: node, accountID: pingAccount) {
+                plan = NextAction(mode: .keepAlive, date: schedule.nextKeepAliveNode(after: now),
+                    decision: .wait(reason: "等待下一可行计划节点"), note: "")
             }
             return plan
         }
@@ -478,31 +497,28 @@ import Network
         decision = plan.decision
         nextNodeText = MenuSummary.build(plan: plan, usage: usage.snapshot, schedule: schedule, tasks: chosen).statusText
         updateUsagePolling(at: now)
-        guard allowExecution, !usage.criticalRefreshPending else { return }
-        let ignored = defaults.bool(forKey: "autoResume") ? choices.keepAliveIgnoredEpisodes :
-            choices.keepAliveIgnoredEpisodes.union(blockedSessions.map(\.episodeKey))
-        if keepAliveBlockers(ignoring: ignored).isEmpty, case .ping = checkedPlan(for: []).decision {
-            execution.ping(schedule: schedule, accountID: usage.snapshot?.accountID, ignoredEpisodes: ignored, ignoredTargets: blockedSessions.filter { ignored.contains($0.episodeKey) }, historicalTargets: accountStates.values.flatMap { $0.pauses.values },
-                blockers: { [weak self] in self?.keepAliveBlockers(ignoring: ignored) ?? [.appStateUnavailable] })
+        let keepAlivePlan = checkedPlan(for: [])
+        let blockers = keepAliveBlockers()
+        execution.observeKeepAlive(schedule: schedule, accountID: pingAccount, usage: keepAliveUsage,
+            reason: execution.recordingFailure ?? blockers.first?.userMessage ?? (keepAlivePlan.note.isEmpty ? nil : L10n.text(keepAlivePlan.note)))
+        guard allowExecution else { return }
+        // Original user tasks retain every quota/runtime/scan gate and take executor priority.
+        if runtimeSaved, !usage.criticalRefreshPending, usage.hasReliableReading, usage.lastError == nil,
+           sessions.hasScanned, sessions.detectionError == nil {
+            let ready = automatic.filter { target in
+                if case .resume = checkedPlan(for: [target]).decision { return true }
+                return false
+            }
+            if !ready.isEmpty { startResume(tasks: ready) }
         }
-        // Each eligible task is checked independently of tasks waiting for a choice.
-        let ready = automatic.filter { target in
-            if case .resume = checkedPlan(for: [target]).decision { return true }
-            return false
+        if blockers.isEmpty, case .ping = keepAlivePlan.decision {
+            execution.ping(schedule: schedule, usage: keepAliveUsage,
+                blockers: { [weak self] in self?.keepAliveBlockers() ?? [.appStateUnavailable] })
         }
-        if !ready.isEmpty { startResume(tasks: ready) }
     }
 
-    func keepAliveBlockers(ignoring episodes: Set<String>) -> [PingPreflightReason] {
-        var reasons: [PingPreflightReason] = []
-        if !runtimeHealthy { reasons.append(.runtimeUnhealthy) }
-        if !sessions.hasScanned { reasons.append(.sessionsUnscanned) }
-        if sessions.detectionError != nil { reasons.append(.sessionScanFailed) }
-        if usage.criticalRefreshPending { reasons.append(.criticalRefresh) }
-        if execution.hasBusyTasks { reasons.append(.keeperBusy) }
-        if sessions.sessions.contains(where: { $0.taskRunning }) { reasons.append(.codexTaskRunning) }
-        if !choices.permitsKeepAlive(for: blockedSessions, ignoring: episodes, autoResume: defaults.bool(forKey: "autoResume")) { reasons.append(.taskSelectionChanged) }
-        return reasons
+    func keepAliveBlockers() -> [PingPreflightReason] {
+        execution.hasBusyTasks ? [.keeperBusy] : []
     }
 
     private func restoreRuntime() throws {
@@ -673,6 +689,7 @@ import Network
         // The shared main plan already provides its time; no duplicate promise in the task card.
         return nil
     }
+    var authenticatedAccountID: String? { authenticationAccountID }
     var enabled: Bool { defaults.bool(forKey: "enabled") }
     var pendingStateFailure: String? {
         guard !runtimeHealthy else { return nil }
