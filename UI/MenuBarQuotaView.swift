@@ -1,5 +1,12 @@
 import AppKit
 
+@MainActor private final class MenuBarContentCell: NSButtonCell {
+    override func drawImage(_ image: NSImage, withFrame frame: NSRect, in controlView: NSView) {
+        // SF Symbols sit below the visible center of the time digits in this compact cell.
+        super.drawImage(image, withFrame: frame.offsetBy(dx: 0, dy: controlView.isFlipped ? -1 : 1), in: controlView)
+    }
+}
+
 @MainActor private final class MenuBarContentButton: NSButton {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override var acceptsFirstResponder: Bool { false }
@@ -28,6 +35,7 @@ import AppKit
             bottomAnchor.constraint(equalTo: button.bottomAnchor),
             heightAnchor.constraint(equalToConstant: Self.railHeight)
         ])
+        contentButton.cell = MenuBarContentCell(textCell: "")
         contentButton.isBordered = false
         contentButton.imagePosition = .imageLeft
         contentButton.imageScaling = .scaleNone

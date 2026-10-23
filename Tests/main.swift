@@ -10,6 +10,14 @@ import Darwin
             count += 1
             if !value { failed += 1; print("FAIL: \(name)") }
         }
+        if CommandLine.arguments.contains("--polling-only") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-polling-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try await checkUsagePollingAndDrift(check, root: root)
+            print("\(count - failed)/\(count) polling checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
         let appUpdateOnly = CommandLine.arguments.contains("--app-update-only")
         if !appUpdateOnly {
             try await checkLogicRepairRegression(check)
@@ -864,8 +872,8 @@ import Darwin
             keepAlivePlan.needsRecoveryDecision = true
             let summary = MenuSummary.build(plan: keepAlivePlan, usage: live, schedule: schedule, tasks: [task], now: at)
             let clock = DateFormatter(); clock.dateFormat = "HH:mm"
-            check(summary.headline == clock.string(from: keepAlivePlan.date!) && summary.action == "保持活动" && summary.statusSymbol == "waveform.path.ecg" && summary.badge == "计划外" && summary.tasks == [task.displayName],
-                "an unanswered task retains its entry while the main area shows the next viable keepalive plan")
+            check(summary.headline == clock.string(from: windowReset) && summary.action == "额度重置" && summary.statusSymbol == "arrow.clockwise.circle.fill" && summary.badge == "计划外" && summary.tasks == [task.displayName],
+                "an unanswered task retains its entry while the main area shows the real off-plan reset")
         }
         let full = QuotaWindow(usedPercent: 100, windowMinutes: 300, resetsAt: localNode.addingTimeInterval(-1))
         let weekly = QuotaWindow(usedPercent: 100, windowMinutes: 10080, resetsAt: future)
@@ -1217,10 +1225,10 @@ import Darwin
         check(display.timeline.first?.kind == .keepAliveNotNeeded && display.timeline.first?.label == "窗口开始" &&
             display.timeline.first?.symbol == "circle.fill" && display.timeline.first?.isAction == false,
             "an active off-plan window needs no keep-alive without claiming a successful execution")
-        check(display.headline == "18:00" && display.action == "保持活动" && display.badge == "计划外", "off-plan menu keeps the next viable keepalive action while classifying the actual window")
+        check(display.headline == "13:11" && display.action == "额度重置" && display.badge == "计划外" && display.statusSymbol == "arrow.clockwise.circle.fill", "off-plan menu highlights the real reset while retaining the next viable keepalive on the timeline")
         check(display.note.isEmpty && display.timeline.map(\.time) == ["08:11", "13:11", "18:00"], "off-plan timeline replaces conditional paragraph with real window and plan")
         check(display.timeline.map(\.solidBefore) == [false, true, false], "actual window uses solid line and waiting uses dotted line")
-        check(display.statusText == "18:00", "menu bar and main area display the same next viable action")
+        check(display.statusText == "13:11", "menu bar and main area display the same real off-plan reset")
         var stoppedUsage = displayQuota; stoppedUsage.fiveHour?.usedPercent = 100
         let stoppedTask = BlockedSession(id: "current", project: "Codex Keeper", cwd: "/tmp", blockedAt: localNode, fiveHourResetAt: localNode.addingTimeInterval(660), weeklyResetAt: nil, fileURL: URL(fileURLWithPath: "/tmp/current"))
         let stoppedPlan = engine.plan(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: stoppedUsage, blocked: [stoppedTask])
@@ -1308,9 +1316,8 @@ import Darwin
                 "elapsed weekly exhaustion permits only real future five-hour reset display and never an executable action")
             live.weekly = nil; live.fiveHour?.resetsAt = start.addingTimeInterval(18660)
             let offPlan = waitingMenu(live)
-            let nextIdle = engine.plan(now: at, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [])
-            check(offPlan.action == "保持活动" && offPlan.statusSymbol == "waveform.path.ecg" && offPlan.badge == "计划外" && offPlan.headline == clock.string(from: nextIdle.date!) && !offPlan.reminderTitle.isEmpty,
-                "off-plan waiting tasks retain the unanswered reminder while showing the next viable keepalive")
+            check(offPlan.action == "额度重置" && offPlan.statusSymbol == "arrow.clockwise.circle.fill" && offPlan.badge == "计划外" && offPlan.headline == clock.string(from: live.fiveHour!.resetsAt) && !offPlan.reminderTitle.isEmpty,
+                "off-plan waiting tasks retain the unanswered reminder while highlighting the real reset")
             live.fiveHour?.usedPercent = 0; live.zeroUseWindowActive = false
             let noWindow = waitingMenu(live)
             check(noWindow.isTime && noWindow.action == "保持活动" && noWindow.statusSymbol == "waveform.path.ecg" && noWindow.timeline.map(\.kind) == [.keepAlive] && !noWindow.reminderTitle.isEmpty,
@@ -3342,6 +3349,67 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
             confirmations: confirmations, usageError: error, usageErrorIsTransient: transient, sessionError: sessionError,
             running: running, executionMode: running ? .keepAlive : nil, now: now)
     }
+    // Replay October 20: the reset left the account idle until a later user message.
+    let idleResetURL = directory.appendingPathComponent("idle-reset.json")
+    var idleReset = MenuPresentation(historyURL: idleResetURL)
+    let idleWindowStart = at(13, 0, 43)
+    let idleBefore = reading(idleWindowStart, at: at(14, 22, 10))
+    let idleConfirmation = completed(.keepAlive, idleWindowStart)
+    _ = render(&idleReset, idleBefore, at: idleBefore.capturedAt, confirmations: [idleConfirmation])
+    let detectedAt = at(14, 32, 54)
+    var idleEmpty = reading(detectedAt, at: detectedAt)
+    idleEmpty.fiveHour?.usedPercent = 0; idleEmpty.zeroUseWindowActive = false
+    let detectedMenu = render(&idleReset, idleEmpty, at: detectedAt, confirmations: [idleConfirmation])
+    check(detectedMenu.timeline.map(\.date) == [idleWindowStart, detectedAt, at(18)] &&
+        detectedMenu.timeline[1].label == "发现重置" && detectedMenu.timeline[1].kind == .reset &&
+        detectedMenu.quotas.first?.detail == "尚未开启窗口",
+        "an early cleared inactive window immediately shows reset detection and retains the real keep-alive history")
+    let idlePlan = DecisionEngine(schedule: ScheduleEngine(anchorMinutes: 480)).plan(now: detectedAt,
+        enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: idleEmpty, blocked: [])
+    check(idlePlan.date == at(18) && idlePlan.decision == .wait(reason: "等待下一可行计划节点"),
+        "detecting an idle reset leaves the next scheduled keep-alive in place without opening a window")
+    var repeatedEmpty = idleEmpty
+    repeatedEmpty.capturedAt = at(14, 50, 50)
+    repeatedEmpty.fiveHour?.resetsAt = repeatedEmpty.capturedAt.addingTimeInterval(18000)
+    let repeatedResetMenu = render(&idleReset, repeatedEmpty, at: repeatedEmpty.capturedAt)
+    check(repeatedResetMenu.timeline.filter { $0.label == "发现重置" }.map(\.date) == [detectedAt],
+        "repeated rolling empty readings preserve the first detection timestamp")
+    var reopenedIdleReset = MenuPresentation(historyURL: idleResetURL)
+    check(render(&reopenedIdleReset, repeatedEmpty, at: repeatedEmpty.capturedAt).timeline.contains {
+        $0.date == detectedAt && $0.label == "发现重置"
+    }, "an idle reset detection survives restarting before another window opens")
+    let userStart = at(14, 54, 25)
+    let userWindow = reading(userStart, at: at(14, 54, 34))
+    let afterIdleReset = render(&reopenedIdleReset, userWindow, at: userWindow.capturedAt)
+    check(afterIdleReset.timeline.map(\.date) == [detectedAt, userStart, at(19, 54, 25), at(23)] &&
+        afterIdleReset.timeline.first?.label == "发现重置" &&
+        afterIdleReset.timeline[1].label == "窗口开始",
+        "a later user window retains the detection event separately instead of claiming its start was the reset")
+    check(afterIdleReset.headline == "19:54" && afterIdleReset.action == "额度重置" && afterIdleReset.badge == "计划外",
+        "an off-plan window highlights its reset while retaining the 23:00 scheduled keep-alive")
+    let agedMenu = render(&reopenedIdleReset, userWindow, at: userWindow.capturedAt.addingTimeInterval(180))
+    check(agedMenu.headline == "19:54" && agedMenu.action == "额度重置" && agedMenu.timeline.map(\.date) == afterIdleReset.timeline.map(\.date),
+        "idle quota polling and retained display do not flicker from the reset back to scheduled keep-alive")
+    let resumePlan = NextAction(mode: .resume, date: at(23), decision: .wait(reason: "按计划自动继续"), note: "按计划自动继续")
+    let pendingResume = render(&reopenedIdleReset, userWindow, at: userWindow.capturedAt, plan: resumePlan)
+    check(pendingResume.headline == "23:00" && pendingResume.action == "自动继续" && pendingResume.statusSymbol == "paperplane",
+        "an approved continuation keeps its own primary time even in an off-plan quota window")
+    for invalid in 0..<9 {
+        var state = MenuPresentation()
+        if invalid != 0 { _ = render(&state, idleBefore, at: idleBefore.capturedAt) }
+        var candidate = idleEmpty
+        if invalid == 1 { candidate.accountID = "another-account" }
+        if invalid == 2 { candidate.sourceFile = "rollout.jsonl" }
+        if invalid == 4 { candidate.fiveHour?.windowMinutes = 360 }
+        if invalid == 5 { candidate.zeroUseWindowActive = nil }
+        if invalid == 6 { candidate.capturedAt = at(18, 1); candidate.fiveHour?.resetsAt = at(23, 1) }
+        if invalid == 7 { candidate.accountID = nil }
+        if invalid == 8 { candidate.fiveHour?.usedPercent = 12; candidate.fiveHour?.resetsAt = at(14) }
+        let now = candidate.capturedAt.addingTimeInterval(invalid == 3 ? 61 : 0)
+        check(!render(&state, candidate, at: now).timeline.contains { $0.label == "发现重置" },
+            "unverified or normally expired windows cannot claim an early idle reset: \(invalid)")
+    }
+
     // Replay the real early reset: both limits cleared before the previous five-hour deadline.
     let beforeResetAt = at(14, 11, 43)
     var beforeReset = reading(at(13, 3, 1), at: beforeResetAt)
@@ -3360,18 +3428,20 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     check(beforeResetMenu.timeline.first?.label == "窗口开始",
         "a first active window uses a neutral origin without claiming a reset or Keeper action")
     let emptyResetMenu = render(&earlyReset, emptyReset, at: emptyReset.capturedAt)
-    check(!emptyResetMenu.timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
-        "the rolling empty-window reading cannot invent a fixed reset timestamp")
+    check(emptyResetMenu.timeline.contains { $0.date == emptyReset.capturedAt && $0.label == "发现重置" } &&
+        !emptyResetMenu.timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
+        "the rolling empty reading records discovery without inventing an official reset timestamp")
     let earlyResetMenu = render(&earlyReset, afterReset, at: afterReset.capturedAt)
-    check(earlyResetMenu.timeline.contains { $0.date == earlyStart && $0.kind == .reset && $0.label == "已重置" } &&
+    check(earlyResetMenu.timeline.contains { $0.date == emptyReset.capturedAt && $0.kind == .reset && $0.label == "发现重置" } &&
         earlyResetMenu.timeline.filter { abs($0.date.timeIntervalSince(earlyStart)) <= ScheduleEngine.alignmentTolerance }.count == 1,
         "the real 51%/95% to 0%/0% transition replaces the unexpired window with one confirmed reset point")
     let savedResetHistory = try Data(contentsOf: resetHistoryURL)
     var reopenedReset = MenuPresentation(historyURL: resetHistoryURL)
-    check(render(&reopenedReset, afterReset, at: afterReset.capturedAt).timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
+    check(render(&reopenedReset, afterReset, at: afterReset.capturedAt).timeline.contains { $0.date == emptyReset.capturedAt && $0.label == "发现重置" },
         "an early reset remains visible after restarting without a new usage drop")
     var legacyResetHistory = try JSONSerialization.jsonObject(with: savedResetHistory) as! [String: Any]
     legacyResetHistory["resets"] = []
+    legacyResetHistory.removeValue(forKey: "resetDetections")
     let legacyResetURL = directory.appendingPathComponent("legacy-early-reset.json")
     try JSONSerialization.data(withJSONObject: legacyResetHistory).write(to: legacyResetURL)
     var recoveredReset = MenuPresentation(historyURL: legacyResetURL)
@@ -3381,7 +3451,7 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     _ = render(&earlyReset, nextWindow, at: nextWindow.capturedAt)
     let savedAfterNextWindow = try JSONSerialization.jsonObject(with: Data(contentsOf: resetHistoryURL)) as! [String: Any]
     let storedResets = (savedAfterNextWindow["resets"] as! [Double]).map { Date(timeIntervalSinceReferenceDate: $0) }
-    check(storedResets.contains(earlyStart) && storedResets.contains(at(19, 13, 15)) && !storedResets.contains(at(18, 3, 1)),
+    check(!storedResets.contains(earlyStart) && storedResets.contains(at(19, 13, 15)) && !storedResets.contains(at(18, 3, 1)),
         "a superseded 18:03 deadline never becomes a reset after the replacement window ends at 19:13")
     var correctedWindow = reading(at(13, 5, 1), at: at(14, 12))
     correctedWindow.fiveHour?.usedPercent = 0; correctedWindow.zeroUseWindowActive = true
@@ -4095,7 +4165,7 @@ private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
     var recovered = live; recovered.capturedAt = now.addingTimeInterval(303)
     recovered.fiveHour?.resetsAt = reset.addingTimeInterval(660); recovered.fiveHour?.usedPercent = 37
     let updated = render(&presentation, usage: recovered, time: recovered.capturedAt)
-    check(updated.headline == "18:00" && updated.action == "保持活动" && updated.badge == "计划外" && updated.quotas.first?.remaining == 63 &&
+    check(updated.headline == "13:11" && updated.action == "额度重置" && updated.badge == "计划外" && updated.quotas.first?.remaining == 63 &&
         updated.error.isEmpty && updated.refreshMessage != shown.refreshMessage,
         "a new valid reading immediately replaces the retained time, quota, timestamp and temporary error")
     var noWindows = recovered; noWindows.fiveHour = nil; noWindows.weekly = nil

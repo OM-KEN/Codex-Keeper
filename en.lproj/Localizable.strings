@@ -367,6 +367,7 @@
 "窗口开始" = "Window start";
 
 "已重置" = "Quota Reset";
+"发现重置" = "Reset Detected";
 
 "保活未发送：本次准备已取消" = "Keep-alive not sent: this preparation was cancelled";
 "保活未发送：自动执行已关闭" = "Keep-alive not sent: automatic execution is off";

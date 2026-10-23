@@ -398,7 +398,7 @@ import SQLite3
         pingTransport: gatePings, codexHome: gateHome, now: { gateClock })
     let gateState = AppState(provider: gateProvider, defaults: gatePrefs,
         runtimeURL: root.appendingPathComponent("gate-support/pending-runtime.json"),
-        codexHome: gateHome, execution: gateExecution, startMonitoring: false, now: { gateClock })
+        codexHome: gateHome, execution: gateExecution, startMonitoring: false, now: { gateClock }, diagnoseScheduling: true)
     gateState.refresh(); try await pollingSettle { gateState.sessions.hasScanned && !gateState.usage.refreshing }
     gateProvider.pause()
     let gateReads = gateProvider.reads
@@ -409,10 +409,31 @@ import SQLite3
     check(gateState.usage.snapshot?.isFresh(at: gateClock) == true &&
         gateState.usage.criticalRefreshPending && !gateExecution.running && gatePings.count == 0,
         "an uncovered critical event blocks automatic dispatch despite a fresh pre-event snapshot at a due node")
+    var dispatchedOnCompletion: Bool?
+    let refreshCompleted = gateState.usage.onRefreshCompleted
+    gateState.usage.onRefreshCompleted = {
+        refreshCompleted?()
+        if !gateState.usage.criticalRefreshPending, dispatchedOnCompletion == nil {
+            dispatchedOnCompletion = gateExecution.running
+        }
+    }
     gateProvider.release()
     try await pollingSettle { !gateState.usage.refreshing && !gateExecution.running && gatePings.count == 1 }
     check(!gateState.usage.criticalRefreshPending && gatePings.count == 1,
         "automatic dispatch proceeds once after the critical follow-up completes")
+    check(dispatchedOnCompletion == true,
+        "completed background recovery advances execution before a later UI or main-queue notification")
+    gateState.usage.onRefreshCompleted = refreshCompleted
+    let schedulingLog = try String(contentsOf: root.appendingPathComponent("gate-support/usage-transitions.jsonl"), encoding: .utf8)
+    let schedulingRows = schedulingLog.split(separator: "\n").compactMap {
+        try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
+    }.filter { $0["event"] as? String == "schedule_evaluated" }
+    check(schedulingRows.contains { $0["critical_refresh"] as? Bool == true && $0["executing"] as? Bool == false },
+        "optional scheduling trace preserves the critical refresh gate before dispatch")
+    check(schedulingRows.contains { $0["trigger"] as? String == "usage" && $0["executing"] as? Bool == true },
+        "optional scheduling trace identifies dispatch from background quota completion")
+    check(schedulingRows.allSatisfy { $0["account_id"] == nil && $0["thread_id"] == nil && $0["prompt"] == nil && $0["cwd"] == nil },
+        "scheduling trace omits identities, prompts and workspace paths")
     gateClock = gateClock.addingTimeInterval(18000)
     gateUsage.capturedAt = gateClock
     gateUsage.fiveHour?.resetsAt = gateClock.addingTimeInterval(18000)

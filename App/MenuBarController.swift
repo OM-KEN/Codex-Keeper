@@ -76,6 +76,7 @@ import UserNotifications
                     self.rebuildMenu()
                 }
             }
+            CFRunLoopWakeUp(CFRunLoopGetMain())
         }.store(in: &cancellables)
         rebuildMenu()
         updateService.startAutomaticChecks()

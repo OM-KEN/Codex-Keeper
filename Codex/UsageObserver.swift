@@ -44,6 +44,8 @@ struct UsageSnapshot: Equatable {
 /// Independent read-only account polling. Rollout data is bounded, explicitly stale fallback evidence.
 @MainActor
 final class UsageObserver: ObservableObject {
+    // Called on the main actor after the reading and critical-refresh gate have both settled.
+    var onRefreshCompleted: (() -> Void)?
     @Published private(set) var snapshot: UsageSnapshot?
     @Published private(set) var lastError: String?
     @Published private(set) var refreshing = false
@@ -63,6 +65,8 @@ final class UsageObserver: ObservableObject {
     private var monitoring = false
     private var requestID: String?
     private var lastReadFailure: UsageReadDiagnostic?
+    private var lastSchedulingState: Data?
+    private var lastSchedulingLogAt: Date?
 
     var lastErrorIsTransient: Bool { lastReadFailure?.isTransient == true }
 
@@ -194,6 +198,7 @@ final class UsageObserver: ObservableObject {
             if let pendingSource { refresh(manual: true, source: pendingSource, critical: pendingAutomatic != nil) }
             else if let pendingAutomatic { refresh(source: pendingAutomatic, critical: true) }
             else { scheduleRefresh() }
+            onRefreshCompleted?()
         }
     }
 
@@ -263,6 +268,20 @@ final class UsageObserver: ObservableObject {
     }
 
     // MARK: - Transition 日志（P0-6 埋点）
+
+    /// Optional scheduling diagnostics contain only classifications, counts and timing.
+    func recordSchedulingState(_ state: [String: Any], source: String) {
+        guard let encoded = try? JSONSerialization.data(withJSONObject: state, options: .sortedKeys) else { return }
+        let date = now()
+        guard encoded != lastSchedulingState || source == "menu_open" ||
+            lastSchedulingLogAt.map({ date.timeIntervalSince($0) >= 60 }) != false else { return }
+        lastSchedulingState = encoded; lastSchedulingLogAt = date
+        var entry = state
+        entry["event"] = "schedule_evaluated"
+        entry["trigger"] = source
+        entry["logged_at"] = ISO8601DateFormatter().string(from: Date())
+        appendLogEntry(entry)
+    }
 
     private func appendTransitionLog(_ snapshot: UsageSnapshot) {
         var entry: [String: Any] = [

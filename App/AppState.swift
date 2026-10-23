@@ -21,6 +21,7 @@ import Network
     private let defaults: UserDefaults
     private let runtimeURL: URL
     private let now: () -> Date
+    private let diagnoseScheduling: Bool
     private var savedRuntime: Data?
     private var runtimeHealthy = true
     private var runtimeReadFailed = false
@@ -44,9 +45,11 @@ import Network
 
     init(provider: UsageProvider = AppServerUsageProvider(), defaults: UserDefaults = .standard,
          runtimeURL: URL? = nil, codexHome: URL = CodexEnvironment.home,
-         execution: ExecutionCoordinator? = nil, startMonitoring: Bool = true, now: @escaping () -> Date = Date.init) {
+         execution: ExecutionCoordinator? = nil, startMonitoring: Bool = true, now: @escaping () -> Date = Date.init,
+         diagnoseScheduling: Bool = ProcessInfo.processInfo.arguments.contains("--diagnose-scheduling")) {
         self.defaults = defaults
         self.now = now
+        self.diagnoseScheduling = diagnoseScheduling
         self.runtimeURL = runtimeURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/pending-runtime.json")
         usage = UsageObserver(codexHome: codexHome, provider: provider, logURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"), now: now)
         let scanWorker = SessionScanWorker(codexHome: codexHome)
@@ -71,11 +74,12 @@ import Network
             }
             self.recompute(allowExecution: false)
         }.store(in: &cancellables)
-        usage.$snapshot.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute() }.store(in: &cancellables)
-        sessions.$sessions.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute() }.store(in: &cancellables)
-        sessions.$detectionError.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute() }.store(in: &cancellables)
-        usage.$lastError.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute(allowExecution: false) }.store(in: &cancellables)
-        usage.$refreshing.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.recompute(allowExecution: false) }.store(in: &cancellables)
+        // Advance scheduling from a fully committed read, without waiting for UI notification delivery.
+        usage.onRefreshCompleted = { [weak self] in
+            guard let self else { return }
+            self.recompute(allowExecution: self.usage.hasReliableReading && self.usage.lastError == nil, source: "usage")
+        }
+        sessions.onRefreshCompleted = { [weak self] in self?.recompute(source: "sessions") }
         self.execution.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         usage.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         self.execution.$running.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] running in
@@ -113,7 +117,7 @@ import Network
         usage.start()
         sessions.start()
         recompute()
-        ticker = Timer(timeInterval: 20, repeats: true) { [weak self] _ in Task { @MainActor in self?.recompute() } }
+        ticker = Timer(timeInterval: 20, repeats: true) { [weak self] _ in Task { @MainActor in self?.recompute(source: "timer") } }
         if let ticker { RunLoop.main.add(ticker, forMode: .common) }
     }
 
@@ -155,7 +159,7 @@ import Network
     }
     func refresh(manual: Bool = false, source: String = "manual") {
         if manual, runtimeReadFailed { try? restoreRuntime() }
-        usage.refresh(manual: manual, source: source); sessions.refresh(); recompute()
+        usage.refresh(manual: manual, source: source); sessions.refresh(); recompute(source: source)
     }
 
     func environmentChanged(source: String = "environment") {
@@ -282,8 +286,26 @@ import Network
         return reasons
     }
 
-    func recompute(allowExecution: Bool = true) {
+    func recompute(allowExecution: Bool = true, source: String = "state") {
         let now = now()
+        defer {
+            if diagnoseScheduling {
+                let kind: String
+                switch decision { case .ping: kind = "ping"; case .resume: kind = "resume"; case .wait: kind = "wait"; case .skip: kind = "skip"; case nil: kind = "none" }
+                usage.recordSchedulingState([
+                    "decision": kind, "allow_execution": allowExecution,
+                    "enabled": enabled, "auto_resume": automaticResumeEnabled, "runtime_healthy": runtimeHealthy,
+                    "usage_reliable": usage.hasReliableReading, "usage_fresh": usage.snapshot?.isFresh(at: now) == true,
+                    "usage_failed": usage.lastError != nil, "usage_refreshing": usage.refreshing,
+                    "critical_refresh": usage.criticalRefreshPending,
+                    "scanned": sessions.hasScanned, "scan_failed": sessions.detectionError != nil,
+                    "scan_recent": sessions.scannedAt.map { (-5...60).contains(now.timeIntervalSince($0)) } ?? false,
+                    "blocked": blockedSessions.count, "selected": selectedTasks.count,
+                    "executing": execution.running, "protected": execution.busyThreadIDs.count,
+                    "preparing": execution.operations.values.filter { $0.phase == .preparing }.count
+                ], source: source)
+            }
+        }
         if sessions.hasScanned { observeSessions() }
         let settings = settingsFingerprint()
         let day = Calendar.current.startOfDay(for: now)

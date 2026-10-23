@@ -1321,8 +1321,8 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
         now: snapshot.capturedAt.addingTimeInterval(61))
     check(!afterReading.quotas.isEmpty && afterReading.headline == beforeReading.headline && afterReading.refreshMessage == beforeReading.refreshMessage,
         "reading a manual reminder never discards retained quota, its capture time or a valid future plan")
-    check(initial.badge == continued.badge && initial.action == "保持活动" && initial.statusSymbol == "waveform.path.ecg",
-        "window classification and viable keepalive primary action stay stable across resume confirmation")
+    check(initial.badge == continued.badge && initial.action == continued.action && initial.statusText == continued.statusText && initial.statusSymbol == continued.statusSymbol,
+        "window classification and primary reset or keepalive display stay stable across resume confirmation")
 }
 
 func resumeTestAttemptKeys(_ url: URL) throws -> [String] {

@@ -54,6 +54,8 @@ struct SessionActivity: Equatable {
 /// 启动扫一次最近 session，之后只重读 mtime 变化的文件（增量）。
 @MainActor
 final class SessionWatcher: ObservableObject {
+    // Consumers must see the matching sessions, authentication and scan result together.
+    var onRefreshCompleted: (() -> Void)?
     @Published private(set) var hasScanned = false
     @Published private(set) var sessions: [SessionActivity] = []
 
@@ -98,6 +100,7 @@ final class SessionWatcher: ObservableObject {
             detectionError = result.1
             sessions = result.0
             refreshing = false
+            onRefreshCompleted?()
         }
     }
 
