@@ -12,15 +12,14 @@ struct UsagePollingPolicy: Equatable {
     static func evaluate(now: Date, schedule: ScheduleEngine, enabled: Bool,
                          scanned: Bool, scanError: String?, reliableUsage: Bool,
                          usage: UsageSnapshot?, runningTask: Bool, resumeDemand: Bool,
-                         executing: Bool, criticalRefresh: Bool) -> UsagePollingPolicy {
+                         executing: Bool, criticalRefresh: Bool, recoveryDates: [Date] = []) -> UsagePollingPolicy {
         let fast = UsagePollingPolicy(interval: activeInterval, wakeAt: nil)
-        guard scanned, scanError == nil, reliableUsage, let usage,
-              usage.sourceFile == "app-server", usage.accountID?.isEmpty == false,
+        guard reliableUsage, let usage, usage.accountID?.isEmpty == false,
               usage.capturedAt <= now.addingTimeInterval(5),
               usage.fiveHour != nil || usage.weekly != nil,
-              usage.activeFiveHourWindow != nil,
-              !runningTask, !resumeDemand, !executing, !criticalRefresh else { return fast }
-        var boundaries: [Date] = []
+              usage.activeFiveHourWindow != nil, !criticalRefresh else { return fast }
+        // Task activity and recovery demand are local facts, not reasons to poll the network.
+        var boundaries = recoveryDates.filter { $0 > now }
         if enabled {
             for opportunity in schedule.keepAliveOpportunities(at: now) {
                 if now >= opportunity.node.addingTimeInterval(-preparation), now <= opportunity.deadline { return fast }
@@ -53,22 +52,4 @@ struct UsagePollingPolicy: Equatable {
 struct UsageRetryOpportunity: Equatable {
     let node: Date
     let end: Date
-}
-
-enum SessionUsageActivity {
-    static func latestRefreshEvent(previous: [SessionActivity], current: [SessionActivity]) -> Date? {
-        let old = Dictionary(previous.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return current.flatMap { activity -> [Date] in
-            guard let before = old[activity.id] else { return [activity.lastActivityAt] }
-            var events: [Date] = []
-            if !before.taskRunning && activity.taskRunning { events.append(activity.lastTaskStartedAt ?? activity.lastActivityAt) }
-            for (current, previous) in [(activity.lastUserMessageAt, before.lastUserMessageAt),
-                (activity.lastTaskStartedAt, before.lastTaskStartedAt),
-                (activity.lastAssistantMessageAt, before.lastAssistantMessageAt),
-                (activity.quotaBlockedAt, before.quotaBlockedAt)] {
-                if let current, current > (previous ?? .distantPast) { events.append(current) }
-            }
-            return events
-        }.max()
-    }
 }

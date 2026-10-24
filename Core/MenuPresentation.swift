@@ -411,7 +411,7 @@ struct MenuPresentation {
                         running: Bool = false, executionMode: NextActionMode? = nil,
                         executionFailure: String? = nil, executionFailureIsCurrent: Bool = false,
                         executionWarning: String? = nil, executionNotice: String? = nil, refreshing: Bool = false,
-                        refreshMessage: String = "", now: Date = Date()) -> MenuSummary {
+                        refreshMessage: String = "", displayUsage: UsageSnapshot? = nil, now: Date = Date()) -> MenuSummary {
         // Notification delivery and retired deadlines do not change the user's action plan.
         var currentChoices = choices
         currentChoices.readManualEvents = nil
@@ -532,6 +532,19 @@ struct MenuPresentation {
                 summary = previous.summary
                 capturedAt = previous.capturedAt
             }
+        }
+        if enabled, !fatalIssue, let displayUsage, displayUsage.sourceFile != "app-server",
+           let authority = usage, authority.accountID == displayUsage.accountID,
+           displayUsage.capturedAt > authority.capturedAt, displayUsage.capturedAt <= now,
+           now.timeIntervalSince(displayUsage.capturedAt) <= RolloutUsageReader.maximumAge, let plan {
+            if summary.isSyncing, let date = plan.date, date >= now {
+                summary = MenuSummary.build(plan: plan, usage: authority, schedule: schedule, tasks: tasks,
+                    confirmations: confirmations, observedWindows: observedWindows, observedResets: observedResets,
+                    observedResetDetections: observedResetDetections, now: now, requireFresh: false)
+            }
+            let local = MenuSummary.build(plan: plan, usage: displayUsage, schedule: schedule, tasks: tasks, now: now, requireFresh: false)
+            summary.quotas = local.quotas; summary.quotaAccountID = local.quotaAccountID
+            capturedAt = displayUsage.capturedAt
         }
         if enabled, summary.tasks.isEmpty, !availableTasks.isEmpty {
             summary.tasks = availableTasks.sorted { $0.blockedAt > $1.blockedAt }.prefix(1).map(\.displayName)

@@ -21,9 +21,11 @@ import SQLite3
     check(policy().interval == 300, "reliable idle state reduces only quota polling to five minutes")
     check(policy(at: day.addingTimeInterval(180)).interval == 300 && !live.isFresh(at: day.addingTimeInterval(180)),
         "normal snapshot aging does not undo idle polling or extend execution freshness")
-    for value in [policy(scanned: false), policy(error: "unreadable log"), policy(reliable: false),
-                  policy(running: true), policy(demand: true), policy(executing: true), policy(critical: true)] {
-        check(value.interval == 20, "unknown, active, recovery and verification states retain fast quota polling")
+    for value in [policy(reliable: false), policy(critical: true)] {
+        check(value.interval == 20, "unreliable quota and pending critical verification retain bounded fast retries")
+    }
+    for value in [policy(scanned: false), policy(error: "unreadable log"), policy(running: true), policy(demand: true), policy(executing: true)] {
+        check(value.interval == 300, "local scans, task activity and far recovery demand do not accelerate healthy quota RPCs")
     }
     var unknown = live; unknown.fiveHour?.usedPercent = 0; unknown.zeroUseWindowActive = nil
     check(policy(unknown).interval == 20, "unknown zero-percent window cannot be classified as idle")
@@ -33,8 +35,8 @@ import SQLite3
         schedule.retryOpportunity(at: nodes[1].addingTimeInterval(599))?.node == nodes[1],
         "two-minute preparation does not consume the last two minutes of the bounded retry opportunity")
     var blocked = live; blocked.fiveHour?.usedPercent = 100
-    check(policy(blocked).interval == 300 && policy(blocked, demand: true).interval == 20,
-        "far exhaustion can idle only without any pending recovery demand")
+    check(policy(blocked).interval == 300 && policy(blocked, demand: true).interval == 300,
+        "far exhaustion keeps five-minute quota fallback even with pending recovery demand")
     for weekly in [false, true] {
         var close = live
         if weekly { close.weekly?.resetsAt = day.addingTimeInterval(120) }
@@ -277,9 +279,9 @@ import SQLite3
     publishFresh()
     try trace.write(to: file, atomically: true, encoding: .utf8)
     let beforeActivity = appProvider.reads
-    state.sessions.refresh(); try await pollingSettle { appProvider.reads > beforeActivity && !state.usage.refreshing }
-    check(state.usage.polling.interval == 20 && state.sessions.sessions.contains { $0.id == id && $0.isSubagent && $0.taskRunning },
-        "new observed child activity wakes quota immediately after local discovery")
+    state.sessions.refresh(); try await pollingSettle { state.sessions.sessions.contains { $0.id == id && $0.taskRunning } }
+    check(state.usage.polling.interval == 300 && appProvider.reads == beforeActivity && state.sessions.sessions.contains { $0.id == id && $0.isSubagent && $0.taskRunning },
+        "new observed child activity stays local and preserves the five-minute quota fallback")
     clock = Date(timeIntervalSince1970: floor(clock.timeIntervalSince1970) + 2)
     publishFresh(); appProvider.pause()
     let coveredReads = appProvider.reads
@@ -299,11 +301,11 @@ import SQLite3
     clock = clock.addingTimeInterval(1); publishFresh()
     trace += pollingEvent("user_message", at: clock)
     try trace.write(to: file, atomically: true, encoding: .utf8)
-    state.sessions.refresh(); try await pollingSettle { state.usage.criticalRefreshPending }
-    check(state.usage.polling.interval == 20, "activity after query admission stays fast until its follow-up is covered")
+    state.sessions.refresh(); try await pollingSettle { state.sessions.sessions.first { $0.id == id }?.lastUserMessageAt == clock }
+    check(!state.usage.criticalRefreshPending && state.usage.polling.interval == 300, "ordinary activity after query admission does not request an online follow-up")
     appProvider.release(); try await pollingSettle { !state.usage.refreshing }
-    check(appProvider.reads == uncoveredReads + 2 && appProvider.manualReads == 0,
-        "activity after query admission merges exactly one automatic follow-up")
+    check(appProvider.reads == uncoveredReads + 1 && appProvider.manualReads == 0,
+        "ordinary activity after query admission adds no quota RPC")
     clock = clock.addingTimeInterval(1)
     for _ in 0..<25 {
         let next = UUID().uuidString
@@ -329,7 +331,7 @@ import SQLite3
     publishFresh(100)
     try stoppedTrace.write(to: stoppedFile, atomically: true, encoding: .utf8)
     state.sessions.refresh(); try await pollingSettle { state.availableTasks.contains { $0.id == stoppedID } && !state.usage.refreshing }
-    check(state.usage.polling.interval == 20, "quota-stopped tasks remain fast throughout a far recovery deadline")
+    check(state.usage.polling.interval == 300, "quota-stopped tasks retain five-minute fallback throughout a far recovery deadline")
     let savedRuntime = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("app-support/pending-runtime.json"))) as! [String: Any]
     check((savedRuntime["accounts"] as? [String: String])?[stoppedID] == "recovery-account",
         "a task discovered with an identity change waits for covered quota before account binding")
@@ -339,20 +341,20 @@ import SQLite3
     check(state.usage.polling.interval == 300, "explicitly disabled automatic continuation does not permanently block idle polling")
     prefs.set(true, forKey: "autoResume"); publishFresh(100); state.recompute(allowExecution: false)
     try await pollingSettle { !state.usage.refreshing }
-    check(state.usage.polling.interval == 20, "reenabling a pending continuation restores fast polling")
+    check(state.usage.polling.interval == 300, "reenabling a far pending continuation preserves five-minute fallback")
     clock = clock.addingTimeInterval(1); publishFresh()
     state.usage.refresh(); try await pollingSettle { !state.usage.refreshing }
     state.recompute(allowExecution: false)
-    check(state.nextAction?.mode == .keepAlive && state.choices.recoveryDecisions?.isEmpty == false && state.usage.polling.interval == 20,
-        "recovery choice remains a demand even when the displayed next action is keep-alive")
+    check(state.nextAction?.mode == .keepAlive && state.choices.recoveryDecisions?.isEmpty == false && state.usage.polling.interval == 300,
+        "recovery choices preserve their state without accelerating quota RPCs")
     let secondID = UUID().uuidString
     let secondFile = traces.appendingPathComponent("rollout-\(secondID).jsonl")
     try (pollingMetadata(secondID, at: clock.addingTimeInterval(-1)) + pollingEvent("error", at: clock, extra: ["message": "usage_limit_reached"]))
         .write(to: secondFile, atomically: true, encoding: .utf8)
     publishFresh(100); state.sessions.refresh()
     try await pollingSettle { state.availableTasks.count == 2 && !state.usage.refreshing }
-    check(state.usage.polling.interval == 20 && state.choices.recoveryDecisions?.isEmpty == false,
-        "one task awaiting a choice cannot hide another task's blocked recovery demand")
+    check(state.usage.polling.interval == 300 && state.choices.recoveryDecisions?.isEmpty == false,
+        "one task awaiting a choice retains another task without fast quota polling")
     state.useKeepAlive(for: state.availableTasks)
     check(state.usage.polling.interval == 300, "explicit cancellation of all historical episodes permits true idle polling")
     let identityReads = appProvider.reads
@@ -365,9 +367,9 @@ import SQLite3
     stoppedTrace += pollingEvent("user_message", at: clock) + pollingEvent("task_started", at: clock)
     try stoppedTrace.write(to: stoppedFile, atomically: true, encoding: .utf8)
     let manualResumeReads = appProvider.reads
-    state.sessions.refresh(); try await pollingSettle { appProvider.reads > manualResumeReads && !state.usage.refreshing }
-    check(!state.blockedSessions.contains { $0.id == stoppedID } && state.usage.polling.interval == 20,
-        "detected manual task recovery revokes the stop and requests automatic live quota")
+    state.sessions.refresh(); try await pollingSettle { !state.blockedSessions.contains { $0.id == stoppedID } && !state.usage.refreshing }
+    check(state.usage.polling.interval == 300 && appProvider.reads == manualResumeReads,
+        "detected manual task recovery revokes the stop without requesting quota RPCs")
     let environmentReads = appProvider.reads
     state.environmentChanged(); try await pollingSettle { !state.usage.refreshing }
     check(appProvider.reads > environmentReads && appProvider.manualReads == 0,

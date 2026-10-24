@@ -10,6 +10,14 @@ import Darwin
             count += 1
             if !value { failed += 1; print("FAIL: \(name)") }
         }
+        if CommandLine.arguments.contains("--passive-usage-only") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-passive-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try await checkPassiveUsage(check, root: root)
+            print("\(count - failed)/\(count) passive usage checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
         if CommandLine.arguments.contains("--polling-only") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-polling-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }
@@ -3303,6 +3311,7 @@ import Darwin
         }
 
         try await checkUsagePollingAndDrift(check, root: temp.appendingPathComponent("polling-regression"))
+        try await checkPassiveUsage(check, root: temp.appendingPathComponent("passive-usage-regression"))
         print("\(count - failed)/\(count) regression checks passed")
         if failed > 0 { exit(1) }
     }

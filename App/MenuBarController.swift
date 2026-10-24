@@ -259,7 +259,8 @@ import UserNotifications
             executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil,
             executionWarning: appState.execution.warning,
             executionNotice: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleNotice,
-            refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage)
+            refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage,
+            displayUsage: appState.usage.displaySnapshot)
         let recordFailures = [appState.pendingStateFailure, appState.execution.recordingFailure].compactMap { $0 }
         if !recordFailures.isEmpty {
             summary.error = ([summary.error] + recordFailures).filter { !$0.isEmpty }.joined(separator: "\n")

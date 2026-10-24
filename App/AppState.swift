@@ -79,7 +79,11 @@ import Network
             guard let self else { return }
             self.recompute(allowExecution: self.usage.hasReliableReading && self.usage.lastError == nil, source: "usage")
         }
-        sessions.onRefreshCompleted = { [weak self] in self?.recompute(source: "sessions") }
+        usage.onPassiveChange = { [weak self] in self?.recompute(allowExecution: false, source: "passive_usage") }
+        sessions.onRefreshCompleted = { [weak self] in
+            self?.usage.rescanPassive()
+            self?.recompute(source: "sessions")
+        }
         self.execution.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         usage.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         self.execution.$running.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] running in
@@ -214,12 +218,15 @@ import Network
             previousUsage = nil
             naturalRecoveries.removeAll()
             execution.invalidatePreparations()
-            usage.invalidate()
-            requestAutomaticRefresh(source: "authentication")
+            usage.authenticationDidChange()
         }
         observedAuthentication = authentication
-        if let event = SessionUsageActivity.latestRefreshEvent(previous: observedSessions, current: sessions.sessions) {
-            requestAutomaticRefresh(source: "session_activity", occurredAt: event)
+        let previous = Dictionary(observedSessions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        if let event = sessions.sessions.compactMap({ session -> Date? in
+            guard let stopped = session.quotaBlockedAt, stopped > (previous[session.id]?.quotaBlockedAt ?? .distantPast) else { return nil }
+            return stopped
+        }).max() {
+            requestAutomaticRefresh(source: "quota_stop", occurredAt: event)
         }
         observedSessions = sessions.sessions
     }
@@ -230,19 +237,42 @@ import Network
             scanned: sessions.hasScanned, scanError: sessions.detectionError, reliableUsage: reliable,
             usage: usage.snapshot, runningTask: execution.hasBusyTasks || sessions.sessions.contains { $0.taskRunning },
             resumeDemand: defaults.bool(forKey: "enabled") && defaults.bool(forKey: "autoResume") && !availableTasks.isEmpty,
-            executing: execution.running, criticalRefresh: usage.criticalRefreshPending)
+            executing: execution.running, criticalRefresh: usage.criticalRefreshPending,
+            recoveryDates: availableTasks.flatMap { [$0.fiveHourResetAt, $0.weeklyResetAt].compactMap { $0 } })
         usage.setPolling(policy, retryOpportunity: defaults.bool(forKey: "enabled") ? schedule.retryOpportunity(at: now) : nil)
     }
 
     private func observeRecovery(_ snapshot: UsageSnapshot?) -> Date? {
         defer { previousUsage = snapshot }
-        guard let old = previousUsage, let new = snapshot else { return nil }
+        guard let new = snapshot else { return nil }
+        var passiveEarly: Date?
+        if let evidence = usage.verifiedPassiveRecovery(at: now()) {
+            let exhausted = [evidence.before.fiveHour, evidence.before.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
+            if let reset = exhausted.map(\.resetsAt).max() {
+                let matching = blockedSessions.filter {
+                    accountBindings[$0.id] == new.accountID && evidence.before.capturedAt > $0.blockedAt &&
+                    evidence.after.capturedAt > evidence.before.capturedAt &&
+                    UsageRecovery.hasAvailableQuota(for: $0, usage: new, boundAccount: accountBindings[$0.id], now: now())
+                }
+                if evidence.before.capturedAt < reset, reset.timeIntervalSince(evidence.before.capturedAt) <= 90,
+                   evidence.after.capturedAt >= reset, evidence.after.capturedAt.timeIntervalSince(reset) <= 90 {
+                    naturalRecoveries.formUnion(matching.map(\.episodeKey))
+                } else if reset.timeIntervalSince(evidence.after.capturedAt) > 90, !matching.isEmpty {
+                    // Explicit local transition plus a subsequent live read; neither sample is re-labelled app-server.
+                    passiveEarly = evidence.before.capturedAt
+                }
+            }
+        }
+        guard let old = previousUsage else { return passiveEarly }
         if UsageRecovery.isNatural(from: old, to: new, now: now()) {
             naturalRecoveries.formUnion(blockedSessions.filter {
                 accountBindings[$0.id] == new.accountID && new.capturedAt > $0.blockedAt
             }.map(\.episodeKey))
         }
-        return UsageRecovery.isEarly(from: old, to: new, now: now()) ? old.capturedAt : nil
+        let recoveredStop = blockedSessions.contains {
+            UsageRecovery.isEarlyAfterQuotaStop($0, from: old, usage: new, boundAccount: accountBindings[$0.id], now: now())
+        }
+        return UsageRecovery.isEarly(from: old, to: new, now: now()) || recoveredStop ? old.capturedAt : passiveEarly
     }
 
     private func hasConfirmedRecovery(for target: BlockedSession) -> Bool {
@@ -420,10 +450,11 @@ import Network
         func checkedPlan(for targets: [BlockedSession]) -> NextAction {
             var plan = engine.plan(now: now, enabled: defaults.bool(forKey: "enabled"), autoResume: defaults.bool(forKey: "autoResume"),
                 earlyRecoveryPolicy: earlyPolicy, usage: usage.snapshot, blocked: targets,
+                reservationUsage: usage.displaySnapshot,
                 observedRecovery: !targets.isEmpty && targets.allSatisfy { hasConfirmedRecovery(for: $0) },
                 heldForPlan: targets.contains { heldForPlan.contains($0.episodeKey) },
                 needsRecoveryDecision: targets.contains { choices.recoveryDecisions?[$0.episodeKey]?.phase != .responded && choices.recoveryDecisions?[$0.episodeKey] != nil },
-                reserveIdleDate: usage.hasReliableReading && usage.lastError == nil && targets.isEmpty &&
+                reserveIdleDate: usage.hasReliableReading && usage.lastError == nil &&
                     sessions.hasScanned && sessions.detectionError == nil && sessions.authentication != .unreadable)
             if defaults.bool(forKey: "enabled"), !targets.isEmpty, targets.allSatisfy({ choices.recoveryDecisions?[$0.episodeKey]?.phase == .responded }) {
                 plan = engine.plan(now: now, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: usage.snapshot, blocked: [], reserveIdleDate: true)

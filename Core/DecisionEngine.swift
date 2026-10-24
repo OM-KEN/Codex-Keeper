@@ -29,7 +29,7 @@ struct DecisionEngine {
 
     func plan(now: Date = Date(), calendar: Calendar = .current, enabled: Bool, autoResume: Bool,
               earlyRecoveryPolicy: String, usage: UsageSnapshot?, blocked: [BlockedSession],
-              observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false,
+              reservationUsage: UsageSnapshot? = nil, observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false,
               reserveIdleDate: Bool = false) -> NextAction {
         let target = blocked.first
         let mode: NextActionMode = target != nil ? .resume : .keepAlive
@@ -39,6 +39,17 @@ struct DecisionEngine {
         guard enabled else { return wait("已停用") }
         guard let usage, usage.fiveHour != nil || usage.weekly != nil else { return wait("等待额度同步") }
         guard usage.isFresh(at: now) else {
+            if reserveIdleDate, let target, autoResume, !needsRecoveryDecision {
+                let reserved = reservationUsage.flatMap { $0.accountID == usage.accountID && $0.capturedAt >= usage.capturedAt ? $0 : nil } ?? usage
+                let exhausted = [reserved.fiveHour, reserved.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
+                let reset = exhausted.map(\.resetsAt).max() ?? [target.fiveHourResetAt, target.weeklyResetAt].compactMap { $0 }.max()
+                if let reset, reset > now {
+                    let deferred = heldForPlan || (schedule.isInAnchorProtection(at: reset, calendar: calendar) && earlyRecoveryPolicy != "immediately")
+                    return wait(deferred ? "恢复后顺延至计划时间" : "额度恢复并确认后续跑",
+                        at: deferred ? schedule.firstNode(onOrAfter: reset, calendar: calendar) : reset)
+                }
+                return wait("额度已过期，等待实时确认", at: schedule.nextNode(after: now, calendar: calendar))
+            }
             if reserveIdleDate, target == nil {
                 let blocked = [usage.fiveHour, usage.weekly].compactMap { $0 }.contains { $0.usedPercent >= 100 }
                 return NextAction(mode: .keepAlive,
@@ -114,6 +125,19 @@ enum UsageRecovery {
               (usage.fiveHour?.usedPercent ?? 0) < 100, (usage.weekly?.usedPercent ?? 0) < 100 else { return false }
         if target.fiveHourResetAt != nil && usage.fiveHour == nil { return false }
         if target.weeklyResetAt != nil && usage.weekly == nil { return false }
+        return true
+    }
+
+    /// A task's confirmed future quota deadline supplies evidence independent of polling cadence.
+    /// Only a new live same-account read can prove that this particular stop recovered early.
+    static func isEarlyAfterQuotaStop(_ target: BlockedSession, from before: UsageSnapshot?, usage: UsageSnapshot?, boundAccount: String?, now: Date) -> Bool {
+        guard target.identityUncertain != true,
+              let before, before.sourceFile == "app-server", before.accountID == boundAccount,
+              before.capturedAt > target.blockedAt, before.capturedAt <= (usage?.capturedAt ?? .distantPast),
+              hasAvailableQuota(for: target, usage: usage, boundAccount: boundAccount, now: now),
+              let reset = [before.fiveHour, before.weekly].compactMap({ $0 }).filter({ $0.usedPercent >= 100 }).map(\.resetsAt).max(),
+              [target.fiveHourResetAt, target.weeklyResetAt].contains(reset),
+              reset > target.blockedAt, reset.timeIntervalSince(now) > observationTolerance else { return false }
         return true
     }
 

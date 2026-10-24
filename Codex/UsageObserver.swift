@@ -41,12 +41,18 @@ struct UsageSnapshot: Equatable {
     }
 }
 
-/// Independent read-only account polling. Rollout data is bounded, explicitly stale fallback evidence.
+/// Online readings authorize execution; verified local rollout readings only update presentation.
 @MainActor
 final class UsageObserver: ObservableObject {
     // Called on the main actor after the reading and critical-refresh gate have both settled.
     var onRefreshCompleted: (() -> Void)?
     @Published private(set) var snapshot: UsageSnapshot?
+    @Published private(set) var displaySnapshot: UsageSnapshot?
+    var onPassiveChange: (() -> Void)?
+    private var passiveSnapshot: UsageSnapshot?
+    private(set) var passiveRecovery: (before: UsageSnapshot, after: UsageSnapshot)?
+    private var passiveMonitor: RolloutUsageMonitor?
+    private var authenticationObservation: AuthenticationObservation = .unreadable
     @Published private(set) var lastError: String?
     @Published private(set) var refreshing = false
     @Published private(set) var refreshMessage = ""
@@ -75,6 +81,8 @@ final class UsageObserver: ObservableObject {
         self.provider = provider
         self.now = now
         self.codexHome = codexHome
+        do { authenticationObservation = .known(try AppServerUsageProvider.authenticationIdentity(home: codexHome)) }
+        catch { authenticationObservation = .unreadable }
         let support = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "CodexKeeper", directoryHint: .isDirectory)
@@ -82,8 +90,9 @@ final class UsageObserver: ObservableObject {
         try? FileManager.default.createDirectory(at: self.logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
     }
 
-    func start(interval: TimeInterval = 20) {
+    func start(interval: TimeInterval = UsagePollingPolicy.idleInterval) {
         monitoring = true
+        startPassiveMonitoring()
         polling = UsagePollingPolicy(interval: interval, wakeAt: nil)
         refresh()
     }
@@ -92,13 +101,91 @@ final class UsageObserver: ObservableObject {
         monitoring = false
         timer?.invalidate()
         timer = nil
+        passiveMonitor?.stop(); passiveMonitor = nil
     }
+
+    func startPassiveMonitoring() {
+        guard passiveMonitor == nil else { return }
+        passiveMonitor = RolloutUsageMonitor(home: codexHome, now: now) { [weak self] readings, changed in
+            Task { @MainActor in self?.receivePassive(readings, authenticationChanged: changed) }
+        }
+        passiveMonitor?.start()
+    }
+
+    func rescanPassive() { passiveMonitor?.rescan() }
 
     func invalidate(clearAccount: Bool = false) {
         hasReliableReading = false
         // Keep the original reading and its capture time as facts. Critical refresh gates execution.
         // Only a reliable new account response may change the display account.
+        if clearAccount { passiveSnapshot = nil; passiveRecovery = nil; displaySnapshot = nil }
+        rescanPassive()
+    }
 
+    func authenticationDidChange() {
+        let current: AuthenticationObservation
+        do { current = .known(try AppServerUsageProvider.authenticationIdentity(home: codexHome)) }
+        catch { current = .unreadable }
+        guard current != authenticationObservation else { return }
+        authenticationObservation = current
+        invalidate(clearAccount: true)
+        refresh(source: "authentication", critical: true)
+    }
+
+    private func receivePassive(_ readings: [PassiveUsageReading], authenticationChanged: Bool) {
+        guard passiveMonitor != nil else { return }
+        if authenticationChanged { authenticationDidChange() }
+        for reading in readings {
+            let next = reading.snapshot
+            guard (try? AppServerUsageProvider.authenticationIdentity(home: codexHome)) == reading.authentication,
+                  (try? AppServerUsageProvider.authenticationAccountID(home: codexHome)) == next.accountID,
+                  next.capturedAt <= now(), now().timeIntervalSince(next.capturedAt) <= RolloutUsageReader.maximumAge else { continue }
+            let old = [passiveSnapshot, snapshot].compactMap { $0 }.filter { $0.accountID == next.accountID }
+                .max { $0.capturedAt < $1.capturedAt }
+            if let old, old.accountID == next.accountID, old.capturedAt > next.capturedAt || (old.capturedAt == next.capturedAt && old == next) { continue }
+            passiveSnapshot = next
+            if let old, old.accountID == next.accountID,
+               [old.fiveHour, old.weekly].compactMap({ $0 }).contains(where: { $0.usedPercent >= 100 }),
+               [next.fiveHour, next.weekly].compactMap({ $0 }).allSatisfy({ $0.usedPercent < 100 }),
+               (old.fiveHour == nil || next.fiveHour != nil), (old.weekly == nil || next.weekly != nil) {
+                passiveRecovery = (old, next)
+            } else if [next.fiveHour, next.weekly].compactMap({ $0 }).contains(where: { $0.usedPercent >= 100 }) {
+                passiveRecovery = nil
+            }
+            updateDisplaySnapshot()
+            onPassiveChange?()
+            if let old, old.accountID == next.accountID, Self.needsOnlineVerification(from: old, to: next),
+               lastRefreshStartedAt.map({ $0 < next.capturedAt }) ?? true {
+                refresh(source: "passive_boundary", critical: true)
+            }
+        }
+    }
+
+    private static func needsOnlineVerification(from old: UsageSnapshot, to new: UsageSnapshot) -> Bool {
+        for (before, after) in [(old.fiveHour, new.fiveHour), (old.weekly, new.weekly)] {
+            if (before?.usedPercent ?? 0 >= 100) != (after?.usedPercent ?? 0 >= 100) { return true }
+            if let before, let after {
+                if abs(before.resetsAt.timeIntervalSince(after.resetsAt)) > ScheduleEngine.alignmentTolerance { return true }
+                if (before.usedPercent == 0) != (after.usedPercent == 0) { return true }
+            } else if before != after { return true }
+        }
+        return false
+    }
+
+    private func updateDisplaySnapshot() {
+        if let passiveSnapshot, now().timeIntervalSince(passiveSnapshot.capturedAt) <= RolloutUsageReader.maximumAge,
+           snapshot == nil || (snapshot?.accountID == passiveSnapshot.accountID && snapshot!.capturedAt < passiveSnapshot.capturedAt) {
+            displaySnapshot = passiveSnapshot
+        } else { displaySnapshot = snapshot }
+    }
+
+    func verifiedPassiveRecovery(at date: Date) -> (before: UsageSnapshot, after: UsageSnapshot)? {
+        guard let evidence = passiveRecovery, let live = snapshot, live.isFresh(at: date), hasReliableReading, lastError == nil,
+              evidence.before.accountID == evidence.after.accountID, live.accountID == evidence.after.accountID,
+              live.capturedAt >= evidence.after.capturedAt, date.timeIntervalSince(evidence.after.capturedAt) <= RolloutUsageReader.maximumAge,
+              [live.fiveHour, live.weekly].compactMap({ $0 }).allSatisfy({ $0.usedPercent < 100 }),
+              (evidence.before.fiveHour == nil || live.fiveHour != nil), (evidence.before.weekly == nil || live.weekly != nil) else { return nil }
+        return evidence
     }
 
     func setPolling(_ policy: UsagePollingPolicy, retryOpportunity: UsageRetryOpportunity?) {
@@ -151,12 +238,11 @@ final class UsageObserver: ObservableObject {
         }
         refreshing = true
         let provider = provider
-        let home = codexHome
         Task {
             let result = await Task.detached { () -> (UsageSnapshot?, String?, UsageReadDiagnostic?) in
                 do { return (try (manual ? provider.readForUserRefresh() : provider.read()), nil, nil) }
                 catch {
-                    return (Self.readLatestSnapshot(codexHome: home), error.localizedDescription,
+                    return (nil, error.localizedDescription,
                         UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - started))
                 }
             }.value
@@ -176,6 +262,9 @@ final class UsageObserver: ObservableObject {
             } else if result.1 != nil {
                 snapshot = nil
             }
+            if let live = snapshot, passiveSnapshot?.accountID != live.accountID { passiveSnapshot = nil; passiveRecovery = nil }
+            if result.2 != nil, result.2?.isTransient != true { passiveSnapshot = nil; passiveRecovery = nil }
+            updateDisplaySnapshot()
             lastError = result.1
             lastReadFailure = result.2
             if manual || !refreshMessage.isEmpty {
@@ -200,71 +289,6 @@ final class UsageObserver: ObservableObject {
             else { scheduleRefresh() }
             onRefreshCompleted?()
         }
-    }
-
-    // MARK: - 快照读取
-
-    /// 扫描最近修改的 rollout 文件，取最后一条带窗口数据的 rate_limits
-    nonisolated static func readLatestSnapshot(codexHome: URL) -> UsageSnapshot? {
-        let sessionsDir = codexHome.appending(path: "sessions", directoryHint: .isDirectory)
-        guard let enumerator = FileManager.default.enumerator(
-            at: sessionsDir,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return nil }
-
-        var files: [(url: URL, mtime: Date)] = []
-        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
-            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
-                  values.isRegularFile == true,
-                  let mtime = values.contentModificationDate else { continue }
-            files.append((url, mtime))
-        }
-        files.sort { $0.mtime > $1.mtime }
-
-        return files.prefix(12).compactMap { readSnapshot(from: $0) }.max { $0.capturedAt < $1.capturedAt }
-    }
-
-    /// 从单个 rollout 尾部找最新 rate_limits（从后往前扫，命中即停）
-    nonisolated private static func readSnapshot(from file: (url: URL, mtime: Date)) -> UsageSnapshot? {
-        guard let handle = try? FileHandle(forReadingFrom: file.url) else { return nil }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd() else { return nil }
-        try? handle.seek(toOffset: size > 512 * 1024 ? size - 512 * 1024 : 0)
-        guard let data = try? handle.readToEnd(), let content = String(data: data, encoding: .utf8) else { return nil }
-        let lines = content.split(separator: "\n", omittingEmptySubsequences: true)
-
-        var fiveHour: QuotaWindow?
-        var weekly: QuotaWindow?
-        var capturedAt: Date?
-
-        for rawLine in lines.reversed() {
-            guard rawLine.contains("rate_limits"),
-                  let lineData = rawLine.data(using: .utf8),
-                  let entry = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let payload = entry["payload"] as? [String: Any],
-                  let rateLimits = payload["rate_limits"] as? [String: Any]
-            else { continue }
-
-            (fiveHour, weekly) = UsageDecoder.windows(rateLimits)
-
-            if fiveHour != nil || weekly != nil {
-                if let ts = entry["timestamp"] as? String {
-                    let formatter = ISO8601DateFormatter()
-                    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    capturedAt = formatter.date(from: ts)
-                }
-                break
-            }
-        }
-
-        guard fiveHour != nil || weekly != nil else { return nil }
-        return UsageSnapshot(
-            fiveHour: fiveHour,
-            weekly: weekly,
-            capturedAt: capturedAt ?? file.mtime,
-            sourceFile: file.url.lastPathComponent
-        )
     }
 
     // MARK: - Transition 日志（P0-6 埋点）

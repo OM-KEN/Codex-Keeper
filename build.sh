@@ -44,7 +44,9 @@ SOURCES=(
     Codex/DesktopIPCClient.swift
     Codex/ComposerDraftReader.swift
     Codex/QuotaErrorLogProvider.swift
+    Codex/ReadOnlyDatabase.swift
     Codex/UsageObserver.swift
+    Codex/RolloutUsageMonitor.swift
     Codex/SessionWatcher.swift
     Codex/BlockedSessionDetector.swift
     UI/MenuSummaryView.swift
