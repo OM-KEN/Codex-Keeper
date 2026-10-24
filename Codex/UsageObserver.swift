@@ -69,6 +69,8 @@ final class UsageObserver: ObservableObject {
     private var pendingManualSource: String?
     private var pendingAutomaticSource: String?
     private var monitoring = false
+    private var suspended = false
+    private var generation = 0
     private var requestID: String?
     private var lastReadFailure: UsageReadDiagnostic?
     private var lastSchedulingState: Data?
@@ -91,6 +93,10 @@ final class UsageObserver: ObservableObject {
     }
 
     func start(interval: TimeInterval = UsagePollingPolicy.idleInterval) {
+        suspended = false
+        provider.setSuspended(false)
+        hasReliableReading = false
+        criticalRefreshPending = true
         monitoring = true
         startPassiveMonitoring()
         polling = UsagePollingPolicy(interval: interval, wakeAt: nil)
@@ -98,16 +104,27 @@ final class UsageObserver: ObservableObject {
     }
 
     func stop() {
+        suspended = true
+        generation += 1
         monitoring = false
         timer?.invalidate()
         timer = nil
         passiveMonitor?.stop(); passiveMonitor = nil
+        pendingManualSource = nil; pendingAutomaticSource = nil
+        refreshing = false; requestID = nil; criticalRefreshPending = false
+        hasReliableReading = false
+        provider.setRetryOpportunity(nil, now: now())
+        provider.setSuspended(true)
     }
 
     func startPassiveMonitoring() {
-        guard passiveMonitor == nil else { return }
+        guard !suspended, passiveMonitor == nil else { return }
+        let generation = self.generation
         passiveMonitor = RolloutUsageMonitor(home: codexHome, now: now) { [weak self] readings, changed in
-            Task { @MainActor in self?.receivePassive(readings, authenticationChanged: changed) }
+            Task { @MainActor in
+                guard let self, self.generation == generation else { return }
+                self.receivePassive(readings, authenticationChanged: changed)
+            }
         }
         passiveMonitor?.start()
     }
@@ -123,6 +140,7 @@ final class UsageObserver: ObservableObject {
     }
 
     func authenticationDidChange() {
+        guard !suspended else { return }
         let current: AuthenticationObservation
         do { current = .known(try AppServerUsageProvider.authenticationIdentity(home: codexHome)) }
         catch { current = .unreadable }
@@ -189,6 +207,7 @@ final class UsageObserver: ObservableObject {
     }
 
     func setPolling(_ policy: UsagePollingPolicy, retryOpportunity: UsageRetryOpportunity?) {
+        guard !suspended else { return }
         provider.setRetryOpportunity(retryOpportunity, now: now())
         guard polling != policy else { return }
         polling = policy
@@ -212,6 +231,7 @@ final class UsageObserver: ObservableObject {
     }
 
     func refresh(manual: Bool = false, source: String = "manual", critical: Bool = false) {
+        guard !suspended else { return }
         let trigger = manual || critical || source != "manual" ? source : "automatic"
         if critical { criticalRefreshPending = true }
         guard !refreshing else {
@@ -238,7 +258,9 @@ final class UsageObserver: ObservableObject {
         }
         refreshing = true
         let provider = provider
+        let generation = self.generation
         Task {
+            guard !suspended, self.generation == generation else { return }
             let result = await Task.detached { () -> (UsageSnapshot?, String?, UsageReadDiagnostic?) in
                 do { return (try (manual ? provider.readForUserRefresh() : provider.read()), nil, nil) }
                 catch {
@@ -246,6 +268,7 @@ final class UsageObserver: ObservableObject {
                         UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - started))
                 }
             }.value
+            guard !suspended, self.generation == generation else { return }
             if let failure = result.2, manual || !failure.sameFailure(as: lastReadFailure) {
                 var entry: [String: Any] = ["event": "usage_read_failed", "logged_at": ISO8601DateFormatter().string(from: Date()),
                     "reason": failure.reason, "trigger": trigger,

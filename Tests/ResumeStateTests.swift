@@ -681,7 +681,9 @@ private func resumePendingChoice(_ target: BlockedSession, account: String, runt
     }, defaults: prefs, ledgerURL: root.appendingPathComponent("support/resume-attempts.json"), pingTransport: ReminderTestPing(), codexHome: root)
     try resumePendingChoice(pendingTarget, account: "ping-admission-account", runtime: root.appendingPathComponent("support/runtime.json"))
     let state = AppState(provider: usage, defaults: prefs, runtimeURL: root.appendingPathComponent("support/runtime.json"), codexHome: root, execution: coordinator, startMonitoring: false)
-    state.refresh(manual: true); try await resumeWait { state.availableTasks.count == 1 && !state.usage.refreshing }
+    // Seed the background observations while disabled; menu/manual refresh is intentionally blocked.
+    state.usage.refresh(); state.sessions.refresh()
+    try await resumeWait { state.availableTasks.count == 1 && !state.usage.refreshing }
     usage.pauseModel(); prefs.set(true, forKey: "enabled"); state.recompute(allowExecution: false)
     let target = state.availableTasks.first!
     let pending = state.choices.recoveryDecisions?[target.episodeKey]

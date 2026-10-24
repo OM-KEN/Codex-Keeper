@@ -356,6 +356,53 @@ private final class LogicRepairGate {
     let missing = worker.read(watchedIDs: [])
     check(missing.1 != nil && missing.0.contains { $0.id == target.id && $0.taskRunning },
         "missing protected running history remains a blocking fact instead of silently disappearing")
+    check(missing.2.contains { $0.stage == "running_rollout_missing" },
+        "a missing running history retains the exact blocking scan stage")
+
+    let diagnosticHome = root.appendingPathComponent("scan-diagnostics")
+    let diagnosticTarget = try logicRepairTask(home: diagnosticHome, clock: clock, reset: clock.addingTimeInterval(-60))
+    let diagnosticTrace = try Data(contentsOf: diagnosticTarget.fileURL)
+    let diagnosticWorker = SessionScanWorker(codexHome: diagnosticHome)
+    _ = diagnosticWorker.read(watchedIDs: [diagnosticTarget.id])
+    try Data([0xff]).write(to: diagnosticTarget.fileURL)
+    let invalid = diagnosticWorker.read(watchedIDs: [diagnosticTarget.id])
+    check(invalid.1 != nil && invalid.2.contains { $0.stage == "rollout_parse.decode_utf8" && $0.fileFingerprint?.count == 64 && $0.code == nil },
+        "unreadable UTF-8 is distinguished from quota and database failures without releasing the scan gate")
+    let encoded = String(decoding: try JSONSerialization.data(withJSONObject: invalid.2.map(\.logValue)), as: UTF8.self)
+    check(!encoded.contains(diagnosticTarget.id) && !encoded.contains(diagnosticTarget.cwd) && !encoded.contains(diagnosticTarget.fileURL.lastPathComponent),
+        "scan diagnostics identify a file by fingerprint without exposing its path or thread ID")
+    try diagnosticTrace.write(to: diagnosticTarget.fileURL)
+    let repaired = diagnosticWorker.read(watchedIDs: [diagnosticTarget.id])
+    check(repaired.1 == nil && repaired.2.isEmpty,
+        "a later background scan clears both the error and its diagnostics after the file recovers")
+
+    let stateDatabase = diagnosticHome.appendingPathComponent("state.sqlite")
+    var lockedDB: OpaquePointer?
+    guard sqlite3_open(stateDatabase.path, &lockedDB) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    defer { sqlite3_close(lockedDB) }
+    guard sqlite3_exec(lockedDB, "CREATE TABLE threads(id TEXT, rollout_path TEXT); BEGIN EXCLUSIVE", nil, nil, nil) == SQLITE_OK else {
+        throw CodexConnectionError.invalidResponse
+    }
+    let locked = diagnosticWorker.read(watchedIDs: [diagnosticTarget.id])
+    check(locked.1 != nil && locked.2.contains { $0.stage == "state_database.prepare" && $0.code == Int(SQLITE_BUSY) && $0.domain == "SQLite" },
+        "an actual SQLite lock is recorded separately from network and rollout failures")
+    guard sqlite3_exec(lockedDB, "ROLLBACK", nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    check(diagnosticWorker.read(watchedIDs: [diagnosticTarget.id]).1 == nil,
+        "releasing the database lock permits an ordinary background scan without menu interaction")
+    let pointMissing = "INSERT INTO threads VALUES('\(diagnosticTarget.id)','\(diagnosticHome.appendingPathComponent("missing.jsonl").path)')"
+    guard sqlite3_exec(lockedDB, pointMissing, nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    check(diagnosticWorker.read(watchedIDs: [diagnosticTarget.id]).2.contains { $0.stage == "canonical_rollout_missing" },
+        "a registered rollout mismatch has its own diagnostic instead of being reported as a database lock")
+    guard sqlite3_exec(lockedDB, "DELETE FROM threads", nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    let logDatabase = diagnosticHome.appendingPathComponent("logs_1.sqlite")
+    let originalLog = try Data(contentsOf: logDatabase)
+    try Data("not a SQLite database".utf8).write(to: logDatabase)
+    let invalidLog = diagnosticWorker.read(watchedIDs: [diagnosticTarget.id])
+    check(invalidLog.1 != nil && invalidLog.2.contains { $0.stage == "quota_log_database.prepare" && $0.code == Int(SQLITE_NOTADB) },
+        "unreadable local quota evidence is distinguished from a current-rollout database failure")
+    try originalLog.write(to: logDatabase)
+    check(diagnosticWorker.read(watchedIDs: [diagnosticTarget.id]).2.isEmpty,
+        "repaired local evidence clears its diagnostic on the next background scan")
 }
 
 private func logicRepairEvent(_ type: String, at: Date) throws -> Data {

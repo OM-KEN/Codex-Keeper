@@ -1,4 +1,5 @@
 import SwiftUI
+import QuartzCore
 
 struct MenuSummaryView: View {
     let summary: MenuSummary
@@ -9,6 +10,19 @@ struct MenuSummaryView: View {
     @State private var tasksHovered = false
 
     var body: some View {
+        Group {
+            if summary.headline == "已停用" {
+                Text(L10n.text("已停用")).font(.system(size: 17, weight: .semibold)).foregroundStyle(.secondary)
+            } else {
+                activeContent
+            }
+        }
+        .padding(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
+        .frame(width: 304, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var activeContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             if !summary.reminderTitle.isEmpty {
                 Button(action: openTasks) {
@@ -116,9 +130,6 @@ struct MenuSummaryView: View {
                 }
             }
         }
-        .padding(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
-        .frame(width: 304, alignment: .leading)
-        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -152,21 +163,20 @@ private struct MenuTaskBubble: Shape {
     }
 }
 
-@MainActor final class MenuQuotaHostView: NSHostingView<MenuQuotaView> {
+@MainActor final class MenuQuotaHostView: NSView {
     private var presentation = MenuQuotaPresentation()
     private var openingTimer: Timer?
     private var hasVisibleFrame = false
+    private var rows: [MenuNativeQuotaRow] = []
+    override var isFlipped: Bool { true }
 
     init(quotas: [MenuQuota] = [], accountID: String? = nil) {
-        super.init(rootView: MenuQuotaView(quotas: []))
+        super.init(frame: .zero)
         update(quotas: quotas, accountID: accountID)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
-
-    @available(*, unavailable)
-    required init(rootView: MenuQuotaView) { fatalError() }
 
     func update(quotas: [MenuQuota], accountID: String?) {
         presentation.update(quotas: quotas, accountID: accountID)
@@ -190,7 +200,6 @@ private struct MenuTaskBubble: Shape {
             hasVisibleFrame = false
             return
         }
-        // NSMenu's window can appear after menuWillOpen. Display the old length for one frame first.
         if !hasVisibleFrame {
             displayIfNeeded()
             hasVisibleFrame = true
@@ -210,10 +219,104 @@ private struct MenuTaskBubble: Shape {
     }
 
     private func render() {
-        rootView = MenuQuotaView(quotas: presentation.quotas,
-            displayedRemaining: presentation.displayedRemaining, animatesChanges: presentation.animatesChanges)
-        layoutSubtreeIfNeeded()
-        frame.size = NSSize(width: 304, height: fittingSize.height)
+        while rows.count > presentation.quotas.count { rows.removeLast().removeFromSuperview() }
+        while rows.count < presentation.quotas.count {
+            let row = MenuNativeQuotaRow(); rows.append(row); addSubview(row)
+        }
+        var y: CGFloat = 10
+        for (row, quota) in zip(rows, presentation.quotas) {
+            let height: CGFloat = quota.barRemaining == 0 ? 14 : 20
+            row.frame = NSRect(x: 16, y: y, width: 272, height: height)
+            row.update(quota, displayed: presentation.displayedRemaining[quota.id] ?? quota.barRemaining,
+                animate: presentation.animatesChanges)
+            y += height + 10
+        }
+        frame.size = NSSize(width: 304, height: y + 4)
+        needsDisplay = true
+        // NSTextField and the native meter repaint synchronously while NSMenu tracks.
+        displayIfNeeded()
+    }
+}
+
+@MainActor private final class MenuNativeQuotaRow: NSView {
+    private let name = NSTextField(labelWithString: "")
+    private let percent = NSTextField(labelWithString: "")
+    private let detail = NSTextField(labelWithString: "")
+    private let meter = MenuNativeQuotaMeter()
+    override var isFlipped: Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        for label in [name, percent, detail] {
+            label.font = .systemFont(ofSize: 11)
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+            addSubview(label)
+        }
+        name.textColor = .secondaryLabelColor; detail.textColor = .secondaryLabelColor
+        percent.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        percent.alignment = .right; detail.alignment = .right
+        addSubview(meter)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(_ quota: MenuQuota, displayed: Double, animate: Bool) {
+        name.stringValue = L10n.text(quota.name)
+        percent.stringValue = "\(Int(max(0, min(100, quota.remaining)).rounded()))%"
+        detail.stringValue = L10n.text(quota.detail)
+        let y = (bounds.height - 14) / 2
+        // NSTextField adds two points of cell inset on either side.
+        name.frame = NSRect(x: -2, y: y, width: 35, height: 14)
+        meter.frame = NSRect(x: 37, y: (bounds.height - 8) / 2, width: 85, height: 8)
+        percent.frame = NSRect(x: 126, y: y, width: 36, height: 14)
+        detail.frame = NSRect(x: 164, y: y, width: 110, height: 14)
+        meter.update(displayed, animate: animate)
+        meter.setAccessibilityLabel(L10n.format("%@剩余额度", L10n.text(quota.name)))
+        meter.setAccessibilityValue(percent.stringValue)
+        for label in [name, percent, detail] { label.needsDisplay = true; label.displayIfNeeded() }
+    }
+}
+
+@MainActor private final class MenuNativeQuotaMeter: NSView {
+    private let fill = NSView()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true; fill.wantsLayer = true
+        layer?.cornerRadius = 4; layer?.borderWidth = 1
+        fill.layer?.cornerRadius = 4
+        addSubview(fill)
+        setAccessibilityElement(true); setAccessibilityRole(.progressIndicator)
+        updateColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(_ remaining: Double, animate: Bool) {
+        updateColors()
+        let fraction = max(0, min(100, remaining)) / 100
+        let width = fraction > 0 ? max(bounds.height, bounds.width * fraction) : 0
+        let target = NSRect(x: 0, y: 0, width: width, height: bounds.height)
+        guard fill.frame != target else { return }
+        if animate && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.5
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                fill.animator().frame = target
+            }
+        } else { fill.frame = target }
+        needsDisplay = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateColors() }
+    private func updateColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
+            fill.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        }
     }
 }
 

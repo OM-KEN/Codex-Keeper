@@ -10,6 +10,23 @@ import Darwin
             count += 1
             if !value { failed += 1; print("FAIL: \(name)") }
         }
+        if CommandLine.arguments.contains("--menu-disabled-only") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-menu-disabled-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try await checkDisabledMenu(check, root: root)
+            print("\(count - failed)/\(count) disabled menu checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
+        if CommandLine.arguments.contains("--menu-cpu-only") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-menu-cpu-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try checkSessionIncrementalReads(check, root: root.appendingPathComponent("sessions"))
+            try checkNativeMenuQuotaUpdates(check, root: root.appendingPathComponent("ui"))
+            print("\(count - failed)/\(count) menu and CPU checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
         if CommandLine.arguments.contains("--passive-usage-only") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-passive-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }
@@ -3312,6 +3329,9 @@ import Darwin
 
         try await checkUsagePollingAndDrift(check, root: temp.appendingPathComponent("polling-regression"))
         try await checkPassiveUsage(check, root: temp.appendingPathComponent("passive-usage-regression"))
+        try checkSessionIncrementalReads(check, root: temp.appendingPathComponent("incremental-sessions"))
+        try checkNativeMenuQuotaUpdates(check, root: temp.appendingPathComponent("native-menu-updates"))
+        try await checkDisabledMenu(check, root: temp.appendingPathComponent("disabled-menu"))
         print("\(count - failed)/\(count) regression checks passed")
         if failed > 0 { exit(1) }
     }

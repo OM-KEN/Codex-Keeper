@@ -436,6 +436,8 @@ import SQLite3
         "optional scheduling trace identifies dispatch from background quota completion")
     check(schedulingRows.allSatisfy { $0["account_id"] == nil && $0["thread_id"] == nil && $0["prompt"] == nil && $0["cwd"] == nil },
         "scheduling trace omits identities, prompts and workspace paths")
+    check(schedulingRows.contains { $0["scan_failures"] is [[String: Any]] },
+        "scheduling diagnostics retain structured local scan failures independently of quota errors")
     gateClock = gateClock.addingTimeInterval(18000)
     gateUsage.capturedAt = gateClock
     gateUsage.fiveHour?.resetsAt = gateClock.addingTimeInterval(18000)

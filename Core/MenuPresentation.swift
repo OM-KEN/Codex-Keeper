@@ -586,7 +586,7 @@ struct MenuPresentation {
             summary.refreshMessage = L10n.format("上次更新 · %@", clock.string(from: capturedAt))
         }
         if showsRefreshFeedback && !refreshMessage.isEmpty { summary.refreshMessage = refreshMessage }
-        return summary
+        return enabled ? summary : MenuSummary(headline: "已停用")
     }
 }
 

@@ -21,6 +21,7 @@ import UserNotifications
     private let appState = AppState()
     private let updateService = AppUpdateService()
     private var updateScheduled = false
+    private var updateChecksEnabled: Bool?
     private var menuIsTracking = false
     private var importantUpdatePromptScheduled = false
     private let importantUpdateWindow = ImportantUpdateWindowController()
@@ -79,18 +80,21 @@ import UserNotifications
             CFRunLoopWakeUp(CFRunLoopGetMain())
         }.store(in: &cancellables)
         rebuildMenu()
-        updateService.startAutomaticChecks()
         if CommandLine.arguments.contains("--show-settings") { openKeeperSettings() }
     }
 
-    // Refresh on every opening; the observation above updates the visible menu when it returns.
+    // Enabled menus refresh on opening; observation updates the visible menu when it returns.
     func menuNeedsUpdate(_ menu: NSMenu) {
-        executionFailureSeen = true
-        appState.refresh(manual: true, source: "menu_open"); rebuildMenu()
+        if appState.enabled {
+            executionFailureSeen = true
+            appState.refresh(manual: true, source: "menu_open")
+        }
+        rebuildMenu()
     }
     func menuWillOpen(_ menu: NSMenu) {
         menuIsTracking = true
-        statusQuotaView.setHighlighted(true); quotaHost?.menuWillOpen()
+        statusQuotaView.setHighlighted(true)
+        if appState.enabled { quotaHost?.menuWillOpen() }
     }
     func menuDidClose(_ menu: NSMenu) {
         menuIsTracking = false
@@ -164,6 +168,11 @@ import UserNotifications
 
     private func rebuildMenu() {
         let enabled = UserDefaults.standard.bool(forKey: "enabled")
+        if updateChecksEnabled != enabled {
+            updateChecksEnabled = enabled
+            if enabled { updateService.startAutomaticChecks() } else { updateService.stop() }
+        }
+        if !enabled { quotaHost?.menuDidClose() }
         let summary = makeSummary()
         let statusText = appState.execution.running ? L10n.text(summary.headline) : summary.statusText
         let action = summary.action.isEmpty ? summary.headline : summary.action
@@ -212,6 +221,7 @@ import UserNotifications
         quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
         let hasUpdate = updateService.showsMenuUpdateIndicator
         let versionTitle = MenuVersionTextFormatter.string(version: AppVersion.currentString, hasUpdate: hasUpdate)
+        versionItem?.isHidden = !enabled
         versionItem?.title = versionTitle
         versionItem?.attributedTitle = nil
         if hasUpdate, let image = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: L10n.text("有新版本"))?
@@ -239,7 +249,7 @@ import UserNotifications
     }
 
     private func presentImportantUpdateIfPossible() {
-        guard !menuIsTracking, importantUpdateWindow.window?.isVisible != true, !appState.execution.running,
+        guard appState.enabled, !menuIsTracking, importantUpdateWindow.window?.isVisible != true, !appState.execution.running,
               NSApp.modalWindow == nil, !NSApp.windows.contains(where: { $0.attachedSheet != nil }),
               let release = updateService.claimImportantUpdatePrompt() else { return }
         importantUpdateWindow.show(release)
@@ -247,9 +257,10 @@ import UserNotifications
 
     private func makeSummary(running: Bool? = nil) -> MenuSummary {
         let defaults = UserDefaults.standard
+        let enabled = defaults.bool(forKey: "enabled")
         var summary = presentation.build(plan: appState.nextAction, usage: appState.usage.snapshot,
             schedule: appState.schedule, tasks: appState.selectedTasks, availableTasks: appState.availableTasks,
-            choices: appState.choices, enabled: defaults.bool(forKey: "enabled"), autoResume: defaults.bool(forKey: "autoResume"),
+            choices: appState.choices, enabled: enabled, autoResume: defaults.bool(forKey: "autoResume"),
             earlyRecoveryPolicy: defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask",
             confirmations: appState.execution.confirmations,
             usageError: appState.usage.lastError, usageErrorIsTransient: appState.usage.lastErrorIsTransient,
@@ -261,6 +272,7 @@ import UserNotifications
             executionNotice: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleNotice,
             refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage,
             displayUsage: appState.usage.displaySnapshot)
+        guard enabled else { return summary }
         let recordFailures = [appState.pendingStateFailure, appState.execution.recordingFailure].compactMap { $0 }
         if !recordFailures.isEmpty {
             summary.error = ([summary.error] + recordFailures).filter { !$0.isEmpty }.joined(separator: "\n")

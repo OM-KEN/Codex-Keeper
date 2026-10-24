@@ -268,6 +268,7 @@ protocol UsageProvider {
     func readForUserRefresh() throws -> UsageSnapshot
     func pingModel() throws -> PingModel
     func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date)
+    func setSuspended(_ suspended: Bool)
 }
 
 struct PingModel: Equatable {
@@ -276,6 +277,7 @@ struct PingModel: Equatable {
 }
 
 extension UsageProvider {
+    func setSuspended(_ suspended: Bool) {}
     func readForUserRefresh() throws -> UsageSnapshot { try read() }
     func pingModel() throws -> PingModel {
         throw CodexConnectionError.server("无法确认保活模型；请更新 Codex 后重试")
@@ -359,6 +361,8 @@ struct UsageReadFailure: LocalizedError {
 
 final class AppServerUsageProvider: UsageProvider {
     private let lock = NSLock()
+    private let suspensionLock = NSLock()
+    private var suspended = false
     private let retryOpportunityLock = NSLock()
     private let makeTransport: () throws -> CodexTransport
     private let contextIdentity: () throws -> Data?
@@ -396,6 +400,30 @@ final class AppServerUsageProvider: UsageProvider {
     }
 
     deinit { transport?.close() }
+
+    private var isSuspended: Bool {
+        suspensionLock.lock(); defer { suspensionLock.unlock() }
+        return suspended
+    }
+
+    func setSuspended(_ suspended: Bool) {
+        suspensionLock.lock()
+        let changed = self.suspended != suspended
+        self.suspended = suspended
+        suspensionLock.unlock()
+        guard changed, suspended else { return }
+        // Let an admitted RPC settle without blocking the menu, then release the query child.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.lock.lock(); defer { self.lock.unlock() }
+            guard self.isSuspended else { return }
+            self.transport?.close(); self.transport = nil; self.cachedModel = nil
+        }
+    }
+
+    private func requireActive() throws {
+        guard !isSuspended else { throw CodexConnectionError.ended }
+    }
 
     // Hash only for local equality checks; credentials never enter logs or snapshots.
     static func authenticationIdentity(home: URL = CodexEnvironment.home) throws -> Data? {
@@ -442,6 +470,7 @@ final class AppServerUsageProvider: UsageProvider {
                 try Self.requireChatGPT(try client.request("account/read", params: ["refreshToken": false]))
                 var snapshot = try read(from: client, stage: { requestStage = $0 })
                 requestStage = "account_verification"
+                try requireActive()
                 let fileAccount = try accountIdentity()
                 if let reported = snapshot.accountID, let fileAccount, reported != fileAccount {
                     throw CodexConnectionError.server("账户身份不一致，请重新登录 Codex 后重试")
@@ -471,6 +500,7 @@ final class AppServerUsageProvider: UsageProvider {
     }
 
     func pingModel() throws -> PingModel {
+        try requireActive()
         // A locally cached discovery needs no automatic RPC admission. Authentication is
         // still checked, and the final quota/account read remains mandatory before sending.
         lock.lock()
@@ -490,6 +520,7 @@ final class AppServerUsageProvider: UsageProvider {
                 var cursors = Set<String>()
                 // Bound both network work and malformed/repeating pagination.
                 for _ in 0..<10 {
+                    try requireActive()
                     var params: [String: Any] = ["limit": 20, "includeHidden": false]
                     if let cursor { params["cursor"] = cursor }
                     let page = try client.request("model/list", params: params)
@@ -527,6 +558,7 @@ final class AppServerUsageProvider: UsageProvider {
     private func withConnection<T>(manual: Bool = false, resetFailuresOnSuccess: Bool = true,
                                    stage: ((String) -> Void)? = nil, _ operation: (CodexTransport) throws -> T) throws -> T {
         lock.lock(); defer { lock.unlock() }
+        try requireActive()
         let currentFallbackPath = fallbackPath()
         retryOpportunityLock.lock(); let shortUntil = shortRetryActive ? shortRetryUntil : 0; retryOpportunityLock.unlock()
         let automaticRetryAfter = upstreamFailure && uptime() < shortUntil ? lastAutomaticAttempt + 30 : retryAfter
@@ -550,13 +582,16 @@ final class AppServerUsageProvider: UsageProvider {
                 cachedModel = nil
             }
             if transport == nil {
+                try requireActive()
                 stage?("connection")
                 transport = try makeTransport()
                 identity = currentIdentity
             }
+            try requireActive()
             operationStarted = true
             lastAutomaticAttempt = uptime()
             let result = try operation(transport!)
+            try requireActive()
             stage?("authentication")
             guard try contextIdentity() == currentIdentity else {
                 throw CodexConnectionError.server("账户在刷新期间改变")
@@ -573,6 +608,10 @@ final class AppServerUsageProvider: UsageProvider {
             }
             return result
         } catch {
+            if isSuspended {
+                transport?.close(); transport = nil; cachedModel = nil
+                throw error
+            }
             if error is CodexCapabilityError { throw error }
             var failure = error
             var retainConnection = false
@@ -599,10 +638,12 @@ final class AppServerUsageProvider: UsageProvider {
     }
 
     private func requireSameAuthentication() throws {
+        try requireActive()
         guard try contextIdentity() == identity else { throw CodexConnectionError.server("账户在刷新期间改变") }
     }
 
     private func readRateLimits(from client: CodexTransport, stage: (String) -> Void) throws -> UsageSnapshot {
+        try requireActive()
         let response: [String: Any]
         do {
             response = try client.request("account/rateLimits/read", params: [:])

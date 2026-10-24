@@ -33,7 +33,9 @@ import Network
     private var environmentTimeZone = Calendar.current.timeZone.identifier
     private var naturalRecoveries = Set<String>()
     private var heldForPlan = Set<String>()
-    private let network = NWPathMonitor()
+    private var network: NWPathMonitor?
+    private let monitorsAutomatically: Bool
+    private var monitoringEnabled: Bool?
     private var networkAvailable: Bool?
     private var confirmed: [String: BlockedSession] = [:]
     private var workspaceAtBlock: [String: String] = [:]
@@ -50,6 +52,7 @@ import Network
         self.defaults = defaults
         self.now = now
         self.diagnoseScheduling = diagnoseScheduling
+        self.monitorsAutomatically = startMonitoring
         self.runtimeURL = runtimeURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/pending-runtime.json")
         usage = UsageObserver(codexHome: codexHome, provider: provider, logURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"), now: now)
         let scanWorker = SessionScanWorker(codexHome: codexHome)
@@ -95,7 +98,7 @@ import Network
         sessions.watchedIDs = Set(confirmed.keys).union(self.execution.busyThreadIDs)
         sessions.watchedPaths = self.execution.protectedPaths
         observers.append(NotificationCenter.default.addObserver(forName: CodexLocator.fallbackPathChanged, object: defaults, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.usage.refresh(manual: true, source: "cli_path") }
+            Task { @MainActor in self?.refresh(manual: true, source: "cli_path") }
         })
         guard startMonitoring else { recompute(allowExecution: false); return }
         observers.append(NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -112,17 +115,34 @@ import Network
                 Task { @MainActor in self?.environmentChanged() }
             })
         }
-        network.pathUpdateHandler = { [weak self] path in
-            let available = path.status == .satisfied
-            Task { @MainActor in self?.networkChanged(available: available) }
-        }
-        network.start(queue: DispatchQueue(label: "keeper.network"))
-        sessions.watchedIDs = Set(confirmed.keys).union(self.execution.busyThreadIDs)
-        usage.start()
-        sessions.start()
+        synchronizeMonitoring()
         recompute()
-        ticker = Timer(timeInterval: 20, repeats: true) { [weak self] _ in Task { @MainActor in self?.recompute(source: "timer") } }
-        if let ticker { RunLoop.main.add(ticker, forMode: .common) }
+    }
+
+    private func synchronizeMonitoring() {
+        guard monitorsAutomatically, monitoringEnabled != enabled else { return }
+        monitoringEnabled = enabled
+        if enabled {
+            sessions.start()
+            usage.start()
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { [weak self] path in
+                let available = path.status == .satisfied
+                Task { @MainActor in self?.networkChanged(available: available) }
+            }
+            network = monitor
+            monitor.start(queue: DispatchQueue(label: "keeper.network"))
+            ticker = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.recompute(source: "timer") }
+            }
+            if let ticker { RunLoop.main.add(ticker, forMode: .common) }
+        } else {
+            ticker?.invalidate(); ticker = nil
+            network?.cancel(); network = nil; networkAvailable = nil
+            usage.stop()
+            sessions.stop()
+            execution.cancelCurrent()
+        }
     }
 
     var availableTasks: [BlockedSession] { choices.available(blockedSessions).filter { !execution.hasAttempted($0, accountID: displayAccountID) } }
@@ -162,11 +182,14 @@ import Network
         recompute()
     }
     func refresh(manual: Bool = false, source: String = "manual") {
+        guard enabled else { return }
         if manual, runtimeReadFailed { try? restoreRuntime() }
         usage.refresh(manual: manual, source: source); sessions.refresh(); recompute(source: source)
     }
 
     func environmentChanged(source: String = "environment") {
+        synchronizeMonitoring()
+        guard enabled else { recompute(allowExecution: false, source: source); return }
         environmentDay = Calendar.current.startOfDay(for: now())
         environmentTimeZone = Calendar.current.timeZone.identifier
         previousUsage = nil
@@ -179,6 +202,7 @@ import Network
     }
 
     func networkChanged(available: Bool) {
+        guard enabled else { return }
         guard networkAvailable == available else {
             networkAvailable = available
             environmentChanged(source: "network")
@@ -206,6 +230,7 @@ import Network
     }
 
     private func requestAutomaticRefresh(source: String, occurredAt: Date? = nil) {
+        guard enabled else { return }
         if let occurredAt, let started = usage.lastRefreshStartedAt, occurredAt <= started { return }
         usage.setPolling(UsagePollingPolicy(interval: UsagePollingPolicy.activeInterval, wakeAt: nil),
             retryOpportunity: defaults.bool(forKey: "enabled") ? schedule.retryOpportunity(at: now()) : nil)
@@ -317,6 +342,7 @@ import Network
     }
 
     func recompute(allowExecution: Bool = true, source: String = "state") {
+        synchronizeMonitoring()
         let now = now()
         defer {
             if diagnoseScheduling {
@@ -329,6 +355,7 @@ import Network
                     "usage_failed": usage.lastError != nil, "usage_refreshing": usage.refreshing,
                     "critical_refresh": usage.criticalRefreshPending,
                     "scanned": sessions.hasScanned, "scan_failed": sessions.detectionError != nil,
+                    "scan_failures": sessions.scanFailures.map(\.logValue),
                     "scan_recent": sessions.scannedAt.map { (-5...60).contains(now.timeIntervalSince($0)) } ?? false,
                     "blocked": blockedSessions.count, "selected": selectedTasks.count,
                     "executing": execution.running, "protected": execution.busyThreadIDs.count,
@@ -378,10 +405,11 @@ import Network
             return target
         }
         blockedSessions = (detected + confirmed.values.filter { c in !detected.contains { $0.id == c.id } }).sorted { $0.blockedAt > $1.blockedAt }
-        for target in blockedSessions where now.timeIntervalSince(target.blockedAt) < 30 {
+        for target in blockedSessions where enabled && now.timeIntervalSince(target.blockedAt) < 30 {
             let key = target.episodeKey
             if workspaceAtBlock[key] == nil, workspaceCapturing.insert(key).inserted {
                 Task {
+                    guard enabled else { workspaceCapturing.remove(key); return }
                     let fingerprint = await Task.detached { WorkspaceGuard.fingerprint(cwd: target.cwd) }.value
                     workspaceAtBlock[key] = fingerprint
                 }
