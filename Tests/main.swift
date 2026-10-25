@@ -12,6 +12,12 @@ import Darwin
             if !value { failed += 1; print("FAIL: \(name)") }
             else if CommandLine.arguments.contains("--verbose") { print("PASS: \(name)") }
         }
+        if CommandLine.arguments.contains("--timeline-resume-only") {
+            checkTimelineResumeHistory(check)
+            print("\(count - failed)/\(count) timeline resume checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
         if CommandLine.arguments.contains("--menu-disabled-only") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-menu-disabled-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }
@@ -53,6 +59,7 @@ import Darwin
         }
         let appUpdateOnly = CommandLine.arguments.contains("--app-update-only")
         if !appUpdateOnly {
+            checkTimelineResumeHistory(check)
             try await checkKeepAliveSimplification(check)
             try await checkLogicRepairRegression(check)
             if CommandLine.arguments.contains("--logic-repair-only") {
@@ -3518,7 +3525,7 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     let confirmedResetAction = completed(.resume, earlyStart)
     var confirmedReading = afterReset; confirmedReading.capturedAt = earlyStart.addingTimeInterval(40)
     check(render(&actionAtReset, confirmedReading, at: confirmedReading.capturedAt, confirmations: [confirmedResetAction])
-        .timeline.contains { $0.date == earlyStart && $0.kind == .completedResume && $0.label == "已继续" },
+        .timeline.contains { $0.date == earlyStart && $0.kind == .completedResume && $0.label == "已续跑" },
         "a real matching Keeper operation retains its continued fact at a reset boundary")
 
     let now = at(19)

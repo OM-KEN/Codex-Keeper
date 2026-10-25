@@ -383,23 +383,20 @@ private struct MenuTimelineView: View {
     var body: some View {
         HStack(alignment: .timelineSymbol, spacing: 6) {
             ForEach(Array(points.enumerated()), id: \.offset) { index, point in
-                VStack(spacing: 5) {
-                    Text(point.timeLabel).font(.system(size: 12, weight: .medium)).monospacedDigit()
-                        .foregroundStyle(point.isHistory && hoveredDate == point.date ? Color.accentColor : Color.primary)
-                        .lineLimit(1).minimumScaleFactor(0.75)
-                    Image(systemName: point.symbol).font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(point.isAction ? Color.accentColor : Color.secondary)
-                        .frame(width: 16, height: 16)
-                        .alignmentGuide(.timelineSymbol) { $0[VerticalAlignment.center] }
-                    Text(L10n.text(point.label)).font(.system(size: 10)).foregroundStyle(point.isHistory && hoveredDate == point.date ? Color.accentColor : Color.secondary)
+                Group {
+                    if point.isHistory {
+                        Button { hoveredDate = nil; openHistory(point) } label: { node(point) }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("\(point.day) \(point.time) \(L10n.text(point.label))")
+                    } else {
+                        node(point)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("\(point.day) \(point.time) \(L10n.text(point.label))")
+                    }
                 }
-                .contentShape(Rectangle())
-                .onTapGesture { if point.isHistory { hoveredDate = nil; openHistory(point) } }
                 .onHover { hoveredDate = $0 && point.isHistory ? point.date : nil }
                 .layoutPriority(1)
-                .help(L10n.text(point.kind == .keepAlive || point.kind == .scheduled ? "计划节点；已有有效额度窗口时跳过" : point.label))
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(point.day) \(point.time) \(L10n.text(point.label))")
+                .help(L10n.text(point.isHistory ? "点击查看详情" : point.kind == .keepAlive || point.kind == .scheduled ? "计划节点；已有有效额度窗口时跳过" : point.label))
                 if index + 1 < points.count {
                     GeometryReader { geometry in
                         Path { path in
@@ -412,5 +409,19 @@ private struct MenuTimelineView: View {
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
         .onDisappear { hoveredDate = nil }
+    }
+
+    private func node(_ point: MenuTimelinePoint) -> some View {
+        VStack(spacing: 5) {
+            Text(point.timeLabel).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                .foregroundStyle(point.isHistory && hoveredDate == point.date ? Color.accentColor : Color.primary)
+                .lineLimit(1).minimumScaleFactor(0.75)
+            Image(systemName: point.symbol).font(.system(size: 13, weight: .medium))
+                .foregroundStyle(point.isAction ? Color.accentColor : Color.secondary)
+                .frame(width: 16, height: 16)
+                .alignmentGuide(.timelineSymbol) { $0[VerticalAlignment.center] }
+            Text(L10n.text(point.label)).font(.system(size: 10))
+                .foregroundStyle(point.isHistory && hoveredDate == point.date ? Color.accentColor : Color.secondary)
+        }.contentShape(Rectangle())
     }
 }

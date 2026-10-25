@@ -164,6 +164,15 @@ private func checkConcurrentPassiveIndexUpdates(_ check: (Bool, String) -> Void,
     clock.advance(); try fixture.append(file, at: clock.value, used: 39, reset: live.fiveHour!.resetsAt); observer.rescanPassive()
     try await passiveSettle { observer.displaySnapshot?.capturedAt == clock.value }
     check(provider.reads == 1, "same percentage with a new event time still makes no quota RPC")
+    for used: Double in [38, 41, 40] {
+        clock.advance(); try fixture.append(file, at: clock.value, used: used,
+            reset: live.fiveHour!.resetsAt.addingTimeInterval(used == 38 ? 0.1 : 0),
+            weeklyReset: live.weekly!.resetsAt)
+        observer.rescanPassive()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        check(observer.displaySnapshot?.fiveHour?.usedPercent == (used == 38 ? 39 : 41) && provider.reads == 1,
+            "a later cached ordinary reading cannot roll back same-window usage or add an RPC: \(used)")
+    }
     clock.advance(); live.capturedAt = clock.value; live.fiveHour?.usedPercent = 100; provider.set(live)
     try fixture.append(file, at: clock.value, used: 100, reset: live.fiveHour!.resetsAt); observer.rescanPassive()
     try await passiveSettle { provider.reads == 2 && !observer.refreshing }
@@ -196,6 +205,10 @@ private func checkConcurrentPassiveIndexUpdates(_ check: (Bool, String) -> Void,
         "only the newly verified account returns to the display after authentication settles")
     observer.refresh(manual: true); try await passiveSettle { !observer.refreshing }
     check(provider.reads == 7 && provider.manualReads == 1, "manual refresh still invokes the user-refresh provider path")
+    clock.advance(); live.capturedAt = clock.value; live.fiveHour?.usedPercent = 39; provider.set(live)
+    observer.refresh(); try await passiveSettle { !observer.refreshing }
+    check(observer.displaySnapshot?.fiveHour?.usedPercent == 39,
+        "an explicit new online reading remains authoritative even when it corrects usage downward")
     observer.stop()
 }
 
@@ -311,6 +324,25 @@ private func checkConcurrentPassiveIndexUpdates(_ check: (Bool, String) -> Void,
     clock.advance(); try fixture.append(file, at: clock.value, used: 46)
     try await passiveSettle { seen.last?.snapshot.fiveHour?.usedPercent == 46 }
     check(seen.last?.snapshot.capturedAt == clock.value, "native file events incrementally deliver an append without online reads")
+    let writer = try FileHandle(forWritingTo: file)
+    defer { try? writer.close() }
+    try writer.seekToEnd()
+    for used: Double in [47, 48, 49] {
+        clock.advance()
+        try writer.write(contentsOf: fixture.quota(at: clock.value, used: used))
+        try await passiveSettle { seen.last?.snapshot.fiveHour?.usedPercent == used }
+        check(seen.last?.snapshot.fiveHour?.usedPercent == used,
+            "an open persistent writer delivers quota before closing its descriptor: \(used)")
+    }
+    clock.advance()
+    let replaced = file.appendingPathExtension("old")
+    try FileManager.default.moveItem(at: file, to: replaced)
+    try fixture.write(file, thread: id, at: clock.value, used: 50)
+    try await passiveSettle { seen.last?.snapshot.fiveHour?.usedPercent == 50 }
+    clock.advance(); try fixture.append(file, at: clock.value, used: 51)
+    try await passiveSettle { seen.last?.snapshot.fiveHour?.usedPercent == 51 }
+    check(seen.last?.snapshot.fiveHour?.usedPercent == 51,
+        "vnode monitoring follows replacement at the registered path and retires the old inode")
 }
 
 private final class PassiveUsageClock: @unchecked Sendable {

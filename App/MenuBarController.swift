@@ -203,7 +203,10 @@ import UserNotifications
         statusItem.button?.setAccessibilityLabel(statusDescription)
         let view = MenuSummaryView(summary: summary,
             openTasks: { [weak self] in self?.menu.cancelTracking(); self?.openTasks() },
-            openHistory: { [weak self] point in self?.menu.cancelTracking(); self?.openTasks(history: point) },
+            openHistory: { [weak self] point in
+                self?.menu.cancelTracking()
+                DispatchQueue.main.async { [weak self] in self?.openTasks(history: point) }
+            },
             showError: { [weak self] in self?.menu.cancelTracking(); self?.showExecutionIssue() },
             refresh: { [weak self] in self?.refreshUsage() })
         let host: NSHostingView<MenuSummaryView>
@@ -370,10 +373,10 @@ import UserNotifications
     }
     @objc private func openTasks() { openTasks(history: nil) }
     private func openTasks(history: MenuTimelinePoint?) {
-        if let result = history?.pingResult {
+        if let history, history.kind == .pingRecord || history.kind == .completedKeepAlive {
             let alert = NSAlert()
             alert.messageText = L10n.text("保活记录")
-            alert.informativeText = result.message
+            alert.informativeText = history.timeLabel + "\n" + (history.pingResult?.message ?? L10n.text(history.label))
             alert.addButton(withTitle: L10n.text("好"))
             NSApp.activate(ignoringOtherApps: true); alert.runModal()
             return
@@ -391,7 +394,8 @@ import UserNotifications
         }
         NSApp.activate(ignoringOtherApps: true)
         tasksWindow?.contentView = NSHostingView(rootView: ResumeTasksView(state: appState,
-            historyIDs: history?.operationIDs, historyAccountID: appState.displayAccountID, historyLabel: history.map { $0.timeLabel + " · " + L10n.text($0.label) }))
+            historyIDs: history?.operationIDs, historyAccountID: appState.displayAccountID,
+            historyLabel: history.map { $0.timeLabel + " · " + L10n.text($0.label) }, historyDetail: history?.pingResult?.message))
         if let progress = tasksWindow?.titlebarAccessoryViewControllers.first {
             progress.view = NSHostingView(rootView: ResumeTasksProgressView(state: appState, historyIDs: history?.operationIDs))
             progress.view.setFrameSize(NSSize(width: 140, height: 28))

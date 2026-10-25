@@ -6,6 +6,7 @@ struct ResumeTasksView: View {
     var historyIDs: Set<String>? = nil
     var historyAccountID: String? = nil
     var historyLabel: String? = nil
+    var historyDetail: String? = nil
     @State private var presentedIDs = Set<String>()
     @State private var ignoring: BlockedSession?
     @State private var error: String?
@@ -36,6 +37,9 @@ struct ResumeTasksView: View {
             VStack(alignment: .leading, spacing: 12) {
                 if let historyLabel, historyAccountID == state.displayAccountID {
                     Text(historyLabel).font(.system(size: 14, weight: .semibold))
+                    if let historyDetail {
+                        Text(historyDetail).font(.system(size: 13)).foregroundStyle(.secondary)
+                    }
                 }
                 if historyIDs == nil, let failure = state.pendingStateFailure ?? state.sessions.detectionError ?? state.execution.recordingFailure {
                     Label(failure, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.system(size: 13))

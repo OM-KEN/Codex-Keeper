@@ -1,6 +1,129 @@
 import Foundation
 import SQLite3
 
+func checkTimelineResumeHistory(_ check: (Bool, String) -> Void) {
+    let calendar = Calendar.current
+    let today = calendar.startOfDay(for: Date())
+    func at(_ hour: Int, _ minute: Int = 0, _ second: Double = 0) -> Date {
+        calendar.date(byAdding: .minute, value: hour * 60 + minute, to: today)!.addingTimeInterval(second)
+    }
+    let account = "timeline-resume-account"
+    let now = at(14)
+    let target = BlockedSession(id: "timeline-resume-task", project: "Test", cwd: "/unused",
+        blockedAt: at(7), fiveHourResetAt: nil, weeklyResetAt: nil, fileURL: URL(fileURLWithPath: "/unused/rollout.jsonl"))
+    let operation = ResumeOperation(id: "confirmed-resume", batchID: "confirmed-batch", accountID: account, target: target,
+        actionAt: at(8, 0, 13.829533), phase: .continued, respondedAt: at(8, 0, 28.962), endedAt: at(8, 7, 59), protectsThread: false)
+    let confirmation = ExecutionConfirmation(kind: .resume, actionAt: operation.actionAt, confirmedAt: operation.respondedAt!,
+        windowStart: nil, accountID: account, operationID: operation.id)
+    let skipped = PingNodeResult(node: at(8), accountID: account, at: at(8, 10, 2), outcome: .skipped)
+    let sentPing = PingNodeResult(node: at(13), accountID: account, at: at(13, 0, 30), outcome: .windowActive)
+    func initial() -> MenuSummary {
+        MenuSummary(timeline: [
+            MenuTimelinePoint(date: at(8), time: "08:00", day: "", label: "窗口开始", kind: .keepAliveNotNeeded, solidBefore: false),
+            MenuTimelinePoint(date: at(13), time: "13:00", day: "", label: "已保活", kind: .completedKeepAlive, solidBefore: false),
+            MenuTimelinePoint(date: at(13, 34), time: "13:34", day: "", label: "已重置", kind: .reset, solidBefore: true),
+            MenuTimelinePoint(date: at(18), time: "18:00", day: "", label: "保活", kind: .keepAlive, solidBefore: false)
+        ])
+    }
+    func history(_ operations: [ResumeOperation], confirmations: [ExecutionConfirmation] = [confirmation]) -> MenuSummary {
+        var summary = initial()
+        summary.applyPingHistory([skipped, sentPing], accountID: account, now: now)
+        summary.applyResumeHistory(operations, accountID: account, confirmations: confirmations, now: now)
+        return summary
+    }
+    var summary = history([operation])
+    check(summary.timeline.first?.kind == .completedResume && summary.timeline.first?.label == "已续跑" &&
+        summary.timeline.first?.symbol == "checkmark.circle.fill",
+        "a confirmed resume takes precedence over a skipped same-node keepalive when all four slots are occupied")
+    check(summary.timeline.first?.operationIDs == [operation.id], "the merged resume retains the exact successful operation association")
+    check(summary.timeline.first?.pingResult?.outcome == .skipped,
+        "a merged resume retains the skipped keepalive as an attached fact")
+    check(summary.timeline.map(\.date) == [at(8), at(13), at(13, 34), at(18)] &&
+        summary.timeline[1].pingResult?.outcome == .windowActive && summary.timeline[2].kind == .reset && summary.timeline[3].kind == .keepAlive,
+        "merging resume history preserves the independent sent keepalive, reset, next action and four-node limit")
+    summary.applyResumeHistory([operation], accountID: account, now: now)
+    check(summary.timeline.first?.operationIDs == [operation.id] && summary.timeline.count == 4,
+        "reapplying resume history without confirmations preserves its explicit operation IDs")
+    summary.applyPingHistory([skipped, sentPing], accountID: account, now: now)
+    check(summary.timeline.first?.kind == .completedResume && summary.timeline.first?.operationIDs == [operation.id] && summary.timeline.count == 4,
+        "applying ping history after resume history cannot overwrite the confirmed resume")
+    let peer = ResumeOperation(id: "unsent-batch-peer", batchID: operation.batchID, accountID: account, target: target,
+        actionAt: at(8, 0, 14), phase: .notSubmitted, protectsThread: false)
+    let other = ResumeOperation(id: "other-batch", batchID: "other-batch", accountID: account, target: target,
+        actionAt: at(9), phase: .continued, respondedAt: at(9, 0, 10), protectsThread: false)
+    let batch = history([operation, peer, other])
+    check(batch.timeline.first?.operationIDs == [operation.id, peer.id],
+        "the merged node opens the real batch including its unsent peer and excludes another batch")
+    var respondedPeer = peer; respondedPeer.phase = .continued; respondedPeer.respondedAt = at(8, 0, 30)
+    var repeatedBatch = history([operation, respondedPeer], confirmations: [])
+    repeatedBatch.applyPingHistory([skipped, sentPing], accountID: account, now: now)
+    repeatedBatch.applyResumeHistory([operation, respondedPeer], accountID: account, now: now)
+    check(repeatedBatch.timeline.count == 4 && repeatedBatch.timeline.first?.kind == .completedResume &&
+        repeatedBatch.timeline.first?.operationIDs == [operation.id, peer.id],
+        "multiple responded tasks in one batch merge once and remain idempotent without log confirmations")
+    for invalid in [ResumeOperation(id: operation.id, batchID: operation.batchID, accountID: "other-account", target: target,
+            actionAt: operation.actionAt, phase: .continued, respondedAt: operation.respondedAt, protectsThread: false),
+        ResumeOperation(id: operation.id, batchID: operation.batchID, accountID: nil, target: target,
+            actionAt: operation.actionAt, phase: .continued, respondedAt: operation.respondedAt, protectsThread: false),
+        ResumeOperation(id: operation.id, batchID: operation.batchID, accountID: account, target: target,
+            actionAt: operation.actionAt, phase: .checking, receivedAt: at(8, 0, 20), endedAt: at(8, 7, 59), protectsThread: false),
+        ResumeOperation(id: operation.id, batchID: operation.batchID, accountID: account, target: target,
+            actionAt: operation.actionAt, phase: .continued, respondedAt: now.addingTimeInterval(1), protectsThread: false),
+        ResumeOperation(id: operation.id, batchID: operation.batchID, accountID: account, target: target,
+            actionAt: operation.actionAt, phase: .continued, respondedAt: operation.actionAt.addingTimeInterval(-1), protectsThread: false)] {
+        let unconfirmed = history([invalid])
+        check(unconfirmed.timeline.first?.kind == .pingRecord && unconfirmed.timeline.first?.operationIDs.isEmpty == true,
+            "another account, missing identity or unconfirmed/invalid response cannot upgrade a skipped node: \(invalid.accountID ?? "nil") \(invalid.respondedAt?.description ?? "no response")")
+    }
+    var distant = operation; distant.actionAt = at(8).addingTimeInterval(ScheduleEngine.alignmentTolerance + 1)
+    distant.respondedAt = distant.actionAt.addingTimeInterval(1)
+    check(history([distant], confirmations: []).timeline.first?.kind == .pingRecord,
+        "a resume outside alignment tolerance cannot consume a skipped keepalive node")
+    var aligned = operation; aligned.actionAt = at(8).addingTimeInterval(ScheduleEngine.alignmentTolerance)
+    aligned.respondedAt = aligned.actionAt.addingTimeInterval(1)
+    check(history([aligned], confirmations: []).timeline.first?.kind == .completedResume,
+        "a real response exactly at alignment tolerance still matches its fixed node")
+    var previousDay = operation
+    previousDay.actionAt = calendar.date(byAdding: .day, value: -1, to: operation.actionAt)!
+    previousDay.respondedAt = calendar.date(byAdding: .day, value: -1, to: operation.respondedAt!)!
+    check(history([previousDay], confirmations: []).timeline.first?.kind == .pingRecord,
+        "a previous-day resume cannot upgrade today's skipped keepalive")
+    var midnight = MenuSummary()
+    midnight.applyPingHistory([PingNodeResult(node: today, accountID: account, at: today.addingTimeInterval(60), outcome: .skipped)], accountID: account, now: now)
+    var yesterday = operation; yesterday.actionAt = today.addingTimeInterval(-1); yesterday.respondedAt = today.addingTimeInterval(1)
+    midnight.applyResumeHistory([yesterday], accountID: account, now: now)
+    check(midnight.timeline.count == 1 && midnight.timeline.first?.kind == .pingRecord,
+        "alignment tolerance cannot merge a prior-day action across local midnight")
+    var futureResponse = operation; futureResponse.respondedAt = now.addingTimeInterval(1)
+    var noPlan = MenuSummary()
+    noPlan.applyResumeHistory([futureResponse], accountID: account, now: now)
+    check(!noPlan.timeline.contains { $0.kind == .completedResume },
+        "a future response cannot invent successful history even when a timeline slot is available")
+    var anonymous = MenuSummary()
+    let anonymousOperation = ResumeOperation(id: operation.id, batchID: operation.batchID, accountID: nil, target: target,
+        actionAt: operation.actionAt, phase: .continued, respondedAt: operation.respondedAt, protectsThread: false)
+    anonymous.applyResumeHistory([anonymousOperation], accountID: nil, now: now)
+    check(anonymous.timeline.isEmpty, "missing current and operation account identity cannot claim successful resume history")
+    for outcome: PingOutcome in [.newWindow, .windowActive, .windowPending, .failed, .unknown, .notExecuted, .submitted] {
+        var independent = initial()
+        let ping = PingNodeResult(node: skipped.node, accountID: account, at: skipped.at, outcome: outcome)
+        independent.applyPingHistory([ping], accountID: account, now: now)
+        independent.applyResumeHistory([operation], accountID: account, confirmations: [confirmation], now: now)
+        check(independent.timeline.first?.kind == .pingRecord && independent.timeline.first?.pingResult?.outcome == outcome &&
+            independent.timeline.first?.operationIDs.isEmpty == true,
+            "an independent \(outcome.rawValue) keepalive result cannot be absorbed by a nearby resume")
+    }
+    var reverse = MenuSummary(timeline: [MenuTimelinePoint(date: operation.actionAt, time: "08:00", day: "", label: "已续跑",
+        kind: .completedResume, solidBefore: false, operationIDs: [operation.id])])
+    reverse.applyPingHistory([skipped], accountID: account, now: now)
+    check(reverse.timeline.count == 1 && reverse.timeline.first?.kind == .completedResume && reverse.timeline.first?.pingResult?.outcome == .skipped,
+        "reverse-order skipped history attaches to an already confirmed aligned resume without adding a duplicate")
+    reverse.applyPingHistory([PingNodeResult(node: skipped.node, accountID: account, at: skipped.at, outcome: .windowActive)], accountID: account, now: now)
+    check(reverse.timeline.count == 2 && reverse.timeline.contains { $0.kind == .completedResume && $0.operationIDs == [operation.id] } &&
+        reverse.timeline.contains { $0.kind == .pingRecord && $0.pingResult?.outcome == .windowActive },
+        "a separately sent keepalive remains a separate fact when applied after a confirmed resume")
+}
+
 @MainActor func checkKeepAliveSimplification(_ check: (Bool, String) -> Void) async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-keepalive-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -105,6 +228,7 @@ import SQLite3
         state.usage.stop(); state.sessions.stop(); execution.stopOwnedTasks()
     }
     try await checkKeepAliveFacts(root.appendingPathComponent("facts"), check)
+    try checkPingNoticeLifecycle(check, root: root.appendingPathComponent("notice-lifecycle"))
     try await checkKeepAliveHardGates(root.appendingPathComponent("hard-gates"), check)
     try await checkCurrentAuthenticationDisplay(root.appendingPathComponent("authentication-display"), check)
     try checkKeepAlivePreparation(root.appendingPathComponent("preparation"), check)
@@ -247,6 +371,54 @@ final class PreparationGatePing: PingTransport {
     func cancel() { releasePreparation() }
 }
 
+@MainActor func checkPingNoticeLifecycle(_ check: (Bool, String) -> Void, root: URL) throws {
+    let suite = "keeper.ping-notice." + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.register(defaults: ["enabled": true, "dailyAnchorMinutes": 480])
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let schedule = ScheduleEngine(anchorMinutes: 480)
+    let node = schedule.nodes()[2]
+    let missed = PingNodeResult(node: node, accountID: "notice-account", at: node.addingTimeInterval(601),
+        outcome: .notExecuted, detail: "额度恢复后按计划保活")
+    var clock = node.addingTimeInterval(7200)
+    for (name, account, confirmedAt, suppress) in [
+        ("later-resume", "notice-account", missed.at.addingTimeInterval(3600), true),
+        ("older-resume", "notice-account", missed.at.addingTimeInterval(-60), false),
+        ("other-account", "other-account", missed.at.addingTimeInterval(3600), false),
+        ("future-resume", "notice-account", clock.addingTimeInterval(60), false)
+    ] {
+        let support = root.appendingPathComponent(name)
+        let events = ExecutionEventLog(url: support.appendingPathComponent("execution-events.jsonl"))
+        try events.record("not_executed", kind: "ping", node: node, at: missed.at, pingResult: missed)
+        try events.record("startup_confirmed", kind: "resume", node: nil, accountID: account,
+            operationID: name, at: confirmedAt)
+        let coordinator = ExecutionCoordinator(defaults: defaults, ledgerURL: support.appendingPathComponent("attempts.json"),
+            codexHome: root, now: { clock })
+        check((coordinator.visibleNotice == nil) == suppress,
+            "only a later real same-account response supersedes a missed ping notice: \(name)")
+        check(events.pingResults().contains { $0.node == missed.node && $0.outcome == .notExecuted },
+            "superseding a current notice preserves the missed opportunity in history: \(name)")
+    }
+    let support = root.appendingPathComponent("skipped")
+    let events = ExecutionEventLog(url: support.appendingPathComponent("execution-events.jsonl"))
+    try events.record("not_executed", kind: "ping", node: node, at: missed.at, pingResult: missed)
+    let coordinator = ExecutionCoordinator(defaults: defaults, ledgerURL: support.appendingPathComponent("attempts.json"),
+        codexHome: root, now: { clock })
+    check(coordinator.visibleNotice != nil, "an unresolved missed opportunity initially retains its notice")
+    clock = schedule.nodes()[3].addingTimeInterval(10)
+    let active = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 26, windowMinutes: 300, resetsAt: clock.addingTimeInterval(5400)),
+        weekly: nil, capturedAt: clock, accountID: "notice-account", sourceFile: "app-server")
+    coordinator.observeKeepAlive(schedule: schedule, accountID: active.accountID, usage: active, reason: nil)
+    clock = clock.addingTimeInterval(601)
+    coordinator.observeKeepAlive(schedule: schedule, accountID: active.accountID, usage: nil, reason: nil)
+    check(coordinator.lastPingResult?.outcome == .skipped && coordinator.lastFailure == nil &&
+        coordinator.visibleNotice == nil && coordinator.visibleFailure == nil,
+        "a normal skipped opportunity clears the previous notice before any menu acknowledgement")
+    coordinator.acknowledgePingResult()
+    check(coordinator.visibleNotice == nil && events.pingResults().contains { $0.outcome == .notExecuted },
+        "closing the menu cannot revive an old notice and never deletes its history")
+}
+
 @MainActor private func checkKeepAliveFacts(_ root: URL, _ check: (Bool, String) -> Void) async throws {
     try writeKeepAliveAuthentication(home: root, account: "facts-account")
     let suite = "keeper.keepalive-facts." + UUID().uuidString
@@ -315,6 +487,19 @@ final class PreparationGatePing: PingTransport {
     menu.applyPingHistory([fact], accountID: "facts-account", now: after.capturedAt)
     check(menu.timeline.first?.pingResult?.outcome == .windowActive && menu.timeline.first?.label == fact.historyLabel,
         "menu history uses the same canonical result fact as execution events and notification text")
+    for outcome: PingOutcome in [.newWindow, .windowActive, .windowPending, .skipped] {
+        let result = PingNodeResult(node: fact.node, accountID: fact.accountID, at: fact.at, outcome: outcome)
+        var history = MenuSummary()
+        history.applyPingHistory([result], accountID: fact.accountID, now: fact.at)
+        check(history.timeline.first?.label == "已保活" && history.timeline.first?.isHistory == true &&
+            history.timeline.first?.pingResult?.message == result.message && result.message != L10n.text("已保活"),
+            "keepalive history has a compact label and retains the distinct \(outcome.rawValue) result for details")
+    }
+    for outcome: PingOutcome in [.submitted, .failed, .unknown, .notExecuted] {
+        let result = PingNodeResult(node: fact.node, accountID: fact.accountID, at: fact.at, outcome: outcome)
+        check(result.historyLabel != "已保活" && !result.succeeded,
+            "unconfirmed or unsuccessful \(outcome.rawValue) keeps its actual status")
+    }
     let future = schedule.nodes()[3]
     menu.timeline = [MenuTimelinePoint(date: schedule.nodes()[0], time: "08:00", day: "", label: "已保活", kind: .completedKeepAlive, solidBefore: false),
         MenuTimelinePoint(date: schedule.nodes()[1], time: "13:00", day: "", label: "已保活", kind: .completedKeepAlive, solidBefore: false),

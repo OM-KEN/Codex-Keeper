@@ -255,7 +255,7 @@ extension MenuSummary {
                     // Only a confirmed operation matching this real window can claim completion.
                     let confirmed = confirmation(for: start)
                     if let confirmed {
-                        result.timeline.append(point(start, confirmed.kind == .resume ? "已继续" : "已保活",
+                        result.timeline.append(point(start, confirmed.kind == .resume ? "已续跑" : "已保活",
                             confirmed.kind == .resume ? .completedResume : .completedKeepAlive))
                     } else { result.timeline.append(observedWindow(five)) }
                     if abs(actionDate.timeIntervalSince(five.resetsAt)) < ScheduleEngine.alignmentTolerance {
@@ -287,7 +287,7 @@ extension MenuSummary {
                           confirmation.actionAt <= confirmation.confirmedAt, date <= confirmation.confirmedAt,
                           date >= historyStart, date < first else { return nil }
                     return point(date,
-                        confirmation.kind == .resume ? "已继续" : "已保活",
+                        confirmation.kind == .resume ? "已续跑" : "已保活",
                         confirmation.kind == .resume ? .completedResume : .completedKeepAlive)
                 }
                 let observed = observedWindows.map(observedWindow) + observedResets.map { point($0, "已重置", .reset) }
@@ -580,10 +580,20 @@ extension MenuSummary {
         let calendar = Calendar.current
         let clock = DateFormatter(); clock.dateFormat = "HH:mm"
         for result in results.sorted(by: { $0.node > $1.node }) where result.accountID == accountID && calendar.isDate(result.node, inSameDayAs: now) && result.at <= now {
+            if result.outcome == .skipped, let accountID, !accountID.isEmpty,
+               let index = timeline.firstIndex(where: {
+                   $0.kind == .completedResume && calendar.isDate($0.date, inSameDayAs: result.node) &&
+                   abs($0.date.timeIntervalSince(result.node)) <= ScheduleEngine.alignmentTolerance &&
+                   ($0.pingResult == nil || ($0.pingResult?.outcome == .skipped && $0.pingResult?.accountID == accountID))
+               }) {
+                timeline[index].pingResult = result
+                continue
+            }
             let point = MenuTimelinePoint(date: result.node, time: clock.string(from: result.node), day: "", label: result.historyLabel,
                 kind: .pingRecord, solidBefore: false, pingResult: result)
             let matches = timeline.indices.filter { index in
                 let existing = timeline[index]
+                guard existing.kind != .completedResume else { return false }
                 return existing.pingResult?.node == result.node ||
                     (existing.kind == .completedKeepAlive && existing.date >= result.node && existing.date <= result.node.addingTimeInterval(ScheduleEngine.keepAliveTolerance + 180)) ||
                     ([.start, .keepAliveNotNeeded].contains(existing.kind) && abs(existing.date.timeIntervalSince(result.node)) <= ScheduleEngine.alignmentTolerance) ||
@@ -647,21 +657,43 @@ extension MenuSummary {
     }
 
     mutating func applyResumeHistory(_ operations: [ResumeOperation], accountID: String?, confirmations: [ExecutionConfirmation] = [], now: Date = Date()) {
+        guard let accountID, !accountID.isEmpty else { return }
+        let calendar = Calendar.current
         let visible = operations.filter { $0.accountID == accountID }
+        let confirmed = visible.filter { operation in
+            operation.respondedAt.map { operation.actionAt <= $0 && $0 <= now } == true
+        }
+        let confirmedIDs = Set(confirmed.map(\.id))
+        let validConfirmations = confirmations.filter { $0.kind == .resume && $0.accountID == accountID &&
+            $0.actionAt <= $0.confirmedAt && ($0.windowStart ?? $0.actionAt) <= $0.confirmedAt && $0.confirmedAt <= now
+        }
         for index in timeline.indices where timeline[index].isHistory {
-            guard timeline[index].kind != .completedKeepAlive && timeline[index].kind != .pingRecord else { timeline[index].operationIDs = []; continue }
-            let date = timeline[index].date
-            let ids = Set(confirmations.filter { $0.kind == .resume && $0.accountID == accountID &&
-                abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(date)) <= ScheduleEngine.alignmentTolerance
-            }.compactMap(\.operationID))
+            let point = timeline[index]
+            guard point.kind != .completedKeepAlive else { timeline[index].operationIDs = []; continue }
+            var ids = point.operationIDs
+            if point.kind == .pingRecord {
+                guard let ping = point.pingResult, ping.outcome == .skipped, ping.accountID == accountID,
+                      calendar.isDate(ping.node, inSameDayAs: now) else { timeline[index].operationIDs = []; continue }
+                let matching = confirmed.filter { calendar.isDate($0.actionAt, inSameDayAs: ping.node) &&
+                    abs($0.actionAt.timeIntervalSince(ping.node)) <= ScheduleEngine.alignmentTolerance
+                }
+                guard !matching.isEmpty else { timeline[index].operationIDs = []; continue }
+                ids.formUnion(matching.map(\.id))
+                timeline[index] = MenuTimelinePoint(date: point.date, time: point.time, day: point.day,
+                    label: "已续跑", kind: .completedResume, solidBefore: point.solidBefore, pingResult: ping)
+            } else {
+                ids.formUnion(validConfirmations.filter {
+                    abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(point.date)) <= ScheduleEngine.alignmentTolerance
+                }.compactMap(\.operationID))
+            }
             let batches = Set(visible.filter { ids.contains($0.id) }.map(\.batchID))
             timeline[index].operationIDs = Set(visible.filter { ids.contains($0.id) || batches.contains($0.batchID) }.map(\.id))
         }
         let clock = DateFormatter(); clock.dateFormat = "HH:mm"
-        let today = Calendar.current.startOfDay(for: now)
+        let today = calendar.startOfDay(for: now)
         let represented = Set(timeline.flatMap(\.operationIDs))
         let missing = visible.filter { operation in
-            !represented.contains(operation.id) && operation.actionAt >= today && operation.actionAt <= now && (operation.respondedAt != nil ||
+            !represented.contains(operation.id) && operation.actionAt >= today && operation.actionAt <= now && (confirmedIDs.contains(operation.id) ||
                 (operation.receivedAt != nil && operation.endedAt != nil) || (operation.phase == .checking && !operation.protectsThread))
         }.sorted { $0.actionAt > $1.actionAt }.prefix(2)
         for operation in missing {
@@ -669,7 +701,7 @@ extension MenuSummary {
             guard !timeline.contains(where: { $0.operationIDs.contains(operation.id) }) else { continue }
             timeline.append(MenuTimelinePoint(date: operation.actionAt, time: clock.string(from: operation.actionAt),
                 day: "",
-                label: operation.respondedAt == nil ? "续跑记录" : "已继续", kind: operation.respondedAt == nil ? .resumeRecord : .completedResume,
+                label: confirmedIDs.contains(operation.id) ? "已续跑" : "续跑记录", kind: confirmedIDs.contains(operation.id) ? .completedResume : .resumeRecord,
                 solidBefore: false, operationIDs: Set(visible.filter { $0.batchID == operation.batchID }.map(\.id))))
         }
         timeline.sort { $0.date < $1.date }

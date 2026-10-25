@@ -37,6 +37,14 @@ final class RolloutUsageReader {
     private(set) var authenticationChanged = false
     private(set) var needsRegistrationRetry = false
 
+    var watchedPaths: [String] {
+        var paths = Array(recent.prefix(24))
+        for (path, _) in cursors.sorted(by: { $0.value.lastRead > $1.value.lastRead }) where !paths.contains(path) {
+            paths.append(path)
+        }
+        return Array(paths.filter { current[$0] != nil }.prefix(64))
+    }
+
     init(home: URL, now: @escaping () -> Date = Date.init) {
         originalHomePath = home.standardizedFileURL.path
         self.home = home.resolvingSymlinksInPath().standardizedFileURL; self.now = now
@@ -238,6 +246,7 @@ final class RolloutUsageMonitor {
     private var stream: FSEventStreamRef?
     private var running = false
     private var retry: DispatchWorkItem?
+    private var fileWatches: [String: (source: DispatchSourceFileSystemObject, inode: UInt64)] = [:]
 
     init(home: URL, now: @escaping () -> Date = Date.init, receive: @escaping ([PassiveUsageReading], Bool) -> Void) {
         self.home = home.resolvingSymlinksInPath().standardizedFileURL
@@ -276,6 +285,8 @@ final class RolloutUsageMonitor {
     func stop() {
         let close = { [self] in
             running = false; retry?.cancel(); retry = nil
+            for watch in fileWatches.values { watch.source.cancel() }
+            fileWatches.removeAll()
             if let stream { FSEventStreamStop(stream); FSEventStreamInvalidate(stream); FSEventStreamRelease(stream) }
             stream = nil
         }
@@ -283,12 +294,46 @@ final class RolloutUsageMonitor {
     }
     private func scan(paths: [String] = [], retryRegistration: Bool = true) {
         guard running else { return }
-        let readings = reader.read(changedPaths: paths)
-        if !readings.isEmpty || reader.authenticationChanged { receive(readings, reader.authenticationChanged) }
+        var readings = reader.read(changedPaths: paths)
+        var authenticationChanged = reader.authenticationChanged
+        let added = updateFileWatches()
+        if !added.isEmpty {
+            // Cover writes between the initial tail read and arming the vnode source.
+            readings += reader.read(changedPaths: added)
+            authenticationChanged = authenticationChanged || reader.authenticationChanged
+        }
+        if !readings.isEmpty || authenticationChanged { receive(readings, authenticationChanged) }
         if retryRegistration, reader.needsRegistrationRetry {
             retry?.cancel()
             let retry = DispatchWorkItem { [weak self] in self?.scan(retryRegistration: false) }
             self.retry = retry; queue.asyncAfter(deadline: .now() + 1, execute: retry)
         }
+    }
+
+    private func updateFileWatches() -> [String] {
+        let paths = Set(reader.watchedPaths)
+        for (path, watch) in fileWatches {
+            var info = stat()
+            if !paths.contains(path) || fstatat(AT_FDCWD, path, &info, 0) != 0 || UInt64(info.st_ino) != watch.inode {
+                watch.source.cancel(); fileWatches.removeValue(forKey: path)
+            }
+        }
+        var added: [String] = []
+        for path in paths where fileWatches[path] == nil {
+            let descriptor = Darwin.open(path, O_EVTONLY | O_CLOEXEC)
+            guard descriptor >= 0 else { continue }
+            var info = stat()
+            guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+                Darwin.close(descriptor); continue
+            }
+            // FSEvents may wait until a persistent writer closes the rollout.
+            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor,
+                eventMask: [.write, .extend, .rename, .delete, .revoke], queue: queue)
+            source.setEventHandler { [weak self] in self?.scan(paths: [path]) }
+            source.setCancelHandler { Darwin.close(descriptor) }
+            fileWatches[path] = (source, UInt64(info.st_ino))
+            source.resume(); added.append(path)
+        }
+        return added
     }
 }

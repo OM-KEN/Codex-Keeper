@@ -8,7 +8,16 @@ import Darwin
     @Published private(set) var lastFailure: String?
     @Published private(set) var lastFailureNeedsAttention = true
     var visibleFailure: String? { lastFailureNeedsAttention ? lastFailure : nil }
-    var visibleNotice: String? { lastFailureNeedsAttention ? nil : lastFailure }
+    var visibleNotice: String? {
+        guard !lastFailureNeedsAttention else { return nil }
+        if let result = lastPingResult, result.outcome == .notExecuted, lastFailure == result.message,
+           let account = result.accountID, !account.isEmpty {
+            let clock = now()
+            if confirmations.contains(where: { $0.accountID == account && $0.actionAt <= $0.confirmedAt &&
+                $0.confirmedAt >= result.at && $0.confirmedAt <= clock }) { return nil }
+        }
+        return lastFailure
+    }
     @Published private(set) var warning: String?
     @Published private(set) var activeMode: NextActionMode?
     @Published private(set) var status = L10n.text("等待计划")
@@ -262,7 +271,7 @@ import Darwin
         pingResults.removeAll { $0.node == result.node && $0.accountID == result.accountID }
         pingResults.append(result); pingResults.sort { $0.at < $1.at }; lastPingResult = result
         status = result.message
-        if result.succeeded || result.acknowledgedAt != nil { lastFailure = nil }
+        if !result.needsAttention { lastFailure = nil }
         else if result.needsAttention {
             lastFailure = result.message; lastFailureNeedsAttention = result.outcome == .failed && (result.preflight?.needsAttention ?? true)
         }

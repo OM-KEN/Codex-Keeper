@@ -35,6 +35,8 @@
 "计划内" = "On Schedule";
 "计划外" = "Off Schedule";
 "已保活" = "Kept Active";
+"已续跑" = "Resumed";
+"点击查看详情" = "Click to view details";
 "已继续" = "Resumed";
 "继续" = "Continue";
 "保活" = "Keep Active";

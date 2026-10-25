@@ -162,6 +162,16 @@ final class UsageObserver: ObservableObject {
             let old = [passiveSnapshot, snapshot].compactMap { $0 }.filter { $0.accountID == next.accountID }
                 .max { $0.capturedAt < $1.capturedAt }
             if let old, old.accountID == next.accountID, old.capturedAt > next.capturedAt || (old.capturedAt == next.capturedAt && old == next) { continue }
+            if let old, !Self.needsOnlineVerification(from: old, to: next),
+               [(old.fiveHour, next.fiveHour), (old.weekly, next.weekly)].contains(where: { before, after in
+                   guard let before, let after else { return false }
+                   return abs(before.resetsAt.timeIntervalSince(after.resetsAt)) <= ScheduleEngine.alignmentTolerance &&
+                       before.windowMinutes == after.windowMinutes &&
+                       after.usedPercent < before.usedPercent
+               }) {
+                // A new token_count timestamp can repeat an older per-thread quota cache.
+                continue
+            }
             passiveSnapshot = next
             if let old, old.accountID == next.accountID,
                [old.fiveHour, old.weekly].compactMap({ $0 }).contains(where: { $0.usedPercent >= 100 }),

@@ -134,13 +134,10 @@ struct PingNodeResult: Codable {
     var historyLabel: String {
         switch outcome {
         case .submitted: return "正在确认中"
-        case .newWindow: return "新窗口已确认"
-        case .windowActive: return "请求完成，窗口有效"
-        case .windowPending: return "请求完成，窗口待确认"
+        case .newWindow, .windowActive, .windowPending, .skipped: return "已保活"
         case .failed: return "保活失败"
         case .unknown: return "结果待确认"
         case .notExecuted: return "本轮未执行"
-        case .skipped: return "已有有效窗口"
         }
     }
 }
