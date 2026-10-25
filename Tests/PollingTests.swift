@@ -21,9 +21,11 @@ import SQLite3
     check(policy().interval == 300, "reliable idle state reduces only quota polling to five minutes")
     check(policy(at: day.addingTimeInterval(180)).interval == 300 && !live.isFresh(at: day.addingTimeInterval(180)),
         "normal snapshot aging does not undo idle polling or extend execution freshness")
-    for value in [policy(scanned: false), policy(error: "unreadable log"), policy(reliable: false),
-                  policy(running: true), policy(demand: true), policy(executing: true), policy(critical: true)] {
-        check(value.interval == 20, "unknown, active, recovery and verification states retain fast quota polling")
+    for value in [policy(reliable: false), policy(critical: true)] {
+        check(value.interval == 20, "unreliable quota and pending critical verification retain bounded fast retries")
+    }
+    for value in [policy(scanned: false), policy(error: "unreadable log"), policy(running: true), policy(demand: true), policy(executing: true)] {
+        check(value.interval == 300, "local scans, task activity and far recovery demand do not accelerate healthy quota RPCs")
     }
     var unknown = live; unknown.fiveHour?.usedPercent = 0; unknown.zeroUseWindowActive = nil
     check(policy(unknown).interval == 20, "unknown zero-percent window cannot be classified as idle")
@@ -33,8 +35,8 @@ import SQLite3
         schedule.retryOpportunity(at: nodes[1].addingTimeInterval(599))?.node == nodes[1],
         "two-minute preparation does not consume the last two minutes of the bounded retry opportunity")
     var blocked = live; blocked.fiveHour?.usedPercent = 100
-    check(policy(blocked).interval == 300 && policy(blocked, demand: true).interval == 20,
-        "far exhaustion can idle only without any pending recovery demand")
+    check(policy(blocked).interval == 300 && policy(blocked, demand: true).interval == 300,
+        "far exhaustion keeps five-minute quota fallback even with pending recovery demand")
     for weekly in [false, true] {
         var close = live
         if weekly { close.weekly?.resetsAt = day.addingTimeInterval(120) }
@@ -45,9 +47,9 @@ import SQLite3
     check(policy(both).interval == 20 && policy(both, demand: true).interval == 20,
         "an unverified five-hour boundary stays fast even when weekly quota remains blocked")
     let stalePlan = DecisionEngine(schedule: schedule).plan(now: day.addingTimeInterval(180), enabled: true,
-        autoResume: true, earlyRecoveryPolicy: "ask", usage: live, blocked: [], reserveIdleDate: true)
-    check(stalePlan.date == reset && stalePlan.decision == .wait(reason: "等待下一可行计划节点"),
-        "older idle reading preserves conditional next-action date without an executable decision")
+        autoResume: true, earlyRecoveryPolicy: "ask", usage: live, blocked: [])
+    check(stalePlan.date == nodes[1] && stalePlan.decision == .wait(reason: "等待下一可行计划节点"),
+        "an expired idle reading reserves the next fixed node without using its old window to shift it")
 
     let evidenceURL = root.appendingPathComponent("evidence.jsonl")
     func evidenceRow(node: Date, drift: TimeInterval, account: String = "polling-account", version: Int? = 1) -> [String: Any] {
@@ -66,54 +68,22 @@ import SQLite3
     var lines = Data()
     for row in rows { lines.append(try JSONSerialization.data(withJSONObject: row)); lines.append(10) }
     try lines.write(to: evidenceURL)
-    let windows = ExecutionEventLog(url: evidenceURL).keepAliveWindows()
-    check(windows.count == 2, "drift loader rejects legacy and account-mismatched confirmations")
-    var drifted = schedule; drifted.accountID = "polling-account"; drifted.confirmedWindows = windows
-    let effective = nodes[2].addingTimeInterval(616)
-    check(drifted.nextKeepAliveNode(after: nodes[2].addingTimeInterval(-1)) == effective,
-        "confirmed preceding Keeper window reserves the compensated actual node")
-    check(drifted.currentKeepAliveNode(at: effective.addingTimeInterval(-1)) == nil &&
-        drifted.currentKeepAliveNode(at: effective) == nodes[2],
-        "compensated keep-alive never sends early and retains original node identity")
-    check(drifted.currentKeepAliveNode(at: effective.addingTimeInterval(600)) == nodes[2] &&
-        drifted.currentKeepAliveNode(at: effective.addingTimeInterval(601)) == nil,
-        "compensated opportunity keeps a bounded ten-minute confirmation grace")
-    check(drifted.currentNode(at: effective) == nil, "drift compensation does not extend three-minute resume tolerance")
-    check(policy(at: effective.addingTimeInterval(-120), plan: drifted).interval == 20,
-        "compensated boundary independently keeps quota polling fast")
-    check(drifted.retryOpportunity(at: effective.addingTimeInterval(-1)) == nil &&
-        drifted.retryOpportunity(at: effective.addingTimeInterval(599))?.node == nodes[2],
-        "compensated retry budget begins at its effective date and lasts through the final opportunity minutes")
-    var changedAccount = drifted; changedAccount.accountID = "other-account"
-    check(changedAccount.nextKeepAliveNode(after: nodes[2].addingTimeInterval(-1)) == nodes[2],
-        "another account cannot reuse persisted Keeper window evidence")
-    var changedPlan = drifted; changedPlan.confirmedWindows = windows.map {
-        KeepAliveWindowEvidence(accountID: $0.accountID, node: $0.node, windowReset: $0.windowReset,
-            confirmedAt: $0.confirmedAt, anchorMinutes: 481, timeZoneID: $0.timeZoneID)
-    }
-    check(changedPlan.nextKeepAliveNode(after: nodes[2].addingTimeInterval(-1)) == nodes[2],
-        "a changed daily plan cannot reuse otherwise matching node evidence")
-    var changedZone = drifted; changedZone.confirmedWindows = windows.map {
-        KeepAliveWindowEvidence(accountID: $0.accountID, node: $0.node, windowReset: $0.windowReset,
-            confirmedAt: $0.confirmedAt, anchorMinutes: $0.anchorMinutes, timeZoneID: "different-zone")
-    }
-    check(changedZone.nextKeepAliveNode(after: nodes[2].addingTimeInterval(-1)) == nodes[2],
-        "timezone provenance is required for drift compensation")
-    var excessive = drifted; excessive.confirmedWindows = [KeepAliveWindowEvidence(accountID: "polling-account",
-        node: nodes[1], windowReset: nodes[2].addingTimeInterval(1201), confirmedAt: nodes[1].addingTimeInterval(1210),
-        anchorMinutes: 480, timeZoneID: calendar.timeZone.identifier)]
-    check(excessive.nextKeepAliveNode(after: nodes[2].addingTimeInterval(-1)) == nodes[2],
-        "drift beyond twenty minutes does not create an unlimited late opportunity")
-    let tomorrow = calendar.date(byAdding: .day, value: 1, to: day)!
-    let nextAnchor = schedule.nodes(on: tomorrow)[0]
-    check(drifted.nextKeepAliveNode(after: nextAnchor.addingTimeInterval(-1)) == nextAnchor,
-        "next daily anchor discards the previous day's drift")
-    let reloaded = ExecutionEventLog(url: evidenceURL).keepAliveWindows()
-    drifted.confirmedWindows = reloaded
-    check(drifted.currentKeepAliveNode(at: effective) == nodes[2], "restarting from persisted evidence restores the same compensated opportunity")
-    var ordinary = live; ordinary.capturedAt = effective; ordinary.fiveHour?.resetsAt = effective.addingTimeInterval(18000)
-    check(schedule.currentKeepAliveNode(at: effective) == nil,
-        "ordinary user windows do not create schedule compensation")
+    let legacy = ExecutionEventLog(url: evidenceURL).confirmations()
+    check(legacy.count == rows.count, "old successful window records remain readable as history")
+    check(schedule.nextKeepAliveNode(after: nodes[2].addingTimeInterval(-1)) == nodes[2] &&
+        schedule.currentKeepAliveNode(at: nodes[2].addingTimeInterval(600)) == nodes[2] &&
+        schedule.currentKeepAliveNode(at: nodes[2].addingTimeInterval(601)) == nil,
+        "legacy window provenance cannot move fixed nodes or their ten-minute opportunity")
+    let historySuite = "keeper.fixed-history." + UUID().uuidString
+    let preferences = UserDefaults(suiteName: historySuite)!
+    defer { preferences.removePersistentDomain(forName: historySuite) }
+    let historyRoot = root.appendingPathComponent("history-restart")
+    try FileManager.default.createDirectory(at: historyRoot, withIntermediateDirectories: true)
+    try lines.write(to: historyRoot.appendingPathComponent("execution-events.jsonl"))
+    let restored = ExecutionCoordinator(provider: RecoveryTestUsage(snapshot: live), defaults: preferences,
+        ledgerURL: historyRoot.appendingPathComponent("resume-attempts.json"), codexHome: root)
+    check(restored.confirmations.count == rows.count && schedule.nextKeepAliveNode(after: nodes[2].addingTimeInterval(-1)) == nodes[2],
+        "restart loads old successes without reconnecting window evidence to scheduling")
 
     for (step, short, expected) in [(20, false, 5), (20, true, 15), (1, true, 20)] {
         var uptime: TimeInterval = 0
@@ -175,7 +145,7 @@ import SQLite3
         check(transport.quotaCalls == 4, "successful model discovery does not reset quota failure backoff debt")
         check((try? provider.pingModel()) != nil && transport.models == 1, "bounded model cache bridges a failed quota preflight without extra RPCs")
         uptime = 341; _ = try? provider.pingModel()
-        check(transport.models == 2, "model permission discovery is repeated after its five-minute cache expires")
+        check(transport.models == 1, "unchanged model capability survives five-minute metadata checks without another online discovery")
     }
     for error in [CodexConnectionError.timeout, .ended, .invalidResponse, .server("HTTP/1.1 401 Unauthorized"),
                   .server("request timed out"), .server("workspace routing discovery timeout")] {
@@ -214,7 +184,7 @@ import SQLite3
     var observation = live; observation.capturedAt = clock; observation.fiveHour?.resetsAt = clock.addingTimeInterval(18000)
     let queuedProvider = PollingFixtureUsage(observation)
     queuedProvider.pause()
-    let observer = UsageObserver(codexHome: observerHome, provider: queuedProvider,
+    let observer = UsageObserver(provider: queuedProvider,
         logURL: root.appendingPathComponent("observer.jsonl"), now: { clock })
     observer.refresh()
     for _ in 0..<100 { if queuedProvider.reads > 0 { break }; try await Task.sleep(nanoseconds: 1_000_000) }
@@ -239,8 +209,9 @@ import SQLite3
         earlyRecoveryPolicy: "ask", usage: live, blocked: [])
     let freshDisplay = display.build(plan: freshPlan, usage: live, schedule: schedule, tasks: [], availableTasks: [], choices: ResumeChoices(), now: day)
     let oldDisplay = display.build(plan: stalePlan, usage: live, schedule: schedule, tasks: [], availableTasks: [], choices: ResumeChoices(), now: day.addingTimeInterval(180))
-    check(oldDisplay.headline == freshDisplay.headline && !oldDisplay.quotas.isEmpty && !oldDisplay.isSyncing,
-        "normal idle aging preserves timestamped menu content instead of creating a synchronization error")
+    check(oldDisplay.quotas.map(\.remaining) == freshDisplay.quotas.map(\.remaining) && oldDisplay.refreshMessage == freshDisplay.refreshMessage &&
+        oldDisplay.isTime && !oldDisplay.isSyncing && oldDisplay.timeline.contains { $0.date == stalePlan.date && $0.kind == .keepAlive },
+        "normal idle aging retains timestamped quota facts alongside its recomputed fixed plan")
 
     let appHome = root.appendingPathComponent("app-home")
     let traces = appHome.appendingPathComponent("sessions")
@@ -277,9 +248,9 @@ import SQLite3
     publishFresh()
     try trace.write(to: file, atomically: true, encoding: .utf8)
     let beforeActivity = appProvider.reads
-    state.sessions.refresh(); try await pollingSettle { appProvider.reads > beforeActivity && !state.usage.refreshing }
-    check(state.usage.polling.interval == 20 && state.sessions.sessions.contains { $0.id == id && $0.isSubagent && $0.taskRunning },
-        "new observed child activity wakes quota immediately after local discovery")
+    state.sessions.refresh(); try await pollingSettle { state.sessions.sessions.contains { $0.id == id && $0.taskRunning } }
+    check(state.usage.polling.interval == 300 && appProvider.reads == beforeActivity && state.sessions.sessions.contains { $0.id == id && $0.isSubagent && $0.taskRunning },
+        "new observed child activity stays local and preserves the five-minute quota fallback")
     clock = Date(timeIntervalSince1970: floor(clock.timeIntervalSince1970) + 2)
     publishFresh(); appProvider.pause()
     let coveredReads = appProvider.reads
@@ -299,11 +270,11 @@ import SQLite3
     clock = clock.addingTimeInterval(1); publishFresh()
     trace += pollingEvent("user_message", at: clock)
     try trace.write(to: file, atomically: true, encoding: .utf8)
-    state.sessions.refresh(); try await pollingSettle { state.usage.criticalRefreshPending }
-    check(state.usage.polling.interval == 20, "activity after query admission stays fast until its follow-up is covered")
+    state.sessions.refresh(); try await pollingSettle { state.sessions.sessions.first { $0.id == id }?.lastUserMessageAt == clock }
+    check(!state.usage.criticalRefreshPending && state.usage.polling.interval == 300, "ordinary activity after query admission does not request an online follow-up")
     appProvider.release(); try await pollingSettle { !state.usage.refreshing }
-    check(appProvider.reads == uncoveredReads + 2 && appProvider.manualReads == 0,
-        "activity after query admission merges exactly one automatic follow-up")
+    check(appProvider.reads == uncoveredReads + 1 && appProvider.manualReads == 0,
+        "ordinary activity after query admission adds no quota RPC")
     clock = clock.addingTimeInterval(1)
     for _ in 0..<25 {
         let next = UUID().uuidString
@@ -325,11 +296,11 @@ import SQLite3
     clock = clock.addingTimeInterval(1)
     var stoppedTrace = pollingMetadata(stoppedID, at: clock.addingTimeInterval(-1)) + pollingEvent("error", at: clock, extra: ["message": "usage_limit_reached"])
     observation.accountID = "recovery-account"
-    try Data("{\"tokens\":{\"account_id\":\"recovery-account\"}}".utf8).write(to: appHome.appendingPathComponent("auth.json"))
+    try writeKeepAliveAuthentication(home: appHome, account: "recovery-account")
     publishFresh(100)
     try stoppedTrace.write(to: stoppedFile, atomically: true, encoding: .utf8)
     state.sessions.refresh(); try await pollingSettle { state.availableTasks.contains { $0.id == stoppedID } && !state.usage.refreshing }
-    check(state.usage.polling.interval == 20, "quota-stopped tasks remain fast throughout a far recovery deadline")
+    check(state.usage.polling.interval == 300, "quota-stopped tasks retain five-minute fallback throughout a far recovery deadline")
     let savedRuntime = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("app-support/pending-runtime.json"))) as! [String: Any]
     check((savedRuntime["accounts"] as? [String: String])?[stoppedID] == "recovery-account",
         "a task discovered with an identity change waits for covered quota before account binding")
@@ -339,24 +310,24 @@ import SQLite3
     check(state.usage.polling.interval == 300, "explicitly disabled automatic continuation does not permanently block idle polling")
     prefs.set(true, forKey: "autoResume"); publishFresh(100); state.recompute(allowExecution: false)
     try await pollingSettle { !state.usage.refreshing }
-    check(state.usage.polling.interval == 20, "reenabling a pending continuation restores fast polling")
+    check(state.usage.polling.interval == 300, "reenabling a far pending continuation preserves five-minute fallback")
     clock = clock.addingTimeInterval(1); publishFresh()
     state.usage.refresh(); try await pollingSettle { !state.usage.refreshing }
     state.recompute(allowExecution: false)
-    check(state.nextAction?.mode == .keepAlive && state.choices.recoveryDecisions?.isEmpty == false && state.usage.polling.interval == 20,
-        "recovery choice remains a demand even when the displayed next action is keep-alive")
+    check(state.nextAction?.mode == .keepAlive && state.choices.recoveryDecisions?.isEmpty == false && state.usage.polling.interval == 300,
+        "recovery choices preserve their state without accelerating quota RPCs")
     let secondID = UUID().uuidString
     let secondFile = traces.appendingPathComponent("rollout-\(secondID).jsonl")
     try (pollingMetadata(secondID, at: clock.addingTimeInterval(-1)) + pollingEvent("error", at: clock, extra: ["message": "usage_limit_reached"]))
         .write(to: secondFile, atomically: true, encoding: .utf8)
     publishFresh(100); state.sessions.refresh()
     try await pollingSettle { state.availableTasks.count == 2 && !state.usage.refreshing }
-    check(state.usage.polling.interval == 20 && state.choices.recoveryDecisions?.isEmpty == false,
-        "one task awaiting a choice cannot hide another task's blocked recovery demand")
+    check(state.usage.polling.interval == 300 && state.choices.recoveryDecisions?.isEmpty == false,
+        "one task awaiting a choice retains another task without fast quota polling")
     state.useKeepAlive(for: state.availableTasks)
     check(state.usage.polling.interval == 300, "explicit cancellation of all historical episodes permits true idle polling")
     let identityReads = appProvider.reads
-    try Data("{\"tokens\":{\"account_id\":\"fixture-only\"}}".utf8).write(to: appHome.appendingPathComponent("auth.json"))
+    try writeKeepAliveAuthentication(home: appHome, account: "fixture-only")
     publishFresh(100); state.sessions.refresh()
     try await pollingSettle { appProvider.reads > identityReads && !state.usage.refreshing }
     check(appProvider.manualReads == 0 && state.usage.hasReliableReading,
@@ -365,9 +336,9 @@ import SQLite3
     stoppedTrace += pollingEvent("user_message", at: clock) + pollingEvent("task_started", at: clock)
     try stoppedTrace.write(to: stoppedFile, atomically: true, encoding: .utf8)
     let manualResumeReads = appProvider.reads
-    state.sessions.refresh(); try await pollingSettle { appProvider.reads > manualResumeReads && !state.usage.refreshing }
-    check(!state.blockedSessions.contains { $0.id == stoppedID } && state.usage.polling.interval == 20,
-        "detected manual task recovery revokes the stop and requests automatic live quota")
+    state.sessions.refresh(); try await pollingSettle { !state.blockedSessions.contains { $0.id == stoppedID } && !state.usage.refreshing }
+    check(state.usage.polling.interval == 300 && appProvider.reads == manualResumeReads,
+        "detected manual task recovery revokes the stop without requesting quota RPCs")
     let environmentReads = appProvider.reads
     state.environmentChanged(); try await pollingSettle { !state.usage.refreshing }
     check(appProvider.reads > environmentReads && appProvider.manualReads == 0,
@@ -392,7 +363,8 @@ import SQLite3
     gateUsage.weekly?.resetsAt = gateClock.addingTimeInterval(86400)
     gateUsage.zeroUseWindowActive = false
     let gateProvider = PollingFixtureUsage(gateUsage)
-    let gatePings = ReminderTestPing()
+    let gatePings = PreparationGatePing(clock: { gateClock })
+    try writeKeepAliveAuthentication(home: gateHome, account: "polling-account")
     let gateExecution = ExecutionCoordinator(provider: gateProvider, defaults: gatePrefs,
         ledgerURL: root.appendingPathComponent("gate-support/resume-attempts.json"),
         pingTransport: gatePings, codexHome: gateHome, now: { gateClock })
@@ -406,32 +378,28 @@ import SQLite3
     gateClock = gateClock.addingTimeInterval(11)
     gateState.usage.refresh(source: "session_activity", critical: true)
     gateState.recompute()
-    check(gateState.usage.snapshot?.isFresh(at: gateClock) == true &&
-        gateState.usage.criticalRefreshPending && !gateExecution.running && gatePings.count == 0,
-        "an uncovered critical event blocks automatic dispatch despite a fresh pre-event snapshot at a due node")
-    var dispatchedOnCompletion: Bool?
+    try await pollingSettle { gatePings.count == 1 }
+    check(gateState.usage.snapshot?.isFresh(at: gateClock) == true && gateState.usage.criticalRefreshPending && gatePings.count == 1,
+        "isolated keepalive uses existing facts and advances during a critical quota follow-up")
+    var dispatchedOnCompletion = false
     let refreshCompleted = gateState.usage.onRefreshCompleted
     gateState.usage.onRefreshCompleted = {
         refreshCompleted?()
-        if !gateState.usage.criticalRefreshPending, dispatchedOnCompletion == nil {
-            dispatchedOnCompletion = gateExecution.running
-        }
+        dispatchedOnCompletion = gateExecution.hasAttemptedKeepAlive(node: schedule.nodes()[0], accountID: "polling-account")
     }
     gateProvider.release()
-    try await pollingSettle { !gateState.usage.refreshing && !gateExecution.running && gatePings.count == 1 }
-    check(!gateState.usage.criticalRefreshPending && gatePings.count == 1,
-        "automatic dispatch proceeds once after the critical follow-up completes")
-    check(dispatchedOnCompletion == true,
-        "completed background recovery advances execution before a later UI or main-queue notification")
+    try await pollingSettle { !gateState.usage.refreshing && !gateExecution.running }
+    check(!gateState.usage.criticalRefreshPending && gatePings.count == 1 && dispatchedOnCompletion,
+        "background quota completion keeps the already submitted original node deduplicated")
     gateState.usage.onRefreshCompleted = refreshCompleted
     let schedulingLog = try String(contentsOf: root.appendingPathComponent("gate-support/usage-transitions.jsonl"), encoding: .utf8)
     let schedulingRows = schedulingLog.split(separator: "\n").compactMap {
         try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
     }.filter { $0["event"] as? String == "schedule_evaluated" }
-    check(schedulingRows.contains { $0["critical_refresh"] as? Bool == true && $0["executing"] as? Bool == false },
-        "optional scheduling trace preserves the critical refresh gate before dispatch")
-    check(schedulingRows.contains { $0["trigger"] as? String == "usage" && $0["executing"] as? Bool == true },
-        "optional scheduling trace identifies dispatch from background quota completion")
+    check(schedulingRows.contains { $0["critical_refresh"] as? Bool == true },
+        "optional scheduling trace retains critical refresh as a fact rather than isolated admission permission")
+    check(schedulingRows.contains { $0["trigger"] as? String == "usage" },
+        "optional scheduling trace identifies background quota completion independently of UI delivery")
     check(schedulingRows.allSatisfy { $0["account_id"] == nil && $0["thread_id"] == nil && $0["prompt"] == nil && $0["cwd"] == nil },
         "scheduling trace omits identities, prompts and workspace paths")
     check(schedulingRows.contains { $0["scan_failures"] is [[String: Any]] },
@@ -443,10 +411,10 @@ import SQLite3
     gateProvider.setModelError(CodexConnectionError.server("fixture model unavailable"))
     let failedReads = gateProvider.reads
     gateState.usage.refresh()
-    try await pollingSettle { !gateState.usage.refreshing && !gateExecution.running && gateExecution.lastFailure != nil }
+    try await pollingSettle { !gateState.usage.refreshing && !gateExecution.running && gatePings.count == 2 }
     try await Task.sleep(nanoseconds: 100_000_000)
-    check(gateProvider.reads == failedReads + 1 && gatePings.count == 1,
-        "failed model preflight cannot create a quota refresh and automatic redispatch loop")
+    check(gateProvider.reads >= failedReads + 1 && gatePings.count == 2,
+        "background model discovery failure cannot block or duplicate a fixed-model attempt at the next node")
     gateState.usage.stop(); gateState.sessions.stop()
 }
 

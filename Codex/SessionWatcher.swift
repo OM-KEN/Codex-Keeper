@@ -9,12 +9,14 @@ struct SessionScanDiagnostic: Equatable {
     var stage: String
     var code: Int? = nil
     var domain: String? = nil
+    var primaryCode: Int? = nil
     var fileFingerprint: String? = nil
 
     var logValue: [String: Any] {
         var value: [String: Any] = ["stage": stage]
         if let code { value["code"] = code }
         if let domain { value["domain"] = domain }
+        if let primaryCode { value["sqlite_primary_code"] = primaryCode }
         if let fileFingerprint { value["file_fingerprint"] = fileFingerprint }
         return value
     }
@@ -83,6 +85,8 @@ final class SessionWatcher: ObservableObject {
     private let worker: SessionScanWorker
     private var timer: Timer?
     private var refreshing = false
+    private var suspended = false
+    private var generation = 0
     var watchedIDs: Set<String> = []
     var watchedPaths: [URL] = []
     @Published private(set) var scannedAt: Date?
@@ -91,6 +95,9 @@ final class SessionWatcher: ObservableObject {
         self.worker = worker ?? SessionScanWorker(codexHome: codexHome)
     }
     func start(interval: TimeInterval = 20) {
+        suspended = false
+        hasScanned = false
+        scannedAt = nil
         refresh()
         timer?.invalidate()
         timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
@@ -98,14 +105,19 @@ final class SessionWatcher: ObservableObject {
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
-    func stop() { timer?.invalidate(); timer = nil }
+    func stop() {
+        suspended = true; generation += 1; refreshing = false
+        timer?.invalidate(); timer = nil
+    }
     func refresh() {
-        guard !refreshing else { return }
+        guard !suspended, !refreshing else { return }
         refreshing = true
         let worker = worker
         let ids = watchedIDs
         let paths = watchedPaths
+        let generation = self.generation
         Task {
+            guard !suspended, self.generation == generation else { return }
             let result = await Task.detached { () -> ([SessionActivity], String?, AuthenticationObservation, [SessionScanDiagnostic]) in
                 let sessions = worker.read(watchedIDs: ids, watchedPaths: paths)
                 let auth: AuthenticationObservation
@@ -113,6 +125,7 @@ final class SessionWatcher: ObservableObject {
                 catch { auth = .unreadable }
                 return (sessions.0, sessions.1, auth, sessions.2)
             }.value
+            guard !suspended, self.generation == generation else { return }
             authentication = result.2
             scannedAt = Date()
             hasScanned = true
@@ -165,40 +178,49 @@ final class SessionWatcher: ObservableObject {
     }
 
     nonisolated fileprivate static func readRollout(url: URL, mtime: Date) throws -> SessionActivity? {
-        let data = try Data(contentsOf: url)
-        guard let content = String(data: data, encoding: .utf8) else {
-            throw SessionRolloutReadError.invalidUTF8
-        }
-        var id = ""
-        var cwd = ""
-        var activity = mtime
-        var five: QuotaWindow?
-        var weekly: QuotaWindow?
-        var running = false
-        var sawError = false
-        var userAt: Date?
-        var assistantAt: Date?
-        var startedAt: Date?
-        var abortedAt: Date?
-        var isSubagent = false
-        var createdAt: Date?
-        var inheritedThrough: Date?
-        var userUsage: UserUsageEvidence?
-        var usagePromptAt: Date?
-        var tokenTotal: Int?
-        var promptTokenBaseline: Int?
-        var blockedAt: Date?
-        var completedAt: Date?
-        var blockedFive: Date?
-        var blockedWeekly: Date?
-        var currentTurn: String?
-        var quotaTurn: String?
-        var turns: [String: SessionTurnEvidence] = [:]
-        var retryingErrorAt: Date?
+        try SessionRolloutReader().read(url: url, mtime: mtime)
+    }
+
+}
+
+/// Carries only parsed session facts across appends; no historical message text is retained.
+private struct SessionRolloutState {
+    var id = ""
+    var cwd = ""
+    var activity = Date.distantPast
+    var sawActivity = false
+    var five: QuotaWindow?
+    var weekly: QuotaWindow?
+    var running = false
+    var sawError = false
+    var userAt: Date?
+    var assistantAt: Date?
+    var startedAt: Date?
+    var abortedAt: Date?
+    var isSubagent = false
+    var createdAt: Date?
+    var inheritedThrough: Date?
+    var userUsage: UserUsageEvidence?
+    var usagePromptAt: Date?
+    var tokenTotal: Int?
+    var promptTokenBaseline: Int?
+    var blockedAt: Date?
+    var completedAt: Date?
+    var blockedFive: Date?
+    var blockedWeekly: Date?
+    var currentTurn: String?
+    var quotaTurn: String?
+    var turns: [String: SessionTurnEvidence] = [:]
+    var retryingErrorAt: Date?
+    var needsMtimeReplay = false
+
+    mutating func append(_ content: String, mtime: Date) {
         for line in content.split(separator: "\n") {
             guard let data = line.data(using: .utf8), let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let payload = entry["payload"] as? [String: Any] else { continue }
-            let timestamp = UsageDecoder.timestamp(entry["timestamp"] as? String) ?? mtime
+            let validTimestamp = UsageDecoder.timestamp(entry["timestamp"] as? String)
+            if validTimestamp == nil { needsMtimeReplay = true }
+            let timestamp = validTimestamp ?? mtime
             if entry["type"] as? String == "session_meta" {
                 // A fork embeds its parent's metadata/history after the owner's first record.
                 // Never let those records change file identity or subagent eligibility.
@@ -206,7 +228,7 @@ final class SessionWatcher: ObservableObject {
                 id = owner
                 cwd = payload["cwd"] as? String ?? ""
                 isSubagent = (payload["source"] as? [String: Any])?["subagent"] != nil
-                createdAt = UsageDecoder.timestamp(payload["timestamp"] as? String) ?? UsageDecoder.timestamp(entry["timestamp"] as? String)
+                createdAt = UsageDecoder.timestamp(payload["timestamp"] as? String) ?? validTimestamp
                 if payload["forked_from_id"] == nil && payload["history_base"] == nil && !isSubagent { tokenTotal = 0 }
                 if payload["forked_from_id"] != nil || payload["history_base"] != nil || isSubagent {
                     // Copied history may be re-stamped at the fork's first-record time.
@@ -217,13 +239,13 @@ final class SessionWatcher: ObservableObject {
             }
             if let inheritedThrough, timestamp <= inheritedThrough { continue }
             if let threadID = (payload["thread_id"] ?? payload["threadId"]) as? String, threadID != id { continue }
-            activity = timestamp
+            activity = timestamp; sawActivity = true
             let type = payload["type"] as? String ?? ""
             let explicitTurn = (payload["turn_id"] ?? payload["turnId"]) as? String
             if type == "task_started" { currentTurn = explicitTurn }
             else if entry["type"] as? String == "turn_context", let explicitTurn { currentTurn = explicitTurn }
             let eventTurn = explicitTurn ?? currentTurn
-            if let turn = eventTurn, let at = UsageDecoder.timestamp(entry["timestamp"] as? String) {
+            if let turn = eventTurn, let at = validTimestamp {
                 var evidence = turns[turn] ?? SessionTurnEvidence()
                 if type == "task_started" { evidence.startedAt = at }
                 if ResumeModelActivity.rollout(entry), evidence.startedAt != nil, evidence.responseAt == nil { evidence.responseAt = at }
@@ -250,7 +272,6 @@ final class SessionWatcher: ObservableObject {
                     blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
                 }
             }
-            let validTimestamp = UsageDecoder.timestamp(entry["timestamp"] as? String)
             if type == "token_count", let promptAt = usagePromptAt, let at = validTimestamp, at >= promptAt,
                let info = payload["info"] as? [String: Any],
                let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
@@ -308,17 +329,95 @@ final class SessionWatcher: ObservableObject {
                 }
             }
         }
+    }
+
+    func snapshot(url: URL, mtime: Date) -> SessionActivity? {
+        var copy = self
+        return copy.finish(url: url, mtime: mtime)
+    }
+
+    private mutating func finish(url: URL, mtime: Date) -> SessionActivity? {
         if let turn = currentTurn, let evidence = turns[turn], evidence.terminal == .quotaStopped, let at = evidence.endedAt {
             blockedAt = at; quotaTurn = turn; running = false
         }
         if id.isEmpty {
-            id = rolloutThreadID(url) ?? ""
+            id = SessionWatcher.rolloutThreadID(url) ?? ""
         }
         guard UUID(uuidString: id) != nil else { return nil }
         return SessionActivity(id: id, project: cwd.isEmpty ? L10n.text("未知项目") : URL(fileURLWithPath: cwd).lastPathComponent,
-            cwd: cwd, fileURL: url, lastActivityAt: activity, fiveHour: five, weekly: weekly,
+            cwd: cwd, fileURL: url, lastActivityAt: sawActivity ? activity : mtime, fiveHour: five, weekly: weekly,
             sawErrorEvent: sawError, taskRunning: running, lastUserMessageAt: userAt, quotaBlockedAt: blockedAt,
             lastCompletedAt: completedAt, blockingFiveReset: blockedFive, blockingWeeklyReset: blockedWeekly, lastAssistantMessageAt: assistantAt, lastTaskStartedAt: startedAt, lastAbortedAt: abortedAt, isSubagent: isSubagent, createdAt: createdAt, userUsage: userUsage, currentTurnID: currentTurn, quotaTurnID: quotaTurn, turns: turns, lastRetryingErrorAt: retryingErrorAt)
+    }
+}
+
+/// A file change invalidates permission checks, but an append need not reparse its history.
+final class SessionRolloutReader {
+    private struct Cursor {
+        var inode: UInt64
+        var offset: UInt64 = 0
+        var mtime: Date
+        var state = SessionRolloutState()
+        var pending = Data()
+        var header = Data()
+        var anchor = Data()
+    }
+    private var cursors: [URL: Cursor] = [:]
+
+    func retainFiles(_ paths: Set<URL>) { cursors = cursors.filter { paths.contains($0.key) } }
+
+    func read(url: URL, mtime: Date) throws -> SessionActivity? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        var cursor = cursors[url]
+        var restart = cursor == nil || cursor?.inode != inode || size < (cursor?.offset ?? 0)
+        if let old = cursor, !restart {
+            restart = old.state.needsMtimeReplay && old.mtime != mtime || (size == old.offset && old.mtime != mtime)
+            if !restart, !old.header.isEmpty {
+                restart = try handle.read(upToCount: old.header.count) != old.header
+            }
+            if !restart, !old.anchor.isEmpty {
+                try handle.seek(toOffset: old.offset - UInt64(old.anchor.count))
+                restart = try handle.read(upToCount: old.anchor.count) != old.anchor
+            }
+        }
+        if restart { cursor = Cursor(inode: inode, mtime: mtime) }
+        guard var next = cursor else { return nil }
+        try handle.seek(toOffset: next.offset)
+        while next.offset < size {
+            guard let data = try handle.read(upToCount: Int(min(64 * 1024, size - next.offset))), !data.isEmpty else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            next.offset += UInt64(data.count)
+            var start = data.startIndex
+            // Search each new byte once, even when a single record spans many chunks.
+            while let end = data[start...].firstIndex(of: 10) {
+                next.pending.append(contentsOf: data[start..<end])
+                try autoreleasepool {
+                    guard let text = String(data: next.pending, encoding: .utf8) else { throw SessionRolloutReadError.invalidUTF8 }
+                    if next.header.isEmpty { next.header = next.pending; next.header.append(10) }
+                    next.state.append(text, mtime: mtime)
+                }
+                next.pending = Data()
+                start = data.index(after: end)
+            }
+            next.pending.append(contentsOf: data[start...])
+        }
+        // A complete final JSON without a newline remains visible, but is not committed
+        // twice when the writer later appends its newline or the rest of that record.
+        var preview = next.state
+        if !next.pending.isEmpty {
+            guard let text = String(data: next.pending, encoding: .utf8) else { throw SessionRolloutReadError.invalidUTF8 }
+            preview.append(text, mtime: mtime)
+        }
+        try handle.seek(toOffset: next.offset > 64 ? next.offset - 64 : 0)
+        next.anchor = try handle.read(upToCount: Int(min(next.offset, 64))) ?? Data()
+        next.mtime = mtime
+        cursors[url] = next
+        return preview.snapshot(url: url, mtime: mtime)
     }
 }
 
@@ -328,10 +427,11 @@ final class SessionScanWorker: @unchecked Sendable {
     private let quotaLogs: QuotaErrorLogProvider
     private let lock = NSLock()
     private let parseRollout: (URL, Date) throws -> SessionActivity?
+    private let rolloutReader = SessionRolloutReader()
     private var cache: [URL: (mtime: Date, size: UInt64, inode: UInt64, activity: SessionActivity)] = [:]
-    init(codexHome: URL, parseRollout: @escaping (URL, Date) throws -> SessionActivity? = { try SessionWatcher.readRollout(url: $0, mtime: $1) }) {
+    init(codexHome: URL, parseRollout: ((URL, Date) throws -> SessionActivity?)? = nil) {
         self.codexHome = codexHome
-        self.parseRollout = parseRollout
+        self.parseRollout = parseRollout ?? rolloutReader.read
         quotaLogs = QuotaErrorLogProvider(codexHome: codexHome)
     }
     func read(watchedIDs: Set<String>, watchedPaths: [URL] = []) -> ([SessionActivity], String?, [SessionScanDiagnostic]) {
@@ -344,7 +444,7 @@ final class SessionScanWorker: @unchecked Sendable {
             var diagnostic = SessionScanDiagnostic(stage: stage, fileFingerprint: fingerprint)
             if let database = error as? CodexDatabaseError {
                 diagnostic.stage += "." + database.stage
-                diagnostic.code = Int(database.extendedCode); diagnostic.domain = "SQLite"
+                diagnostic.code = Int(database.extendedCode); diagnostic.primaryCode = Int(database.code); diagnostic.domain = "SQLite"
             } else if error is SessionRolloutReadError {
                 diagnostic.stage += ".decode_utf8"
             } else if let error = error as NSError? {
@@ -363,7 +463,7 @@ final class SessionScanWorker: @unchecked Sendable {
         do { stops = try quotaLogs.read() }
         catch {
             // A new installation with no sessions has no candidates to resume.
-            if !all.isEmpty || !watchedIDs.isEmpty { errorMessage = error.localizedDescription; diagnose("quota_log_database", error: error) }
+            if !all.isEmpty || !watchedIDs.isEmpty { errorMessage = errorMessage ?? error.localizedDescription; diagnose("quota_log_database", error: error) }
         }
         let runningIDs = Set(cache.values.filter { $0.activity.taskRunning }.map { $0.activity.id })
         let ids = watchedIDs.union(stops.keys).union(runningIDs)
@@ -371,8 +471,18 @@ final class SessionScanWorker: @unchecked Sendable {
         let candidates = ids.union(recent.compactMap(SessionWatcher.rolloutThreadID))
         let registered = Set(currentPaths.filter { candidates.contains($0.key) }.map { $0.value.resolvingSymlinksInPath() })
         let watched = Set(watchedPaths.map { $0.resolvingSymlinksInPath() })
-        let files = all.filter { file in recent.contains(file.url) || watched.contains(file.url.resolvingSymlinksInPath()) ||
-            SessionWatcher.rolloutThreadID(file.url).map { candidates.contains($0) } == true || registered.contains(file.url.resolvingSymlinksInPath()) }
+        let files = all.filter { file in
+            let path = file.url.resolvingSymlinksInPath()
+            if let id = SessionWatcher.rolloutThreadID(file.url), let current = currentPaths[id],
+               current.resolvingSymlinksInPath() != path { return false }
+            return recent.contains(file.url) || watched.contains(path) ||
+                SessionWatcher.rolloutThreadID(file.url).map { candidates.contains($0) } == true || registered.contains(path)
+        }
+        // Validate registered current files after excluding replaced history, before parsing candidates.
+        for (id, path) in currentPaths where candidates.contains(id) && !files.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
+            errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
+            diagnose("canonical_rollout_missing", file: path)
+        }
         var titles: [String: String] = [:]
         if let index = try? String(contentsOf: codexHome.appendingPathComponent("session_index.jsonl"), encoding: .utf8) {
             for line in index.split(separator: "\n") {
@@ -399,7 +509,7 @@ final class SessionScanWorker: @unchecked Sendable {
                 } else {
                     let name = file.url.deletingPathExtension().lastPathComponent
                     if cache[file.url] != nil || name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) != nil {
-                        errorMessage = L10n.text("无法读取 Codex 本地暂停记录")
+                        errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
                         diagnose("rollout_parse", error: parseError, file: file.url)
                     }
                     activity = cache[file.url]?.activity
@@ -413,13 +523,13 @@ final class SessionScanWorker: @unchecked Sendable {
         activities = Dictionary(grouping: activities, by: \.id).values.compactMap { group in
             if let path = currentPaths[group[0].id] {
                 guard var current = group.first(where: { $0.fileURL.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) else {
-                    errorMessage = L10n.text("无法读取 Codex 本地暂停记录"); diagnose("canonical_rollout_missing", file: path); return nil
+                    errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录"); diagnose("canonical_rollout_missing", file: path); return nil
                 }
                 current.currentRolloutVerified = true
                 return current
             }
             guard group.count == 1 else {
-                errorMessage = L10n.text("无法读取 Codex 本地暂停记录"); diagnose("ambiguous_rollout", file: group[0].fileURL); return nil
+                errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录"); diagnose("ambiguous_rollout", file: group[0].fileURL); return nil
             }
             return group[0]
         }
@@ -451,11 +561,12 @@ final class SessionScanWorker: @unchecked Sendable {
             !activities.contains(where: { $0.id == entry.value.activity.id && $0.currentRolloutVerified })
         }
         if !missing.isEmpty {
-            errorMessage = L10n.text("无法读取 Codex 本地暂停记录")
+            errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
             for file in missing.keys { diagnose("running_rollout_missing", file: file) }
             activities += missing.map { $0.value.activity }
         }
         cache = cache.filter { existing.contains($0.key) || $0.value.activity.taskRunning }
+        rolloutReader.retainFiles(Set(cache.keys))
         if errorMessage != nil { activities = activities.map { var value = $0; value.currentRolloutVerified = false; return value } }
         return (activities.sorted { $0.lastActivityAt > $1.lastActivityAt }, errorMessage,
             failures.sorted { ($0.stage, $0.fileFingerprint ?? "") < ($1.stage, $1.fileFingerprint ?? "") })

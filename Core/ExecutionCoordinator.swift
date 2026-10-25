@@ -8,14 +8,26 @@ import Darwin
     @Published private(set) var lastFailure: String?
     @Published private(set) var lastFailureNeedsAttention = true
     var visibleFailure: String? { lastFailureNeedsAttention ? lastFailure : nil }
-    var visibleNotice: String? { lastFailureNeedsAttention ? nil : lastFailure }
+    var visibleNotice: String? {
+        guard !lastFailureNeedsAttention else { return nil }
+        if let result = lastPingResult, result.outcome == .notExecuted, lastFailure == result.message,
+           let account = result.accountID, !account.isEmpty {
+            let clock = now()
+            if confirmations.contains(where: { $0.accountID == account && $0.actionAt <= $0.confirmedAt &&
+                $0.confirmedAt >= result.at && $0.confirmedAt <= clock }) { return nil }
+        }
+        return lastFailure
+    }
     @Published private(set) var warning: String?
     @Published private(set) var activeMode: NextActionMode?
     @Published private(set) var status = L10n.text("等待计划")
     @Published private(set) var confirmations: [ExecutionConfirmation] = []
-    private(set) var confirmedWindows: [KeepAliveWindowEvidence] = []
     @Published private(set) var operations: [String: ResumeOperation] = [:]
     @Published private(set) var recordingFailure: String?
+    @Published private(set) var pingResults: [PingNodeResult] = []
+    @Published private(set) var lastPingResult: PingNodeResult?
+    private var observedPing: (node: Date, account: String?, reason: String, skipped: Bool)?
+    private var preparationRunning = false
     private var pingRunning = false
     private var storageFault = false
     private var pendingEventWrites: [String: (String, ResumeOperation)] = [:]
@@ -33,20 +45,20 @@ import Darwin
     private let pingTransport: PingTransport
     private var ledgerHealthy = true
     private var generation = 0
+    private var pingGeneration = 0
     private var executionLock: Int32 = -1
 
-    init(provider: UsageProvider = AppServerUsageProvider(), makeResumeTransport: @escaping () -> ResumeTransport = { OwnedSessionResumeTransport() }, defaults: UserDefaults = .standard, ledgerURL: URL? = nil, pingTransport: PingTransport = PTYPingTransport(), codexHome: URL = CodexEnvironment.home, scanWorker: SessionScanWorker? = nil, now: @escaping () -> Date = Date.init) {
+    init(provider: UsageProvider = AppServerUsageProvider(), makeResumeTransport: @escaping () -> ResumeTransport = { OwnedSessionResumeTransport() }, defaults: UserDefaults = .standard, ledgerURL: URL? = nil, pingTransport: PingTransport? = nil, codexHome: URL = CodexEnvironment.home, scanWorker: SessionScanWorker? = nil, now: @escaping () -> Date = Date.init) {
         self.codexHome = codexHome
         self.scanWorker = scanWorker ?? SessionScanWorker(codexHome: codexHome)
         self.now = now
-        self.pingTransport = pingTransport
         self.provider = provider
         self.makeResumeTransport = makeResumeTransport
         self.defaults = defaults
         self.ledgerURL = ledgerURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/resume-attempts.json")
+        self.pingTransport = pingTransport ?? PTYPingTransport(codexHome: codexHome, supportRoot: self.ledgerURL.deletingLastPathComponent().appendingPathComponent("ping"))
         self.events = ExecutionEventLog(url: self.ledgerURL.deletingLastPathComponent().appendingPathComponent("execution-events.jsonl"))
         confirmations = events.confirmations()
-        confirmedWindows = events.keepAliveWindows()
         if FileManager.default.fileExists(atPath: self.ledgerURL.path) {
             if let data = try? Data(contentsOf: self.ledgerURL), let saved = try? JSONDecoder().decode(ResumeLedger.self, from: data), saved.version == 1 {
                 attempts = saved.keys; operations = Dictionary(uniqueKeysWithValues: saved.operations.map { ($0.id, $0) })
@@ -65,6 +77,12 @@ import Darwin
             } else if let data = try? Data(contentsOf: self.ledgerURL), let saved = try? JSONDecoder().decode([String].self, from: data) { attempts = Set(saved) }
             else { attempts = []; ledgerHealthy = false; status = L10n.text("记录无法读取，请到关于页反馈问题。") }
         } else { attempts = [] }
+        pingResults = events.pingResults()
+        lastPingResult = pingResults.last
+        if let result = lastPingResult, result.needsAttention {
+            lastFailure = result.message; lastFailureNeedsAttention = result.outcome == .failed
+            activeMode = .keepAlive
+        }
         reloadConfirmations()
         try? FileManager.default.createDirectory(at: self.ledgerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         executionLock = Darwin.open(self.ledgerURL.deletingLastPathComponent().appendingPathComponent("execution.lock").path, O_CREAT | O_RDWR, 0o600)
@@ -73,13 +91,20 @@ import Darwin
             status = L10n.text(executionLock < 0 ? "记录无法读取，请到关于页反馈问题。" : "Keeper 已在运行，请使用已打开的 Keeper。")
         }
         if !ledgerHealthy { permanentlyUnhealthy = true; lastFailure = status; recordingFailure = status }
+        else {
+            for result in pingResults where result.outcome == .submitted {
+                let interrupted = PingNodeResult(node: result.node, accountID: result.accountID, at: now(), outcome: .unknown)
+                try? recordPing(interrupted, event: "interrupted")
+            }
+        }
     }
 
     deinit { if executionLock >= 0 { Darwin.close(executionLock) } }
 
     /// Identity, plan or clock changes revoke preparation, without interrupting submitted work.
-    func invalidatePreparations() {
+    func invalidatePreparations(keepAlive: Bool = true) {
         generation += 1
+        if keepAlive { pingGeneration += 1 }
         for (id, transport) in activeTransports where operations[id]?.phase == .preparing { transport.cancel() }
     }
 
@@ -192,115 +217,172 @@ import Darwin
         else if pingRunning { activeMode = .keepAlive }
     }
 
-    func ping(schedule: ScheduleEngine, accountID: String?, ignoredEpisodes: Set<String> = [], ignoredTargets: [BlockedSession] = [], historicalTargets: [BlockedSession] = [], blockers: @escaping () -> [PingPreflightReason]) {
-        guard ledgerHealthy, defaults.bool(forKey: "enabled"),
-              !running, !hasBusyTasks, let node = schedule.currentKeepAliveNode(at: now()), let accountID else { return }
-        let key = "ping:\(accountID):\(node.timeIntervalSince1970)"
-        guard !attempts.contains(key) else { return }
-        let operation = generation
-        let startedAt = now()
-        let startedUptime = ProcessInfo.processInfo.systemUptime
+    func acknowledgePingResult() {
+        guard !pingRunning, var result = lastPingResult, result.needsAttention else { return }
+        result.acknowledgedAt = now()
+        try? recordPing(result, event: "viewed")
+    }
+
+    func relocateKeepAlive() {
+        pingTransport.relocatePreparation()
+        maintainKeepAlive(forceCheck: true)
+    }
+
+    func maintainKeepAlive(forceCheck: Bool = false) {
+        guard defaults.bool(forKey: "enabled"), !preparationRunning else { return }
+        preparationRunning = true
+        let transport = pingTransport; let provider = provider
+        Task {
+            guard defaults.bool(forKey: "enabled") else { preparationRunning = false; return }
+            await Task.detached { transport.maintainPreparation(provider: provider, forceCheck: forceCheck) }.value
+            preparationRunning = false
+        }
+    }
+
+    /// Remember why an observed opportunity was not used; later read recovery cannot erase it.
+    func observeKeepAlive(schedule: ScheduleEngine, accountID: String?, usage: UsageSnapshot?, reason: String?) {
+        let clock = now()
+        if let previous = observedPing, clock > previous.node.addingTimeInterval(ScheduleEngine.keepAliveTolerance) {
+            if !pingResults.contains(where: { $0.node == previous.node && $0.accountID == previous.account &&
+                [.submitted, .newWindow, .windowActive, .windowPending, .unknown, .skipped, .notExecuted].contains($0.outcome) }) {
+                let prior = pingResults.last { $0.node == previous.node && $0.accountID == previous.account }
+                let result = PingNodeResult(node: previous.node, accountID: previous.account, at: clock,
+                    outcome: previous.skipped ? .skipped : .notExecuted, diagnostic: prior?.diagnostic,
+                    preflight: prior?.preflight, detail: prior?.preflight?.errorDescription ?? prior?.detail ?? previous.reason)
+                try? recordPing(result, event: previous.skipped ? "skipped" : "not_executed")
+            }
+            observedPing = nil
+        }
+        guard defaults.bool(forKey: "enabled"), let node = schedule.currentKeepAliveNode(at: clock) else { return }
+        let skipped = usage?.isFresh(at: clock) == true && usage?.activeFiveHourWindow == true &&
+            (usage?.fiveHour?.usedPercent ?? 100) < 100 && (usage?.weekly?.usedPercent ?? 0) < 100
+        observedPing = (node, accountID, reason ?? (skipped ? L10n.text("已有有效 5 小时窗口") : L10n.text("正在确认中")), skipped)
+    }
+
+    private func recordPing(_ result: PingNodeResult, event: String, before: UsageSnapshot? = nil, after: UsageSnapshot? = nil, error: String? = nil) throws {
+        do {
+            try events.record(event, kind: "ping", node: result.node, before: before, after: after, error: error,
+                diagnostic: result.diagnostic, preflight: result.preflight, accountID: result.accountID, at: result.at, pingResult: result)
+        } catch {
+            storageFault = true; ledgerHealthy = false
+            recordingFailure = L10n.text("记录不可用，请检查磁盘空间后刷新。")
+            throw error
+        }
+        pingResults.removeAll { $0.node == result.node && $0.accountID == result.accountID }
+        pingResults.append(result); pingResults.sort { $0.at < $1.at }; lastPingResult = result
+        status = result.message
+        if !result.needsAttention { lastFailure = nil }
+        else if result.needsAttention {
+            lastFailure = result.message; lastFailureNeedsAttention = result.outcome == .failed && (result.preflight?.needsAttention ?? true)
+        }
+    }
+
+    func ping(schedule: ScheduleEngine, usage: UsageSnapshot? = nil,
+              blockers: @escaping () -> [PingPreflightReason]) {
+        guard ledgerHealthy, defaults.bool(forKey: "enabled"), !running, !hasBusyTasks,
+              let node = schedule.currentKeepAliveNode(at: now()) else { return }
+        let startedAt = now(); let startedUptime = ProcessInfo.processInfo.systemUptime
         let opportunity = schedule.keepAliveOpportunities(at: startedAt).first { $0.node == node }
-        warning = nil
-        lastFailure = nil
-        activeMode = .keepAlive
+        let authentication = try? PingAuthentication.read(home: codexHome)
+        let boundAccount = authentication?.accountID
+        let before = usage.flatMap { $0.isFresh(at: startedAt) && $0.accountID == boundAccount ? $0 : nil } ??
+            UsageSnapshot(fiveHour: nil, weekly: nil, capturedAt: .distantPast, accountID: boundAccount, sourceFile: "")
+        guard let boundAccount else {
+            let diagnostic = PingPreflightDiagnostic(stage: .beforeSend, reasons: [.accountUnconfirmed], startedAt: startedAt, checkedAt: now(),
+                elapsedSeconds: 0, usageCapturedAt: nil, usageAgeSeconds: nil, opportunityStartsAt: opportunity?.date,
+                opportunityDeadline: opportunity?.deadline, newPauseCount: nil)
+            if lastPingResult?.node != node || lastPingResult?.preflight?.reasons != diagnostic.reasons {
+                try? recordPing(PingNodeResult(node: node, accountID: nil, at: now(), outcome: .failed, preflight: diagnostic), event: "failed")
+            }
+            return
+        }
+        let key = "ping:\(boundAccount):\(node.timeIntervalSince1970)"
+        guard !attempts.contains(key) else { return }
+        let operation = pingGeneration
+        warning = nil; activeMode = .keepAlive
         pingRunning = true; running = true
         status = L10n.text("正在确认保活条件…")
-        let provider = provider
-        let pingTransport = pingTransport
-        let scanWorker = scanWorker; let codexHome = codexHome
+        let provider = provider; let transport = pingTransport
         Task {
-            var stage = PingPreflightDiagnostic.Stage.modelDiscovery
-            var checkedUsage: UsageSnapshot?
+            var submitted = false
             do {
-                // Resolve capabilities before taking the final account/quota snapshot.
-                let model = try await Task.detached { try provider.pingModel() }.value
-                stage = .usageRead
-                let before = try await Task.detached { try provider.read() }.value
-                checkedUsage = before
-                stage = .afterUsage
-                @MainActor func checkPreflight(_ stage: PingPreflightDiagnostic.Stage, newPauseCount: Int? = nil) throws {
-                    let appBlockers = blockers()
-                    let checkedAt = now()
-                    var reasons: [PingPreflightReason] = []
-                    if let newPauseCount, newPauseCount > 0 { reasons.append(.newPause) }
-                    reasons.append(contentsOf: appBlockers)
-                    if operation != generation { reasons.append(.generationChanged) }
-                    if !defaults.bool(forKey: "enabled") { reasons.append(.disabled) }
-                    if (defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480) != schedule.anchorMinutes { reasons.append(.anchorChanged) }
-                    if stage == .afterUsage, accountID != before.accountID {
-                        let knownBefore = before.isFresh(at: checkedAt) && before.accountID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                        reasons.append(knownBefore && !accountID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .accountChanged : .accountUnconfirmed)
-                    }
-                    if stage == .beforeSend {
-                        if !before.isFresh(at: checkedAt) { reasons.append(.usageNotFresh) }
-                        if Calendar.current.timeZone.identifier != schedule.timeZoneID { reasons.append(.timeZoneChanged) }
-                    }
-                    if schedule.currentKeepAliveNode(at: checkedAt) != node {
-                        reasons.append(opportunity.map { checkedAt > $0.deadline } == true ? .opportunityExpired : .nodeChanged)
-                    }
-                    guard reasons.isEmpty else {
-                        throw PingPreflightDiagnostic(stage: stage, reasons: reasons, startedAt: startedAt, checkedAt: checkedAt,
-                            elapsedSeconds: max(0, ProcessInfo.processInfo.systemUptime - startedUptime), usageCapturedAt: before.capturedAt,
-                            usageAgeSeconds: checkedAt.timeIntervalSince(before.capturedAt), opportunityStartsAt: opportunity?.date,
-                            opportunityDeadline: opportunity?.deadline, newPauseCount: newPauseCount)
-                    }
+                try await Task.detached { try transport.prepareForSend() }.value
+                let appBlockers = blockers()
+                let checkedAt = now()
+                let currentAccount = (try? PingAuthentication.read(home: codexHome))?.accountID
+                var reasons = appBlockers
+                if operation != pingGeneration { reasons.append(.generationChanged) }
+                if !defaults.bool(forKey: "enabled") { reasons.append(.disabled) }
+                if (defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480) != schedule.anchorMinutes { reasons.append(.anchorChanged) }
+                if Calendar.current.timeZone.identifier != schedule.timeZoneID { reasons.append(.timeZoneChanged) }
+                if currentAccount == nil { reasons.append(.accountUnconfirmed) }
+                else if currentAccount != boundAccount { reasons.append(.accountChanged) }
+                if !ledgerHealthy { reasons.append(.runtimeUnhealthy) }
+                if schedule.currentKeepAliveNode(at: checkedAt) != node {
+                    reasons.append(opportunity.map { checkedAt > $0.deadline } == true ? .opportunityExpired : .nodeChanged)
                 }
-                try checkPreflight(.afterUsage)
-                let decision = DecisionEngine(schedule: schedule).decide(now: now(), enabled: true, autoResume: false, earlyRecoveryPolicy: "ask", usage: before, blocked: [])
-                guard case .ping = decision else { status = decision.text; pingRunning = false; updateRunning(); return }
-                stage = .sessionScan
-                let blocked = try await Task.detached { try SessionWatcher.freshBlockedSessions(codexHome: codexHome, worker: scanWorker) }.value
-                stage = .beforeSend
-                let newPauseCount = blocked.filter { raw in
-                    !ignoredEpisodes.contains(raw.episodeKey) && !ignoredTargets.contains { ignoredEpisodes.contains($0.episodeKey) && $0.matchesPause(raw) } && !historicalTargets.contains { $0.matchesPause(raw) }
-                }.count
-                try checkPreflight(.beforeSend, newPauseCount: newPauseCount)
-                try saveLedger(keys: attempts.union([key]))
+                if !reasons.isEmpty {
+                    throw PingPreflightDiagnostic(stage: .beforeSend, reasons: reasons, startedAt: startedAt, checkedAt: checkedAt,
+                        elapsedSeconds: max(0, ProcessInfo.processInfo.systemUptime - startedUptime),
+                        usageCapturedAt: usage?.capturedAt, usageAgeSeconds: usage.map { checkedAt.timeIntervalSince($0.capturedAt) },
+                        opportunityStartsAt: opportunity?.date, opportunityDeadline: opportunity?.deadline, newPauseCount: nil)
+                }
+                // A previously good read can age during local preparation; unknown quota still permits one attempt.
+                let currentBefore = before.isFresh(at: checkedAt) ? before : UsageSnapshot(fiveHour: nil, weekly: nil,
+                    capturedAt: .distantPast, accountID: boundAccount, sourceFile: "")
+                let decision = DecisionEngine(schedule: schedule).decide(now: checkedAt, enabled: true, autoResume: false,
+                    earlyRecoveryPolicy: "ask", usage: currentBefore, blocked: [])
+                guard case .ping = decision else { pingRunning = false; updateRunning(); return }
+                do { try saveLedger(keys: attempts.union([key])) }
+                catch { storageFault = true; ledgerHealthy = false; recordingFailure = L10n.text("记录不可用，请检查磁盘空间后刷新。"); throw error }
+                try recordPing(PingNodeResult(node: node, accountID: boundAccount, at: checkedAt, outcome: .submitted), event: "started", before: currentBefore)
+                submitted = true
                 status = L10n.text("正在建立 5 小时窗口…")
-                try events.record("started", kind: "ping", node: node, before: before)
                 let events = events
-                let after = try await Task.detached {
-                    try pingTransport.ping(before: before, model: model, provider: provider) { diagnostic in
+                let result = try await Task.detached {
+                    try transport.perform(before: currentBefore, model: transport.preparedModel, provider: provider) { diagnostic in
                         try? events.record("diagnostic", kind: "ping", node: node, diagnostic: diagnostic)
                         Task { @MainActor in
-                            guard self.running, self.generation == operation else { return }
+                            guard self.pingRunning else { return }
                             self.warning = diagnostic.outcome == "waiting" && diagnostic.elapsedSeconds >= diagnostic.warningSeconds ? diagnostic.warning : nil
                         }
                     }
                 }.value
-                guard PingConfirmation.accepts(before: before, after: after, now: now()) else {
-                    throw CodexConnectionError.server("保活已发送，但未确认新窗口；本轮不再重试")
-                }
-                try events.record("confirmed", kind: "ping", node: node, before: before, after: after, schedule: schedule)
+                guard result.diagnostic.taskCompleted else { throw PingFailure(diagnostic: result.diagnostic) }
+                let outcome: PingOutcome
+                if let after = result.after, PingConfirmation.accepts(before: currentBefore, after: after, now: now()) {
+                    outcome = PingConfirmation.newWindow(before: currentBefore, after: after, now: now(), submittedAt: checkedAt) ? .newWindow : .windowActive
+                } else { outcome = .windowPending }
+                try recordPing(PingNodeResult(node: node, accountID: boundAccount, at: now(), outcome: outcome, diagnostic: result.diagnostic),
+                    event: outcome == .windowPending ? "completed_pending" : "confirmed", before: currentBefore, after: result.after)
                 reloadConfirmations()
-                status = L10n.text("已确认新的 5 小时窗口")
             } catch {
-                let loggedError = CodexConnectionError.diagnosticDescription(for: error)
-                var diagnostic = error as? PingPreflightDiagnostic
-                if diagnostic == nil, [.modelDiscovery, .usageRead, .sessionScan].contains(stage) {
-                    var failure = UsageReadFailure.describe(error, elapsed: ProcessInfo.processInfo.systemUptime - startedUptime)
-                    if stage == .modelDiscovery {
-                        failure = UsageReadDiagnostic(requestStage: "model_discovery", rpcAttempted: nil, cooldown: failure.cooldown,
-                            elapsedMilliseconds: failure.elapsedMilliseconds, reason: failure.reason)
-                    }
-                    diagnostic = PingPreflightDiagnostic(stage: stage, reasons: [stage == .modelDiscovery ? .modelDiscoveryFailed : stage == .usageRead ? .usageReadFailed : .sessionScanFailed],
-                        startedAt: startedAt, checkedAt: now(), elapsedSeconds: max(0, ProcessInfo.processInfo.systemUptime - startedUptime),
-                        usageCapturedAt: checkedUsage?.capturedAt, usageAgeSeconds: checkedUsage.map { now().timeIntervalSince($0.capturedAt) },
-                        opportunityStartsAt: opportunity?.date, opportunityDeadline: opportunity?.deadline, newPauseCount: nil, failure: failure)
+                if error is PingSubmissionError {
+                    do { try saveLedger(keys: attempts.subtracting([key])); submitted = false }
+                    catch { storageFault = true; ledgerHealthy = false; recordingFailure = L10n.text("记录不可用，请检查磁盘空间后刷新。") }
                 }
-                status = CodexConnectionError.capabilityMessage(for: error) ?? diagnostic?.errorDescription ?? (error as? PingFailure)?.errorDescription ?? L10n.text("结果待确认，请刷新查看额度。")
-                lastFailureNeedsAttention = diagnostic?.needsAttention ?? true
-                lastFailure = status
-                try? events.record("failed", kind: "ping", node: node, error: loggedError, preflight: diagnostic)
+                let underlying = (error as? PingSubmissionError)?.underlying ?? error
+                var diagnostic = (underlying as? PingFailure)?.diagnostic
+                if diagnostic == nil, let local = error as? PingSubmissionError {
+                    let failure = underlying as NSError
+                    diagnostic = PingDiagnostic(elapsedSeconds: max(0, ProcessInfo.processInfo.systemUptime - startedUptime), warningSeconds: 90, timeoutSeconds: 180,
+                        reason: local.stage == "process_launch" ? .launch : local.stage == "authentication" ? .accountChanged : .configuration,
+                        outcome: "not_submitted", errorCode: "\(failure.domain):\(failure.code)", stage: local.stage)
+                }
+                let preflight = underlying as? PingPreflightDiagnostic
+                let outcome: PingOutcome = submitted ? (diagnostic?.reason == .model || diagnostic?.reason == .request || diagnostic?.reason == .configuration ? .failed : .unknown) : .failed
+                let result = PingNodeResult(node: node, accountID: boundAccount, at: now(), outcome: outcome, diagnostic: diagnostic,
+                    preflight: preflight, detail: preflight?.errorDescription ?? diagnostic?.failureMessage ?? CodexConnectionError.capabilityMessage(for: error))
+                let unchanged = lastPingResult?.node == node && lastPingResult?.outcome == outcome &&
+                    lastPingResult?.preflight?.reasons == preflight?.reasons && lastPingResult?.diagnostic?.reason == diagnostic?.reason
+                if !unchanged { try? recordPing(result, event: "failed", error: CodexConnectionError.diagnosticDescription(for: error)) }
+                if error is PingSubmissionError || diagnostic?.reason == .model || diagnostic?.reason == .configuration { transport.invalidatePreparation(); maintainKeepAlive(forceCheck: true) }
             }
-            warning = nil
-            pingRunning = false; updateRunning()
+            warning = nil; pingRunning = false; updateRunning()
         }
     }
 
     private func reloadConfirmations() {
-        confirmedWindows = events.keepAliveWindows()
         let logged = events.confirmations()
         let ids = Set(logged.compactMap(\.operationID))
         let saved = operations.values.compactMap { operation -> ExecutionConfirmation? in
@@ -310,6 +392,11 @@ import Darwin
                 threadID: operation.target.id, turnID: operation.turnID)
         }
         confirmations = (logged + saved).sorted { $0.confirmedAt < $1.confirmedAt }
+    }
+
+    func hasAttemptedKeepAlive(node: Date, accountID: String?) -> Bool {
+        guard let accountID else { return false }
+        return attempts.contains("ping:\(accountID):\(node.timeIntervalSince1970)")
     }
 
     func hasAttempted(_ target: BlockedSession, accountID: String? = nil) -> Bool {

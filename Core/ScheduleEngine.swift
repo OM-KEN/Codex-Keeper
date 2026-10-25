@@ -7,17 +7,14 @@ import Foundation
 struct ScheduleEngine {
     /// 自动续跑保留节点后的三分钟宽限。
     static let alignmentTolerance: TimeInterval = 180
-    /// 保活机会保留十分钟；可靠的前一轮窗口最多将本轮机会顺延二十分钟。
+    /// 保活从原节点起保留十分钟开始机会。
     static let keepAliveTolerance: TimeInterval = 600
-    static let maximumKeepAliveDrift: TimeInterval = 20 * 60
     /// 5h 窗口时长
     static let windowDuration: TimeInterval = 5 * 3600
 
     /// 每日开始时间，分钟数（08:00 = 480）
     let anchorMinutes: Int
     var timeZoneID = Calendar.current.timeZone.identifier
-    var accountID: String? = nil
-    var confirmedWindows: [KeepAliveWindowEvidence] = []
 
     /// 当日四个目标节点（本地时间，可能跨到次日凌晨）
     func nodes(on day: Date = Date(), calendar: Calendar = .current) -> [Date] {
@@ -53,23 +50,8 @@ struct ScheduleEngine {
 
     func keepAliveOpportunities(at now: Date, calendar: Calendar = .current) -> [KeepAliveOpportunity] {
         adjacentNodes(at: now, calendar: calendar).map { node in
-            // Only the immediately preceding node of the same daily plan can shift this node.
-            let dayNodes = (-1...0).flatMap { offset in
-                nodes(on: calendar.date(byAdding: .day, value: offset, to: node) ?? node, calendar: calendar)
-            }
-            let previous = dayNodes.firstIndex(of: node).flatMap { index -> Date? in
-                guard index % 4 > 0 else { return nil }
-                return dayNodes[index - 1]
-            }
-            let evidence = confirmedWindows.filter {
-                $0.accountID == accountID && $0.node == previous && $0.anchorMinutes == anchorMinutes &&
-                $0.timeZoneID == calendar.timeZone.identifier &&
-                $0.windowReset > node && $0.windowReset.timeIntervalSince(node) <= Self.maximumKeepAliveDrift
-            }.max { $0.confirmedAt < $1.confirmedAt }
-            let date = evidence?.windowReset ?? node
-            return KeepAliveOpportunity(node: node, date: date,
-                deadline: date.addingTimeInterval(Self.keepAliveTolerance))
-        }.sorted { $0.date < $1.date }
+            KeepAliveOpportunity(node: node, date: node, deadline: node.addingTimeInterval(Self.keepAliveTolerance))
+        }
     }
 
     func retryOpportunity(at now: Date, calendar: Calendar = .current) -> UsageRetryOpportunity? {
@@ -119,13 +101,4 @@ struct KeepAliveOpportunity: Equatable {
     let node: Date
     let date: Date
     let deadline: Date
-}
-
-struct KeepAliveWindowEvidence: Equatable {
-    let accountID: String
-    let node: Date
-    let windowReset: Date
-    let confirmedAt: Date
-    let anchorMinutes: Int
-    let timeZoneID: String
 }

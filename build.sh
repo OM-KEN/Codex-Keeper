@@ -35,6 +35,7 @@ SOURCES=(
     Core/DecisionEngine.swift
     Core/NextAction.swift
     Core/MenuPresentation.swift
+    Core/PingPreparation.swift
     Core/PingEngine.swift
     Core/PingDiagnostics.swift
     Core/ResumeEngine.swift Core/ResumeState.swift
@@ -43,9 +44,10 @@ SOURCES=(
     Codex/AppServerClient.swift
     Codex/DesktopIPCClient.swift
     Codex/ComposerDraftReader.swift
-    Codex/QuotaErrorLogProvider.swift
     Codex/ReadOnlyDatabase.swift
+    Codex/QuotaErrorLogProvider.swift
     Codex/UsageObserver.swift
+    Codex/RolloutUsageMonitor.swift
     Codex/SessionWatcher.swift
     Codex/BlockedSessionDetector.swift
     UI/MenuSummaryView.swift

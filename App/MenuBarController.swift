@@ -21,6 +21,7 @@ import UserNotifications
     private let appState = AppState()
     private let updateService = AppUpdateService()
     private var updateScheduled = false
+    private var updateChecksEnabled: Bool?
     private var menuIsTracking = false
     private var importantUpdatePromptScheduled = false
     private let importantUpdateWindow = ImportantUpdateWindowController()
@@ -63,6 +64,20 @@ import UserNotifications
             notifications.add(UNNotificationRequest(identifier: "keeper-ping-wait-" + UUID().uuidString,
                 content: content, trigger: nil))
         }.store(in: &cancellables)
+        appState.execution.$lastPingResult.dropFirst().receive(on: DispatchQueue.main).sink { result in
+            guard let result else { return }
+            let identifier = "keeper-ping-result-" + String(result.node.timeIntervalSince1970)
+            if result.succeeded || result.acknowledgedAt != nil {
+                notifications.removePendingNotificationRequests(withIdentifiers: [identifier])
+                notifications.removeDeliveredNotifications(withIdentifiers: [identifier])
+                return
+            }
+            guard result.needsAttention else { return }
+            let content = UNMutableNotificationContent()
+            content.title = L10n.text("保活结果")
+            content.body = result.message
+            notifications.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+        }.store(in: &cancellables)
         appState.$recoveryReminderTasks.receive(on: DispatchQueue.main).sink { [weak self] tasks in
             self?.sendRecoveryReminders(for: tasks)
         }.store(in: &cancellables)
@@ -79,21 +94,25 @@ import UserNotifications
             CFRunLoopWakeUp(CFRunLoopGetMain())
         }.store(in: &cancellables)
         rebuildMenu()
-        updateService.startAutomaticChecks()
         if CommandLine.arguments.contains("--show-settings") { openKeeperSettings() }
     }
 
-    // Refresh on every opening; the observation above updates the visible menu when it returns.
+    // Enabled menus refresh on opening; observation updates the visible menu when it returns.
     func menuNeedsUpdate(_ menu: NSMenu) {
-        executionFailureSeen = true
-        appState.refresh(manual: true, source: "menu_open"); rebuildMenu()
+        if appState.enabled {
+            executionFailureSeen = true
+            appState.refresh(manual: true, source: "menu_open")
+        }
+        rebuildMenu()
     }
     func menuWillOpen(_ menu: NSMenu) {
         menuIsTracking = true
-        statusQuotaView.setHighlighted(true); quotaHost?.menuWillOpen()
+        statusQuotaView.setHighlighted(true)
+        if appState.enabled { quotaHost?.menuWillOpen() }
     }
     func menuDidClose(_ menu: NSMenu) {
         menuIsTracking = false
+        appState.execution.acknowledgePingResult()
         statusQuotaView.setHighlighted(false); quotaHost?.menuDidClose()
         scheduleImportantUpdatePrompt()
     }
@@ -164,6 +183,11 @@ import UserNotifications
 
     private func rebuildMenu() {
         let enabled = UserDefaults.standard.bool(forKey: "enabled")
+        if updateChecksEnabled != enabled {
+            updateChecksEnabled = enabled
+            if enabled { updateService.startAutomaticChecks() } else { updateService.stop() }
+        }
+        if !enabled { quotaHost?.menuDidClose() }
         let summary = makeSummary()
         let statusText = appState.execution.running ? L10n.text(summary.headline) : summary.statusText
         let action = summary.action.isEmpty ? summary.headline : summary.action
@@ -179,7 +203,10 @@ import UserNotifications
         statusItem.button?.setAccessibilityLabel(statusDescription)
         let view = MenuSummaryView(summary: summary,
             openTasks: { [weak self] in self?.menu.cancelTracking(); self?.openTasks() },
-            openHistory: { [weak self] point in self?.menu.cancelTracking(); self?.openTasks(history: point) },
+            openHistory: { [weak self] point in
+                self?.menu.cancelTracking()
+                DispatchQueue.main.async { [weak self] in self?.openTasks(history: point) }
+            },
             showError: { [weak self] in self?.menu.cancelTracking(); self?.showExecutionIssue() },
             refresh: { [weak self] in self?.refreshUsage() })
         let host: NSHostingView<MenuSummaryView>
@@ -212,6 +239,7 @@ import UserNotifications
         quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
         let hasUpdate = updateService.showsMenuUpdateIndicator
         let versionTitle = MenuVersionTextFormatter.string(version: AppVersion.currentString, hasUpdate: hasUpdate)
+        versionItem?.isHidden = !enabled
         versionItem?.title = versionTitle
         versionItem?.attributedTitle = nil
         if hasUpdate, let image = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: L10n.text("有新版本"))?
@@ -239,7 +267,7 @@ import UserNotifications
     }
 
     private func presentImportantUpdateIfPossible() {
-        guard !menuIsTracking, importantUpdateWindow.window?.isVisible != true, !appState.execution.running,
+        guard appState.enabled, !menuIsTracking, importantUpdateWindow.window?.isVisible != true, !appState.execution.running,
               NSApp.modalWindow == nil, !NSApp.windows.contains(where: { $0.attachedSheet != nil }),
               let release = updateService.claimImportantUpdatePrompt() else { return }
         importantUpdateWindow.show(release)
@@ -247,26 +275,33 @@ import UserNotifications
 
     private func makeSummary(running: Bool? = nil) -> MenuSummary {
         let defaults = UserDefaults.standard
+        let enabled = defaults.bool(forKey: "enabled")
         var summary = presentation.build(plan: appState.nextAction, usage: appState.usage.snapshot,
             schedule: appState.schedule, tasks: appState.selectedTasks, availableTasks: appState.availableTasks,
-            choices: appState.choices, enabled: defaults.bool(forKey: "enabled"), autoResume: defaults.bool(forKey: "autoResume"),
+            choices: appState.choices, enabled: enabled, autoResume: defaults.bool(forKey: "autoResume"),
             earlyRecoveryPolicy: defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask",
             confirmations: appState.execution.confirmations,
             usageError: appState.usage.lastError, usageErrorIsTransient: appState.usage.lastErrorIsTransient,
-            sessionError: appState.sessions.detectionError,
+            sessionError: appState.nextAction?.mode == .resume ? appState.sessions.detectionError : nil,
             running: running ?? appState.execution.running, executionMode: appState.execution.activeMode,
             executionFailure: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleFailure,
             executionFailureIsCurrent: !executionFailureSeen || appState.execution.activeMode == nil,
             executionWarning: appState.execution.warning,
             executionNotice: appState.execution.activeMode == .resume || appState.execution.recordingFailure != nil ? nil : appState.execution.visibleNotice,
-            refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage)
-        let recordFailures = [appState.pendingStateFailure, appState.execution.recordingFailure].compactMap { $0 }
+            refreshing: appState.usage.refreshing, refreshMessage: appState.usage.refreshMessage,
+            displayUsage: appState.usage.displaySnapshot, accountContext: appState.authenticatedAccountID)
+        guard enabled else { return summary }
+        let recordFailures = [appState.execution.recordingFailure].compactMap { $0 }
         if !recordFailures.isEmpty {
             summary.error = ([summary.error] + recordFailures).filter { !$0.isEmpty }.joined(separator: "\n")
             summary.hasStatusIssue = true
         }
         summary.applyResumeTasks(operations: appState.currentOperations, pending: appState.availableTasks, choices: appState.choices,
             enabled: appState.enabled, autoResume: appState.automaticResumeEnabled)
+        if appState.automaticResumeEnabled, appState.pendingStateFailure != nil || appState.sessions.detectionError != nil {
+            summary.tasks = [L10n.text("自动继续暂不可用")]; summary.tasksNeedAttention = true
+        }
+        summary.applyPingHistory(appState.execution.pingResults, accountID: appState.authenticatedAccountID ?? appState.displayAccountID ?? appState.execution.lastPingResult?.accountID)
         summary.applyResumeHistory(appState.visibleOperations, accountID: appState.displayAccountID, confirmations: appState.execution.confirmations)
         return summary
     }
@@ -338,6 +373,14 @@ import UserNotifications
     }
     @objc private func openTasks() { openTasks(history: nil) }
     private func openTasks(history: MenuTimelinePoint?) {
+        if let history, history.kind == .pingRecord || history.kind == .completedKeepAlive {
+            let alert = NSAlert()
+            alert.messageText = L10n.text("保活记录")
+            alert.informativeText = history.timeLabel + "\n" + (history.pingResult?.message ?? L10n.text(history.label))
+            alert.addButton(withTitle: L10n.text("好"))
+            NSApp.activate(ignoringOtherApps: true); alert.runModal()
+            return
+        }
         if tasksWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 572, height: 340), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.title = L10n.text("自动继续任务")
@@ -351,7 +394,8 @@ import UserNotifications
         }
         NSApp.activate(ignoringOtherApps: true)
         tasksWindow?.contentView = NSHostingView(rootView: ResumeTasksView(state: appState,
-            historyIDs: history?.operationIDs, historyAccountID: appState.displayAccountID, historyLabel: history.map { $0.timeLabel + " · " + L10n.text($0.label) }))
+            historyIDs: history?.operationIDs, historyAccountID: appState.displayAccountID,
+            historyLabel: history.map { $0.timeLabel + " · " + L10n.text($0.label) }, historyDetail: history?.pingResult?.message))
         if let progress = tasksWindow?.titlebarAccessoryViewControllers.first {
             progress.view = NSHostingView(rootView: ResumeTasksProgressView(state: appState, historyIDs: history?.operationIDs))
             progress.view.setFrameSize(NSSize(width: 140, height: 28))

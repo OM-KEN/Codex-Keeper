@@ -17,7 +17,7 @@ enum KeeperDecision: Equatable {
     }
 }
 
-/// One plan supplies both the menu and the executor. Dates are conditional on fresh quota.
+/// One plan supplies both the menu and the executor. Continuation requires fresh quota.
 struct DecisionEngine {
     let schedule: ScheduleEngine
 
@@ -29,7 +29,7 @@ struct DecisionEngine {
 
     func plan(now: Date = Date(), calendar: Calendar = .current, enabled: Bool, autoResume: Bool,
               earlyRecoveryPolicy: String, usage: UsageSnapshot?, blocked: [BlockedSession],
-              observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false,
+              reservationUsage: UsageSnapshot? = nil, observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false,
               reserveIdleDate: Bool = false) -> NextAction {
         let target = blocked.first
         let mode: NextActionMode = target != nil ? .resume : .keepAlive
@@ -37,14 +37,19 @@ struct DecisionEngine {
             NextAction(mode: mode, date: date, decision: .wait(reason: reason), note: reason, needsRecoveryDecision: needsRecoveryDecision)
         }
         guard enabled else { return wait("已停用") }
+        if target == nil { return keepAlivePlan(now: now, calendar: calendar, usage: usage) }
         guard let usage, usage.fiveHour != nil || usage.weekly != nil else { return wait("等待额度同步") }
         guard usage.isFresh(at: now) else {
-            if reserveIdleDate, target == nil {
-                let blocked = [usage.fiveHour, usage.weekly].compactMap { $0 }.contains { $0.usedPercent >= 100 }
-                return NextAction(mode: .keepAlive,
-                    date: UsagePollingPolicy.reservedKeepAliveDate(now: now, schedule: schedule, usage: usage, calendar: calendar),
-                    decision: .wait(reason: "等待下一可行计划节点"),
-                    note: blocked ? "额度恢复后按计划保活" : usage.fiveHour == nil ? "当前无需保活" : "")
+            if reserveIdleDate, let target, autoResume, !needsRecoveryDecision {
+                let reserved = reservationUsage.flatMap { $0.accountID == usage.accountID && $0.capturedAt >= usage.capturedAt ? $0 : nil } ?? usage
+                let exhausted = [reserved.fiveHour, reserved.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
+                let reset = exhausted.map(\.resetsAt).max() ?? [target.fiveHourResetAt, target.weeklyResetAt].compactMap { $0 }.max()
+                if let reset, reset > now {
+                    let deferred = heldForPlan || (schedule.isInAnchorProtection(at: reset, calendar: calendar) && earlyRecoveryPolicy != "immediately")
+                    return wait(deferred ? "恢复后顺延至计划时间" : "额度恢复并确认后续跑",
+                        at: deferred ? schedule.firstNode(onOrAfter: reset, calendar: calendar) : reset)
+                }
+                return wait("额度已过期，等待实时确认", at: schedule.nextNode(after: now, calendar: calendar))
             }
             return wait("额度已过期，等待实时确认")
         }
@@ -52,9 +57,8 @@ struct DecisionEngine {
         let five = usage.fiveHour
         let exhausted = [five, usage.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
         let blockingReset = exhausted.map { $0.resetsAt }.max()
-        let atNode = (target == nil ? schedule.currentKeepAliveNode(at: now, calendar: calendar) :
-            schedule.currentNode(at: now, calendar: calendar)) != nil
-        let nextNode = target == nil ? schedule.nextKeepAliveNode(after: now, calendar: calendar) : schedule.nextNode(after: now, calendar: calendar)
+        let atNode = schedule.currentNode(at: now, calendar: calendar) != nil
+        let nextNode = schedule.nextNode(after: now, calendar: calendar)
         if let target {
             if target.fiveHourResetAt != nil && five == nil || target.weeklyResetAt != nil && usage.weekly == nil {
                 return wait("等待额度恢复确认")
@@ -89,18 +93,32 @@ struct DecisionEngine {
             default: return wait("按计划自动继续", at: nextNode)
             }
         }
-        if let reset = blockingReset {
-            guard reset > now else { return wait("等待额度恢复确认") }
-            return wait("额度恢复后按计划保活", at: schedule.firstKeepAliveNode(onOrAfter: reset, calendar: calendar))
+        return wait("等待额度恢复确认")
+    }
+
+    private func keepAlivePlan(now: Date, calendar: Calendar, usage: UsageSnapshot?) -> NextAction {
+        let node = schedule.currentKeepAliveNode(at: now, calendar: calendar)
+        let next = schedule.nextKeepAliveNode(after: now, calendar: calendar)
+        func wait(_ reason: String, at date: Date?) -> NextAction {
+            NextAction(mode: .keepAlive, date: date, decision: .wait(reason: reason), note: reason)
         }
-        guard let five else { return wait("当前无需保活") }
-        guard let active = usage.activeFiveHourWindow else { return wait("正在同步窗口状态") }
-        if atNode && !active {
-            return NextAction(mode: .keepAlive, date: now, decision: .ping(reason: "计划节点，当前无窗口"), note: "")
+        if let usage, usage.isFresh(at: now) {
+            let exhausted = [usage.fiveHour, usage.weekly].compactMap { $0 }.filter { $0.usedPercent >= 100 }
+            if !exhausted.isEmpty {
+                let reset = exhausted.map(\.resetsAt).max()!
+                return wait("额度恢复后按计划保活", at: reset > now ? schedule.firstKeepAliveNode(onOrAfter: reset, calendar: calendar) : next)
+            }
+            if let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now {
+                return NextAction(mode: .keepAlive, date: schedule.firstKeepAliveNode(onOrAfter: five.resetsAt, calendar: calendar),
+                    decision: node == nil ? .wait(reason: "等待下一可行计划节点") : .skip(reason: "已有有效 5 小时窗口"), note: "")
+            }
         }
-        let date = schedule.firstKeepAliveNode(onOrAfter: active ? five.resetsAt : nextNode, calendar: calendar)
-        return NextAction(mode: .keepAlive, date: date,
-            decision: atNode ? .skip(reason: "已有有效 5 小时窗口") : .wait(reason: "等待下一可行计划节点"), note: "")
+        if node != nil {
+            let knownInactive = usage?.isFresh(at: now) == true && usage?.fiveHour != nil && usage?.activeFiveHourWindow == false
+            return NextAction(mode: .keepAlive, date: now, decision: .ping(reason: knownInactive ? "计划节点，当前无窗口" : "计划节点，尝试保活"), note: "")
+        }
+        return NextAction(mode: .keepAlive, date: next, decision: .wait(reason: "等待下一可行计划节点"), note: "")
+
     }
 }
 
@@ -114,6 +132,19 @@ enum UsageRecovery {
               (usage.fiveHour?.usedPercent ?? 0) < 100, (usage.weekly?.usedPercent ?? 0) < 100 else { return false }
         if target.fiveHourResetAt != nil && usage.fiveHour == nil { return false }
         if target.weeklyResetAt != nil && usage.weekly == nil { return false }
+        return true
+    }
+
+    /// A task's confirmed future quota deadline supplies evidence independent of polling cadence.
+    /// Only a new live same-account read can prove that this particular stop recovered early.
+    static func isEarlyAfterQuotaStop(_ target: BlockedSession, from before: UsageSnapshot?, usage: UsageSnapshot?, boundAccount: String?, now: Date) -> Bool {
+        guard target.identityUncertain != true,
+              let before, before.sourceFile == "app-server", before.accountID == boundAccount,
+              before.capturedAt > target.blockedAt, before.capturedAt <= (usage?.capturedAt ?? .distantPast),
+              hasAvailableQuota(for: target, usage: usage, boundAccount: boundAccount, now: now),
+              let reset = [before.fiveHour, before.weekly].compactMap({ $0 }).filter({ $0.usedPercent >= 100 }).map(\.resetsAt).max(),
+              [target.fiveHourResetAt, target.weeklyResetAt].contains(reset),
+              reset > target.blockedAt, reset.timeIntervalSince(now) > observationTolerance else { return false }
         return true
     }
 
