@@ -37,7 +37,7 @@ struct ResumeTasksView: View {
                 if let historyLabel, historyAccountID == state.displayAccountID {
                     Text(historyLabel).font(.system(size: 14, weight: .semibold))
                 }
-                if historyIDs == nil, let failure = state.execution.recordingFailure {
+                if historyIDs == nil, let failure = state.pendingStateFailure ?? state.sessions.detectionError ?? state.execution.recordingFailure {
                     Label(failure, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.system(size: 13))
                 }
                 if rows.isEmpty {

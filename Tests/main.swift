@@ -4,11 +4,13 @@ import Darwin
 
 @main struct RegressionTests {
     @MainActor static func main() async throws {
+        setbuf(stdout, nil)
         var failed = 0
         var count = 0
         func check(_ value: Bool, _ name: String) {
             count += 1
             if !value { failed += 1; print("FAIL: \(name)") }
+            else if CommandLine.arguments.contains("--verbose") { print("PASS: \(name)") }
         }
         if CommandLine.arguments.contains("--menu-disabled-only") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-menu-disabled-" + UUID().uuidString)
@@ -43,8 +45,15 @@ import Darwin
             if failed > 0 { exit(1) }
             return
         }
+        if CommandLine.arguments.contains("--keepalive-only") {
+            try await checkKeepAliveSimplification(check)
+            print("\(count - failed)/\(count) keepalive simplification checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
         let appUpdateOnly = CommandLine.arguments.contains("--app-update-only")
         if !appUpdateOnly {
+            try await checkKeepAliveSimplification(check)
             try await checkLogicRepairRegression(check)
             if CommandLine.arguments.contains("--logic-repair-only") {
                 print("\(count - failed)/\(count) logic repair checks passed")
@@ -907,7 +916,7 @@ import Darwin
         }
         if case .ping = decide(full, nil) { check(false, "expired exhausted must wait") } else { check(true, "expired exhausted must wait") }
         if case .ping = decide(QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: localNode.addingTimeInterval(-1)), weekly) { check(false, "weekly gates ping") } else { check(true, "weekly gates ping") }
-        if case .ping = decide(nil, QuotaWindow(usedPercent: 20, windowMinutes: 10080, resetsAt: future)) { check(false, "weekly-only must not ping") } else { check(true, "weekly-only must not ping") }
+        if case .ping = decide(nil, QuotaWindow(usedPercent: 20, windowMinutes: 10080, resetsAt: future)) { check(true, "weekly-only has unknown five-hour status and permits an isolated attempt") } else { check(false, "weekly-only has unknown five-hour status and permits an isolated attempt") }
         // The displayed action must be the same action the executor can perform.
         let evening = date("2026-09-10T21:13:00Z")
         let midnightReset = date("2026-09-11T00:52:44Z")
@@ -924,7 +933,7 @@ import Darwin
         let weeklyPlan = engine.plan(now: evening, calendar: cal, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask", usage: exhaustedEvening, blocked: [resetTarget])
         check(weeklyPlan.date == date("2026-09-12T13:00:00Z"), "weekly exhausted window gates next resume date")
         var oldEvening = liveEvening; oldEvening.capturedAt = evening.addingTimeInterval(-61)
-        check(engine.plan(now: evening, calendar: cal, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask", usage: oldEvening, blocked: []).date == nil, "stale quota never displays a fabricated schedule date")
+        check(engine.plan(now: evening, calendar: cal, enabled: true, autoResume: true, earlyRecoveryPolicy: "ask", usage: oldEvening, blocked: []).date == schedule.nextKeepAliveNode(after: evening, calendar: cal), "stale quota retains the next fixed schedule without using its old reset")
         check(oldEvening.nextResetDate(at: evening) == nil, "stale quota cannot supply prominent reset")
         let graceTime = date("2026-09-10T13:00:00Z")
         let graceReset = graceTime.addingTimeInterval(8)
@@ -1204,16 +1213,20 @@ import Darwin
         let liveModel = try catalogProvider.pingModel()
         _ = try catalogProvider.read()
         check(liveModel == PingModel(model: "gpt-6-luna", reasoningEffort: "low") && catalogConnections == 1,
-            "online paginated Luna discovery reuses the quota connection without model cache")
+            "online paginated Luna discovery reuses the quota connection and caches stable capabilities")
         check(catalogTransport.modelParams.count == 2 && catalogTransport.modelParams[1]["cursor"] as? String == "page-2" &&
             catalogTransport.modelParams[0]["includeHidden"] as? Bool == false, "model pagination sends official fields")
         catalogTransport.pages = [["data": [["model": "gpt-6-luna", "supportedReasoningEfforts": [["reasoningEffort": "medium"]], "defaultReasoningEffort": "medium"]]]]
+        catalogProvider.invalidatePingModel()
         check(try catalogProvider.pingModel().reasoningEffort == "medium", "unsupported low effort uses declared supported default")
         catalogTransport.pages = [["data": [["model": "gpt-6-luna"]]]]
+        catalogProvider.invalidatePingModel()
         check(try catalogProvider.pingModel().reasoningEffort == nil, "missing capability leaves reasoning to model default")
         catalogTransport.pages = [["data": [["model": "gpt-6-luna", "supportedReasoningEfforts": [["reasoningEffort": "invalid\"value"]], "defaultReasoningEffort": "invalid\"value"]]]]
+        catalogProvider.invalidatePingModel()
         check(try catalogProvider.pingModel().reasoningEffort == nil, "unknown reasoning value cannot enter generated TOML")
         catalogTransport.pages = [["data": [["model": "expensive-alternative"]]]]
+        catalogProvider.invalidatePingModel()
         check((try? catalogProvider.pingModel()) == nil, "missing Luna never substitutes another model")
         let modelCallsAtFailure = catalogTransport.modelParams.count
         for _ in 0..<10 { _ = try? catalogProvider.pingModel() }
@@ -1281,8 +1294,8 @@ import Darwin
         var uncertainUsage = recoveredUsage; uncertainUsage.zeroUseWindowActive = nil
         let uncertainPlan = engine.plan(now: recoveredAt, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: uncertainUsage, blocked: [])
         let uncertainMenu = MenuSummary.build(plan: uncertainPlan, usage: uncertainUsage, schedule: schedule, tasks: [], now: recoveredAt)
-        check(uncertainMenu.timeline.isEmpty && uncertainMenu.quotas.first?.detail == "—", "unknown window cannot display rolling timestamp or duplicate loading label")
-        check(uncertainMenu.isSyncing && uncertainMenu.headline == "正在同步", "quota confirmation shares one native loading state")
+        check(uncertainMenu.isTime && uncertainMenu.timeline.allSatisfy { $0.date >= recoveredAt && $0.kind != .start && $0.kind != .keepAliveNotNeeded } && uncertainMenu.quotas.first?.detail == "—", "unknown quota displays the fixed plan without inventing a window origin")
+        check(!uncertainMenu.isSyncing && uncertainMenu.action == "保持活动", "unknown quota retains the fixed keep-alive plan while refreshing")
         let alignedQuota = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 20, windowMinutes: 300, resetsAt: localNode.addingTimeInterval(8)), weekly: nil, capturedAt: localNode, sourceFile: "app-server")
         let alignedPlan = engine.plan(now: localNode, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: alignedQuota, blocked: [])
         let alignedMenu = MenuSummary.build(plan: alignedPlan, usage: alignedQuota, schedule: schedule, tasks: [], now: localNode)
@@ -1335,10 +1348,9 @@ import Darwin
             live.weekly?.resetsAt = at.addingTimeInterval(-1)
             let unconfirmed = waitingMenu(live)
             let unconfirmedPlan = engine.plan(now: at, enabled: true, autoResume: false, earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [])
-            check((!unconfirmed.isTime || unconfirmed.action == "额度重置" && unconfirmed.headline == clock.string(from: live.fiveHour!.resetsAt)) &&
-                unconfirmed.timeline.filter { $0.isAction }.isEmpty && unconfirmedPlan.date == nil &&
-                unconfirmedPlan.decision == .wait(reason: "等待额度恢复确认"),
-                "elapsed weekly exhaustion permits only real future five-hour reset display and never an executable action")
+            check(unconfirmed.isTime && unconfirmedPlan.date.map { $0 > at } == true &&
+                unconfirmedPlan.decision == .wait(reason: "额度恢复后按计划保活") && unconfirmed.quotas.last?.remaining == 0,
+                "elapsed weekly exhaustion retains its true reading and a future fixed plan without authorizing execution")
             live.weekly = nil; live.fiveHour?.resetsAt = start.addingTimeInterval(18660)
             let offPlan = waitingMenu(live)
             check(offPlan.action == "额度重置" && offPlan.statusSymbol == "arrow.clockwise.circle.fill" && offPlan.badge == "计划外" && offPlan.headline == clock.string(from: live.fiveHour!.resetsAt) && !offPlan.reminderTitle.isEmpty,
@@ -1349,8 +1361,8 @@ import Darwin
                 "available quota without an active window shows normal keep-alive and the unanswered reminder")
             live.zeroUseWindowActive = nil
             let unknownActivity = waitingMenu(live)
-            check(unknownActivity.isSyncing && !unknownActivity.isTime && unknownActivity.badge.isEmpty && unknownActivity.quotas.first?.detail == "—" && !unknownActivity.reminderTitle.isEmpty,
-                "unknown window activity waits for sync while retaining the unanswered reminder")
+            check(unknownActivity.isTime && !unknownActivity.isSyncing && unknownActivity.badge.isEmpty && unknownActivity.quotas.first?.detail == "—" && !unknownActivity.reminderTitle.isEmpty,
+                "unknown window activity retains the fixed keep-alive plan and unanswered reminder")
             let approvedPlan = engine.plan(now: at, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [task], heldForPlan: true)
             let approved = MenuSummary.build(plan: approvedPlan, usage: live, schedule: schedule, tasks: [task], now: at)
             check(approved.isTime && approved.action == "自动继续" && approved.statusSymbol == "paperplane" && approved.badge.isEmpty && approved.quotas.first?.detail == "—" && approved.timeline.map(\.kind) == [.resume],
@@ -1358,8 +1370,10 @@ import Darwin
         }
         let resumeMenu = MenuSummary.build(plan: plannedResume, usage: exhaustedEvening, schedule: schedule, tasks: [resetTarget], now: evening)
         check(resumeMenu.action == "自动继续" && resumeMenu.tasks == [resetTarget.displayName], "resume still shows pending task and automatic action")
-        let staleMenu = MenuSummary.build(plan: displayPlan, usage: oldEvening, schedule: schedule, tasks: [], now: evening)
-        check(staleMenu.headline == "正在同步" && !staleMenu.isTime && staleMenu.badge.isEmpty, "stale quota cannot claim plan status or reset time")
+        let staleDisplayPlan = engine.plan(now: evening, enabled: true, autoResume: true, earlyRecoveryPolicy: "keepPlan", usage: oldEvening, blocked: [])
+        let staleMenu = MenuSummary.build(plan: staleDisplayPlan, usage: oldEvening, schedule: schedule, tasks: [], now: evening)
+        check(staleMenu.isTime && staleMenu.quotas.first?.remaining == 100 - oldEvening.fiveHour!.usedPercent &&
+            staleMenu.timeline.contains { $0.date == staleDisplayPlan.date && $0.kind == .keepAlive }, "a fixed plan displays independently of the age of the last real quota")
         var expiredDisplayQuota = displayQuota
         expiredDisplayQuota.capturedAt = localNode.addingTimeInterval(-60)
         check(MenuSummary.build(plan: displayPlan, usage: expiredDisplayQuota, schedule: schedule, tasks: [], now: localNode).isTime,
@@ -1367,8 +1381,8 @@ import Darwin
         expiredDisplayQuota.capturedAt = localNode.addingTimeInterval(-61)
         var expiredDisplayMenu = MenuSummary.build(plan: displayPlan, usage: expiredDisplayQuota, schedule: schedule, tasks: [], now: localNode)
         expiredDisplayMenu.applyUsageRefreshState(refreshing: false, error: "暂时连接失败")
-        check(!expiredDisplayMenu.isTime && expiredDisplayMenu.quotas.isEmpty && expiredDisplayMenu.statusText == "待同步",
-            "expired live readings display waiting for sync without exposing stale quota or plan time")
+        check(expiredDisplayMenu.isTime && expiredDisplayMenu.quotas.map(\.remaining) == alignedMenu.quotas.map(\.remaining),
+            "expired real readings retain their quota facts alongside the fixed plan without granting execution permission")
         checkSteadyMenuPresentation(check)
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -1957,8 +1971,11 @@ import Darwin
         _ = try? fallbackProvider.read()
         _ = try? fallbackProvider.readForUserRefresh()
         let fallbackRuntime = temp.appendingPathComponent("fallback-support/pending-runtime.json")
+        let fallbackExecution = ExecutionCoordinator(provider: fallbackProvider, defaults: fallbackDefaults,
+            ledgerURL: fallbackRuntime.deletingLastPathComponent().appendingPathComponent("attempts.json"),
+            pingTransport: PreparationGatePing(), codexHome: locatorHome)
         let fallbackState = AppState(provider: fallbackProvider, defaults: fallbackDefaults, runtimeURL: fallbackRuntime,
-            codexHome: locatorHome, startMonitoring: false)
+            codexHome: locatorHome, execution: fallbackExecution, startMonitoring: false)
         try CodexLocator.saveFallbackPath(manualCLI.path, defaults: fallbackDefaults)
         for _ in 0..<300 {
             if fallbackConnections == 3 && !fallbackState.usage.refreshing { break }
@@ -2008,7 +2025,7 @@ import Darwin
             return observerConnections == 1 ? observerFailed : observerRecovered
         }, contextIdentity: { nil })
         let observerLog = temp.appendingPathComponent("observer-events.jsonl")
-        let observer = UsageObserver(codexHome: fakeHome, provider: observerProvider, logURL: observerLog)
+        let observer = UsageObserver(provider: observerProvider, logURL: observerLog)
         observer.refresh()
         for _ in 0..<10 { observer.refresh(manual: true) }
         for _ in 0..<300 {
@@ -2036,7 +2053,7 @@ import Darwin
         successTransport.delay = 0.05
         let successProvider = AppServerUsageProvider(makeTransport: { successTransport }, contextIdentity: { nil })
         let successLog = temp.appendingPathComponent("refresh-success.jsonl")
-        let successObserver = UsageObserver(codexHome: fakeHome, provider: successProvider, logURL: successLog)
+        let successObserver = UsageObserver(provider: successProvider, logURL: successLog)
         successObserver.refresh()
         successObserver.refresh(manual: true, source: "button")
         check(successObserver.refreshing && successObserver.refreshMessage.contains("完成后重新读取"),
@@ -2074,16 +2091,15 @@ import Darwin
         accountFailureTransport.onRequest = { call in
             if call > 1 { throw CodexConnectionError.server("HTTP/1.1 401 Unauthorized") }
         }
-        let accountFailureObserver = UsageObserver(codexHome: fakeHome,
-            provider: AppServerUsageProvider(makeTransport: { accountFailureTransport }, contextIdentity: { nil }),
+        let accountFailureObserver = UsageObserver(provider: AppServerUsageProvider(makeTransport: { accountFailureTransport }, contextIdentity: { nil }),
             logURL: temp.appendingPathComponent("refresh-account-failure.jsonl"))
         accountFailureObserver.refresh()
         for _ in 0..<300 { if !accountFailureObserver.refreshing { break }; try await Task.sleep(nanoseconds: 10_000_000) }
         check(accountFailureObserver.snapshot?.isFresh(at: Date()) == true, "account failure fixture starts with a fresh live reading")
         accountFailureObserver.refresh()
         for _ in 0..<300 { if !accountFailureObserver.refreshing { break }; try await Task.sleep(nanoseconds: 10_000_000) }
-        check(accountFailureObserver.lastError != nil && !accountFailureObserver.lastErrorIsTransient && accountFailureObserver.snapshot == nil && accountFailureTransport.closes == 1,
-            "authentication failure discards the recent account reading instead of continuing to trust it")
+        check(accountFailureObserver.lastError != nil && !accountFailureObserver.lastErrorIsTransient && accountFailureObserver.snapshot != nil && !accountFailureObserver.hasReliableReading && accountFailureTransport.closes == 1,
+            "authentication failure keeps the last real display fact while revoking execution reliability")
         for message in ["unexpected status code: 503", "error sending request"] {
             for authUnreadable in [false, true] {
                 var authenticationFailed = false
@@ -2099,14 +2115,14 @@ import Darwin
                     return Data((authenticationFailed ? "changed-account" : "initial-account").utf8)
                 })
                 let failureLog = temp.appendingPathComponent("network-auth-failure-\(UUID().uuidString).jsonl")
-                let observer = UsageObserver(codexHome: fakeHome, provider: provider, logURL: failureLog)
+                let observer = UsageObserver(provider: provider, logURL: failureLog)
                 observer.refresh()
                 for _ in 0..<300 { if !observer.refreshing { break }; try await Task.sleep(nanoseconds: 10_000_000) }
                 check(observer.snapshot?.isFresh(at: Date()) == true, "network/authentication fixture begins with live quota")
                 observer.refresh()
                 for _ in 0..<300 { if !observer.refreshing { break }; try await Task.sleep(nanoseconds: 10_000_000) }
-                check(observer.lastError != nil && !observer.lastErrorIsTransient && observer.snapshot == nil && connection.closes == 1 && connection.calls == 2,
-                    "authentication fault during RPC failure clears live quota and stops the immediate retry: \(message), unreadable=\(authUnreadable)")
+                check(observer.lastError != nil && !observer.lastErrorIsTransient && observer.snapshot != nil && !observer.hasReliableReading && connection.closes == 1 && connection.calls == 2,
+                    "authentication fault during RPC failure keeps the old display fact untrusted and stops immediate retry: \(message), unreadable=\(authUnreadable)")
                 let rows = try String(contentsOf: failureLog, encoding: .utf8).split(separator: "\n").compactMap {
                     try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
                 }
@@ -2121,7 +2137,7 @@ import Darwin
                 }
             }
         }
-        let failureObserver = UsageObserver(codexHome: fakeHome, provider: manualFailureProvider,
+        let failureObserver = UsageObserver(provider: manualFailureProvider,
             logURL: temp.appendingPathComponent("refresh-failure.jsonl"))
         failureObserver.refresh(manual: true, source: "button")
         for _ in 0..<300 {
@@ -2136,7 +2152,7 @@ import Darwin
             let filler = "{\"event\":\"historical_fixture\",\"marker\":\"bounded-padding\"}\n"
             let historical = firstRow + String(repeating: filler, count: (1024 * 1024 / filler.utf8.count) + 1)
             try historical.write(to: rotationLog, atomically: true, encoding: .utf8)
-            let rotationObserver = UsageObserver(codexHome: fakeHome, provider: successProvider, logURL: rotationLog)
+            let rotationObserver = UsageObserver(provider: successProvider, logURL: rotationLog)
             rotationObserver.refresh(manual: true, source: "button")
             for _ in 0..<300 { if !rotationObserver.refreshing { break }; try await Task.sleep(nanoseconds: 10_000_000) }
             let backup = rotationLog.appendingPathExtension("1")
@@ -2195,7 +2211,7 @@ import Darwin
             return shutdownConnections == 1 ? shutdownClient : try AppServerClient(binary: shutdownExecutable, usageOnly: true)
         }, contextIdentity: { nil }, uptime: { shutdownUptime })
         let shutdownLog = shutdownRoot.appendingPathComponent("usage-transitions.jsonl")
-        let shutdownObserver = UsageObserver(codexHome: shutdownRoot, provider: shutdownProvider, logURL: shutdownLog)
+        let shutdownObserver = UsageObserver(provider: shutdownProvider, logURL: shutdownLog)
         shutdownObserver.refresh()
         for _ in 0..<300 {
             if !shutdownObserver.refreshing { break }
@@ -2239,15 +2255,10 @@ import Darwin
         check(shutdownEvents.contains("usage_read_failed") && shutdownEvents.contains("automatic") &&
             shutdownEvents.contains("connection_ended") && !shutdownEvents.contains("usage_refresh_started"),
             "shutdown recovery records the automatic failure without a manual refresh")
-        let retryEvidence = PingLogEvidence.classify("stream disconnected - retrying sampling request (4/5 in 1.648s)... retries=4 max_retries=5 sampling_error=request timed out")
-        check(retryEvidence?.reason == .requestTimeout && retryEvidence?.retryCount == 4, "request timeout preserves observed retry count without blaming proxy or server")
-        check(PingLogEvidence.classify("request payload: proxy authentication required") == nil, "quoted request content is not connection evidence")
-        check(PingLogEvidence.classify("stream disconnected - retrying sampling request (1/5)... sampling_error=proxy authentication required")?.reason == .proxy, "explicit proxy failure has its own category")
-        check(PingLogEvidence.classify("stream disconnected - retrying sampling request (1/5)... sampling_error=unexpected status 503 Service Unavailable")?.reason == .server, "explicit server HTTP failure has its own category")
         check(PingTiming().warning == 90 && PingTiming().timeout == 180, "warning at 90 does not replace 180-second deadline")
         let pingRoot = temp.appendingPathComponent("keeper-ping")
         try FileManager.default.createDirectory(at: fakeHome, withIntermediateDirectories: true)
-        try Data("test-credential-only".utf8).write(to: fakeHome.appendingPathComponent("auth.json"))
+        try writeKeepAliveAuthentication(home: fakeHome, account: beforePing.accountID!)
         let fakeTUI = temp.appendingPathComponent("fake-tui")
         let ttyScript = """
         #!/usr/bin/python3
@@ -2280,7 +2291,7 @@ import Darwin
         let previousReceipts = Set(SessionWatcher.recentRollouts(codexHome: receiptHome, limit: 20).map(\.url))
         check(!PingReceipt.completed(home: receiptHome, excluding: previousReceipts), "old OK receipt cannot confirm another request")
         let copiedAuth = try Data(contentsOf: pingRoot.appendingPathComponent("home/auth.json"))
-        check(copiedAuth == Data("test-credential-only".utf8), "ping uses isolated home with local-only credential copy")
+        check(copiedAuth == (try Data(contentsOf: fakeHome.appendingPathComponent("auth.json"))), "ping uses isolated home with local-only credential copy")
         check(!FileManager.default.fileExists(atPath: fakeHome.appendingPathComponent("sessions").path), "ping does not create normal-home history")
         let pingConfig = try String(contentsOf: receiptHome.appendingPathComponent("config.toml"), encoding: .utf8)
         check(pingConfig.contains("[projects.\"" + pingRoot.appendingPathComponent("work").path + "\"]"), "generated TOML project path has no invalid escaped forward slashes")
@@ -2292,34 +2303,10 @@ import Darwin
         } catch {
             check(error.localizedDescription.contains("设置未就绪"), "config startup failure cannot report quota confirmation timeout")
         }
-        let diagnosticHome = temp.appendingPathComponent("ping-log-fixture")
-        try FileManager.default.createDirectory(at: diagnosticHome, withIntermediateDirectories: true)
-        var pingDB: OpaquePointer?
-        sqlite3_open(diagnosticHome.appendingPathComponent("logs_2.sqlite").path, &pingDB)
-        sqlite3_exec(pingDB, "CREATE TABLE logs(ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil)
         let pingThread = "11111111-1111-1111-1111-111111111111"
         let pingTurn = "22222222-2222-2222-2222-222222222222"
-        let pingOther = "33333333-3333-3333-3333-333333333333"
-        let logStart = Date(timeIntervalSince1970: 1000.5)
-        func addPingLog(_ second: Int, _ nano: Int, _ thread: String, _ turn: String, _ reason: String, _ target: String = "codex_core::responses_retry") {
-            let body = "stream disconnected - retrying sampling request (4/5 in 1s)... turn_id=\(turn) retries=4 max_retries=5 sampling_error=\(reason)"
-            sqlite3_exec(pingDB, "INSERT INTO logs VALUES(\(second),\(nano),'\(target)','\(thread)','\(body)')", nil, nil, nil)
-        }
-        addPingLog(1000, 100_000_000, pingThread, pingTurn, "proxy authentication required")
-        addPingLog(1001, 0, pingOther, pingTurn, "proxy authentication required")
-        addPingLog(1001, 0, pingThread, pingOther, "proxy authentication required")
-        let logReader = PingDiagnosticLogReader(home: diagnosticHome)
-        check(logReader.read(threadID: pingThread, turnID: pingTurn, since: logStart, until: Date(timeIntervalSince1970: 1002)).evidence == nil,
-            "ping evidence excludes old nanosecond, another thread and another turn")
-        addPingLog(1001, 0, pingThread, pingTurn, "request timed out Authorization: Bearer fixture-secret-token")
-        addPingLog(1003, 0, pingThread, pingTurn, "proxy authentication required")
-        addPingLog(1001, 500_000_000, pingThread, pingTurn, "proxy authentication required", "codex_core::prewarm")
-        sqlite3_close(pingDB)
-        let scopedEvidence = logReader.read(threadID: pingThread, turnID: pingTurn, since: logStart, until: Date(timeIntervalSince1970: 1002))
-        check(scopedEvidence.evidence?.reason == .requestTimeout && scopedEvidence.evidence?.retryCount == 4 && scopedEvidence.status == "readable",
-            "ping evidence selects exact attempt and ignores future and unrelated target logs")
         var safeDiagnostic = PingDiagnostic(elapsedSeconds: 90, warningSeconds: 90, timeoutSeconds: 180, threadID: pingThread, turnID: pingTurn)
-        safeDiagnostic.reason = scopedEvidence.evidence!.reason; safeDiagnostic.retryCount = scopedEvidence.evidence?.retryCount
+        safeDiagnostic.reason = .requestTimeout; safeDiagnostic.errorCode = "request_timeout"
         let safeEventURL = temp.appendingPathComponent("ping-diagnostic-events.jsonl")
         try ExecutionEventLog(url: safeEventURL).record("diagnostic", kind: "ping", node: nil, diagnostic: safeDiagnostic)
         let safeEvent = try String(contentsOf: safeEventURL, encoding: .utf8)
@@ -2390,6 +2377,7 @@ import Darwin
             return cooledConnections == 1 ? cooledFailure : cooledRecovery
         }, contextIdentity: { nil }, uptime: { ProcessInfo.processInfo.systemUptime * 40 })
         var providerPingBefore = pingBefore; providerPingBefore.accountID = "usage-test"
+        try writeKeepAliveAuthentication(home: fakeHome, account: "usage-test")
         var cooledProgress: [PingDiagnostic] = []
         _ = try PTYPingTransport(codexHome: fakeHome, supportRoot: cooledRoot, binary: completedTUI, timing: testTiming)
             .ping(before: providerPingBefore, model: PingModel(model: "gpt-6-luna", reasoningEffort: "low"), provider: cooledProvider) { cooledProgress.append($0) }
@@ -2401,6 +2389,7 @@ import Darwin
             "ping diagnostics distinguish failed Keeper RPC from cached cooldown errors")
         check(try String(contentsOf: cooledRoot.appendingPathComponent("home/launch-count"), encoding: .utf8) == "1",
             "production provider cooldown recovery never relaunches the completed ping")
+        try writeKeepAliveAuthentication(home: fakeHome, account: pingBefore.accountID!)
         let persistentRoot = temp.appendingPathComponent("persistent-quota-ping")
         let persistentUsage = ConfirmationTestUsage { _ in throw CodexConnectionError.timeout }
         var persistentProgress: [PingDiagnostic] = []
@@ -3122,6 +3111,7 @@ import Darwin
                 UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 300, resetsAt: clockNow.addingTimeInterval(18000)),
                     weekly: nil, capturedAt: clockNow, accountID: "grace-account", sourceFile: "app-server", zeroUseWindowActive: false)
             }
+            try writeKeepAliveAuthentication(home: home, account: "grace-account")
             let provider = RecoveryTestUsage(snapshot: idle())
             let pings = ReminderTestPing()
             let ledger = root.appendingPathComponent("support/resume-attempts.json")
@@ -3133,11 +3123,11 @@ import Darwin
             }
             for (index, node) in nodes.enumerated() {
                 clockNow = node.addingTimeInterval(Double(50 + index * 90)); provider.set(idle())
-                coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] })
+                coordinator!.ping(schedule: schedule, usage: idle(), blockers: { [] })
                 try await settle()
                 check(pings.count == index + 1, "four-node accumulated drift still executes keep-alive round \(index + 1) once")
                 clockNow = clockNow.addingTimeInterval(10); provider.set(idle())
-                coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] })
+                coordinator!.ping(schedule: schedule, usage: idle(), blockers: { [] })
                 try await settle()
                 check(pings.count == index + 1, "refresh after drifted keep-alive round \(index + 1) cannot duplicate its original node")
             }
@@ -3147,17 +3137,16 @@ import Darwin
             coordinator = nil
             coordinator = ExecutionCoordinator(provider: provider, defaults: prefs, ledgerURL: ledger,
                 pingTransport: pings, codexHome: home, now: { clockNow })
-            coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] }); try await settle()
+            coordinator!.ping(schedule: schedule, usage: idle(), blockers: { [] }); try await settle()
             check(pings.count == 4, "restarted coordinator cannot resend the final drifted scheduled round")
             coordinator = nil
             for (name, from, to, expected) in [("three-minute crossing", 179.0, 182.0, true), ("ten-minute crossing", 599.0, 600.001, false)] {
-                clockNow = nodes[0].addingTimeInterval(from); provider.set(idle()); provider.pause()
+                clockNow = nodes[0].addingTimeInterval(from); provider.set(idle())
                 coordinator = ExecutionCoordinator(provider: provider, defaults: prefs, ledgerURL: root.appendingPathComponent(name + "/attempts.json"),
                     pingTransport: pings, codexHome: home, now: { clockNow })
                 let oldCount = pings.count
-                coordinator!.ping(schedule: schedule, accountID: "grace-account", blockers: { [] })
-                try await Task.sleep(nanoseconds: 50_000_000)
-                clockNow = nodes[0].addingTimeInterval(to); provider.set(idle()); provider.release(); try await settle()
+                coordinator!.ping(schedule: schedule, usage: idle(), blockers: { clockNow = nodes[0].addingTimeInterval(to); return [] })
+                try await settle()
                 check(pings.count == oldCount + (expected ? 1 : 0), "final send guard honors \(name) without changing the attempt node")
                 coordinator = nil
             }
@@ -3188,7 +3177,8 @@ import Darwin
             defer { prefs.removePersistentDomain(forName: suite) }
             let parts = Calendar.current.dateComponents([.hour, .minute], from: at)
             prefs.register(defaults: ["enabled": true, "autoResume": true, "earlyRecoveryPolicy": "ask", "dailyAnchorMinutes": parts.hour! * 60 + parts.minute!])
-            let pings = ReminderTestPing()
+            let pings = PreparationGatePing(clock: { pingNow })
+            try writeKeepAliveAuthentication(home: home, account: "test-account")
             let resumes = BatchRecorder(expected: 1)
             let execution = ExecutionCoordinator(provider: provider, makeResumeTransport: { BatchTransport(recorder: resumes) }, defaults: prefs,
                 ledgerURL: root.appendingPathComponent("support/resume-attempts.json"), pingTransport: pings, codexHome: home, now: { pingNow })
@@ -3230,8 +3220,8 @@ import Darwin
             func reload(_ value: UsageSnapshot) async throws {
                 provider.set(value)
                 state = makeState()
-                state.sessions.refresh(); try await settle()
                 state.usage.refresh(); try await settle()
+                state.sessions.refresh(); try await settle()
             }
             func setPhase(_ phase: RecoveryDecision.Phase, deadline: Date?, account: String = "test-account") throws {
                 var data = try JSONSerialization.jsonObject(with: Data(contentsOf: runtime)) as! [String: Any]
@@ -3272,10 +3262,10 @@ import Darwin
             check(pings.count == 4, "an existing active window still suppresses keep-alive with a pending reminder")
             unavailable = snapshot(at: pingNow); unavailable.capturedAt = pingNow.addingTimeInterval(-61)
             try await reload(unavailable)
-            check(pings.count == 4, "stale quota never permits keep-alive while reminders are ignored")
+            check(pings.count == 5, "stale quota permits one isolated attempt while preserving unanswered reminders")
             unavailable = snapshot(at: pingNow); unavailable.weekly?.usedPercent = 100
             try await reload(unavailable)
-            check(pings.count == 4, "weekly exhaustion still blocks keep-alive while reminders are ignored")
+            check(pings.count == 5, "known weekly exhaustion cannot cause another request in an attempted node")
             var failedSummary = MenuSummary.build(plan: state.nextAction, usage: nil, schedule: state.schedule, tasks: state.selectedTasks)
             failedSummary.applyIssues(usageError: "同步失败", sessionError: nil, executionFailure: nil, executionAction: "保活")
             var waitingChoices = state.choices
@@ -3284,46 +3274,55 @@ import Darwin
             check(!failedSummary.reminderTitle.isEmpty && !failedSummary.reminderBody.isEmpty && !failedSummary.error.isEmpty && failedSummary.note.isEmpty,
                 "a standalone persistent reminder stays visible alongside sync errors without becoming a footnote")
 
-            // Stage a fresh, idle reading without dispatch, then race the execution preflight.
+            // Hold only local preparation: no online model/quota lookup is required to stage a send.
+            prefs.set(false, forKey: "autoResume")
             func readyForRace() async throws {
                 prefs.set(false, forKey: "enabled")
+                pingNow = pingNow.addingTimeInterval(86400)
+                try writeKeepAliveAuthentication(home: home, account: "test-account")
                 try await reload(snapshot(at: pingNow))
-                let models = provider.modelReadCount
-                provider.pauseModel()
-                prefs.set(true, forKey: "enabled")
-                state.recompute()
+                let preparations = pings.preparationCount
+                pings.holdPreparation()
+                prefs.set(true, forKey: "enabled"); state.recompute()
                 for _ in 0..<300 {
-                    if execution.running && provider.modelReadCount > models { break }
+                    if execution.running && pings.preparationCount > preparations { break }
                     try await Task.sleep(nanoseconds: 10_000_000)
                 }
-                check(execution.running && provider.modelReadCount > models, "ping preflight race can reach model preparation: \(execution.status); busy \(execution.busyThreadIDs); plan \(state.nextAction?.note ?? "none")")
+                check(execution.running && pings.preparationCount > preparations && provider.modelReadCount == 0,
+                    "local preparation can be held without synchronous model discovery")
             }
             try await readyForRace()
-            var switched = snapshot(at: pingNow); switched.accountID = "different-account"
-            provider.set(switched); provider.releaseModel(); try await settle()
-            check(pings.count == 4 && execution.lastFailure != nil,
-                "changing the actual ping account during preflight still blocks every send")
+            let firstCount = pings.count
+            try writeKeepAliveAuthentication(home: home, account: "different-account")
+            pings.releasePreparation(); try await settle()
+            check(pings.count == firstCount && execution.lastFailure != nil,
+                "changing current authentication during local preparation blocks the old-account send")
             try await readyForRace()
+            let secondCount = pings.count
             unavailable = snapshot(at: pingNow); unavailable.zeroUseWindowActive = true
-            provider.set(unavailable); provider.releaseModel(); try await settle()
-            check(pings.count == 4, "a window that becomes active during ping preflight is not opened again")
+            provider.set(unavailable)
+            pings.releasePreparation(); try await settle()
+            check(pings.count == secondCount + 1 && provider.modelReadCount == 0,
+                "submission uses its admitted existing facts without adding a synchronous quota/model lookup")
             try await readyForRace()
+            let thirdCount = pings.count
             let surprisePath = traces.appendingPathComponent("rollout-\(childID).jsonl")
             try (metadata(childID, at: pingNow.addingTimeInterval(-60)) + event("error", pingNow.addingTimeInterval(-1), ["message": "usage_limit_reached"]))
                 .write(to: surprisePath, atomically: true, encoding: .utf8)
-            provider.releaseModel(); try await settle()
-            check(pings.count == 4 && execution.lastFailure != nil,
-                "the final fresh task scan rejects a newly paused episode outside the frozen ignored set")
+            pings.releasePreparation(); try await settle()
+            check(pings.count == thirdCount + 1,
+                "a new external quota pause does not add a full scan or block isolated keepalive")
             try FileManager.default.removeItem(at: surprisePath)
             try await readyForRace()
+            let fourthCount = pings.count
             let originalTrace = try String(contentsOf: path, encoding: .utf8)
             try (originalTrace + event("user_message", pingNow)).write(to: path, atomically: true, encoding: .utf8)
             state.sessions.refresh(); try await settle()
-            provider.releaseModel(); try await settle()
-            check(pings.count == 4 && state.choices.recoveryDecisions?[target.episodeKey] == nil,
-                "a changed task that revokes the frozen ignored state aborts the pending keep-alive")
+            pings.releasePreparation(); try await settle()
+            check(pings.count == fourthCount + 1 && state.choices.recoveryDecisions?[target.episodeKey] == nil,
+                "external task progress updates its choice while leaving isolated keepalive free to finish")
             check(resumes.count == 0 && !execution.hasAttempted(target),
-                "all keep-alive paths leave the paused task's resume attempt ledger untouched")
+                "all isolated keepalive paths leave user-task resume attempts untouched")
             state.usage.stop(); state.sessions.stop()
         }
 
@@ -3417,7 +3416,9 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     check(afterIdleReset.headline == "19:54" && afterIdleReset.action == "额度重置" && afterIdleReset.badge == "计划外",
         "an off-plan window highlights its reset while retaining the 23:00 scheduled keep-alive")
     let agedMenu = render(&reopenedIdleReset, userWindow, at: userWindow.capturedAt.addingTimeInterval(180))
-    check(agedMenu.headline == "19:54" && agedMenu.action == "额度重置" && agedMenu.timeline.map(\.date) == afterIdleReset.timeline.map(\.date),
+    check(agedMenu.headline == "19:54" && agedMenu.action == "额度重置" &&
+        agedMenu.timeline.filter { $0.date <= userWindow.capturedAt }.map(\.date) == afterIdleReset.timeline.filter { $0.date <= userWindow.capturedAt }.map(\.date) &&
+        agedMenu.timeline.contains { $0.date == at(18) && $0.kind == .keepAlive },
         "idle quota polling and retained display do not flicker from the reset back to scheduled keep-alive")
     let resumePlan = NextAction(mode: .resume, date: at(23), decision: .wait(reason: "按计划自动继续"), note: "按计划自动继续")
     let pendingResume = render(&reopenedIdleReset, userWindow, at: userWindow.capturedAt, plan: resumePlan)
@@ -3577,8 +3578,9 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
             "foreign, unscoped, prior-cycle or future confirmations never fill history: \(record.actionAt)")
     }
     var unscoped = MenuPresentation()
-    check(render(&unscoped, reading(at(18, 1), at: now, account: nil), at: now, confirmations: confirmations).timeline.count == 2,
-        "an unknown current account cannot borrow scoped confirmation history")
+    let unknownAccount = render(&unscoped, reading(at(18, 1), at: now, account: nil), at: now, confirmations: confirmations)
+    check(unknownAccount.quotas.isEmpty && unknownAccount.timeline.allSatisfy { !$0.isHistory && $0.date >= now },
+        "an unknown current account cannot borrow scoped quota or confirmation history")
     var failedRows = Data()
     for event in ["started", "failed"] {
         let row: [String: Any] = ["kind": "ping", "event": event, "at": iso.string(from: at(13)), "account_id": "timeline-account"]
@@ -3603,8 +3605,8 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
         "historical successes do not invent a timeline without any current next action")
     var unknown = usage; unknown.fiveHour?.usedPercent = 0; unknown.zeroUseWindowActive = nil
     var unknownState = MenuPresentation()
-    check(render(&unknownState, unknown, at: now).timeline.isEmpty,
-        "unknown window state without usable history cannot invent a window origin")
+    check(render(&unknownState, unknown, at: now).timeline.allSatisfy { $0.date >= now && $0.kind != .start && $0.kind != .keepAliveNotNeeded },
+        "unknown window state shows only a future fixed plan without inventing a window origin")
 
     var observed = MenuPresentation()
     _ = render(&observed, reading(at(8, 11), at: at(9)), at: at(9))
@@ -3636,8 +3638,8 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     var startup = MenuPresentation(historyURL: startupURL)
     let synchronizing = render(&startup, nil, at: now, error: "临时失败", transient: true)
     let startupHistory = try Data(contentsOf: startupURL)
-    check(synchronizing.timeline.isEmpty && synchronizing.quotas.isEmpty &&
-        startupHistory == savedHistory,
+    check(synchronizing.timeline.contains { $0.kind == .keepAlive && $0.date >= now } && synchronizing.quotas.isEmpty &&
+        !synchronizing.timeline.contains { $0.kind == .completedKeepAlive || $0.kind == .completedResume } && startupHistory == savedHistory,
         "persisted observations survive initial transient synchronization without supplying stale live quota")
     check(render(&startup, reading(at(18, 1, 13), at: now), at: now).timeline.first?.date == at(13, 1),
         "initial synchronization cannot erase restored observation history before the first fresh reading")
@@ -3801,9 +3803,11 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
 
     var continuity = MenuPresentation()
     let before = render(&continuity, usage, at: now, confirmations: confirmations)
-    let retry = render(&continuity, nil, at: now.addingTimeInterval(61), error: "临时失败", transient: true)
-    check(retry.timeline.map(\.date) == before.timeline.map(\.date) && retry.refreshMessage == before.refreshMessage,
-        "temporary synchronization failure retains the supplemented timeline and its original capture time")
+    let retry = render(&continuity, nil, at: now.addingTimeInterval(61), confirmations: confirmations, error: "临时失败", transient: true)
+    check(retry.timeline.filter { $0.date <= now }.map(\.date) == before.timeline.filter { $0.date <= now }.map(\.date) &&
+        retry.quotas.map(\.remaining) == before.quotas.map(\.remaining) && retry.refreshMessage == before.refreshMessage &&
+        retry.timeline.contains { $0.date == at(23) && $0.kind == .keepAlive },
+        "temporary synchronization failure retains historical facts and sampling time while recomputing the next fixed node")
     let frozen = render(&continuity, usage, at: now, confirmations: confirmations, running: true)
     let progressed = reading(at(23, 1), at: at(23, 2))
     let running = render(&continuity, progressed, at: progressed.capturedAt, running: true)
@@ -4178,8 +4182,8 @@ private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
     }
     check(!live.isFresh(at: now.addingTimeInterval(61)) &&
         DecisionEngine(schedule: schedule).plan(now: now.addingTimeInterval(61), enabled: true, autoResume: true,
-            earlyRecoveryPolicy: "keepPlan", usage: live, blocked: []).date == nil,
-        "display continuity never extends quota freshness or supplies an executable plan")
+            earlyRecoveryPolicy: "keepPlan", usage: live, blocked: []).decision == .wait(reason: "等待下一可行计划节点"),
+        "display continuity never extends quota freshness or grants immediate execution permission")
     var invalidated = live; invalidated.capturedAt = .distantPast
     let afterInvalidation = render(&presentation, usage: invalidated, refreshing: true)
     check(afterInvalidation.headline == shown.headline && afterInvalidation.timeline.map(\.date) == shown.timeline.map(\.date),
@@ -4201,20 +4205,22 @@ private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
     noWindows.capturedAt.addTimeInterval(1)
     let emptyUpdate = render(&presentation, usage: noWindows, time: noWindows.capturedAt)
     let emptyRetry = render(&presentation, usage: nil, time: noWindows.capturedAt, usageError: "临时服务失败", transient: true)
-    check(emptyUpdate.quotas.isEmpty && emptyUpdate.timeline.isEmpty && !emptyUpdate.isTime &&
-        emptyRetry.quotas.isEmpty && emptyRetry.timeline.isEmpty,
+    check(emptyUpdate.quotas.isEmpty && emptyUpdate.isTime && emptyRetry.quotas.isEmpty &&
+        emptyRetry.timeline.allSatisfy { $0.kind != .start && $0.kind != .keepAliveNotNeeded },
         "a real reading explicitly without windows replaces the old display and cannot revive it on failure")
     var unknown = recovered; unknown.fiveHour?.usedPercent = 0; unknown.zeroUseWindowActive = nil
+    unknown.capturedAt = noWindows.capturedAt.addingTimeInterval(1)
     let unknownUpdate = render(&presentation, usage: unknown, time: unknown.capturedAt)
-    check(!unknownUpdate.isTime && unknownUpdate.statusText == "待同步" && unknownUpdate.timeline.isEmpty && unknownUpdate.quotas.first?.detail == "—",
+    check(unknownUpdate.isTime && unknownUpdate.quotas.first?.detail == "—" &&
+        !unknownUpdate.timeline.contains { $0.kind == .keepAliveNotNeeded && $0.date == recovered.fiveHour!.resetsAt.addingTimeInterval(-18000) },
         "a meaningful new unknown-window reading replaces an old confirmed window")
 
     var first = MenuPresentation()
     let firstIdle = render(&first, usage: nil)
     let firstReading = render(&first, usage: nil, refreshing: true)
     let firstFailure = render(&first, usage: rollout, usageError: "临时连接失败", transient: true)
-    check(firstIdle.statusText == "待同步" && firstReading.statusText == "同步中" && firstFailure.quotas.isEmpty &&
-        firstFailure.timeline.isEmpty && !firstFailure.error.isEmpty,
+    check(firstIdle.isTime && firstReading.isTime && firstFailure.quotas.isEmpty &&
+        firstFailure.timeline.allSatisfy { $0.date >= now } && !firstFailure.error.isEmpty,
         "first launch without any valid display still reports idle, reading and failure states accurately")
     check(firstFailure.note.contains(L10n.text("正在自动重试额度读取。")),
         "a transient failure explains automatic retry without requiring menu interaction")
@@ -4223,9 +4229,9 @@ private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
         var fatal = MenuPresentation(); _ = render(&fatal, usage: live)
         let failed = render(&fatal, usage: live, usageError: issue)
         let retry = render(&fatal, usage: nil, usageError: "临时连接失败", transient: true)
-        check(failed.statusSymbol == "exclamationmark.circle" && failed.quotas.isEmpty && !failed.isTime &&
-            retry.quotas.isEmpty && !retry.isTime,
-            "fatal usage errors clear old display and cannot be covered by a later transient retry: \(issue)")
+        check(failed.statusSymbol == "exclamationmark.circle" && failed.quotas.map(\.remaining) == shown.quotas.map(\.remaining) && failed.isTime &&
+            retry.quotas.map(\.remaining) == shown.quotas.map(\.remaining) && retry.refreshMessage == shown.refreshMessage,
+            "quota errors preserve the last real quota and sampling time while displaying the current error: \(issue)")
     }
     var account = MenuPresentation(); _ = render(&account, usage: live)
     var switched = invalidated; switched.accountID = "another-account"
@@ -4243,8 +4249,8 @@ private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
         "an account mismatch in the actual task plan cannot reuse an earlier account's display")
     var scanner = MenuPresentation(); _ = render(&scanner, usage: live)
     let scanFailure = render(&scanner, usage: live, sessionError: "任务扫描不兼容")
-    check(!scanFailure.isTime && scanFailure.quotas.isEmpty && scanFailure.statusSymbol == "exclamationmark.circle",
-        "fatal task scanning errors clear retained action display while exposing the current error")
+    check(scanFailure.isTime && scanFailure.quotas.map(\.remaining) == shown.quotas.map(\.remaining) && scanFailure.statusSymbol == "exclamationmark.circle",
+        "task scanning errors remain visible without erasing the independent keep-alive plan or quota facts")
 
     var stopped = live; stopped.fiveHour?.usedPercent = 100
     var settings = MenuPresentation(); _ = render(&settings, usage: stopped, tasks: [task])
@@ -4256,26 +4262,28 @@ private func checkSteadyMenuPresentation(_ check: (Bool, String) -> Void) {
         var altered = MenuPresentation(); _ = render(&altered, usage: stopped, tasks: [task])
         let next = render(&altered, usage: nil, tasks: [task], autoResume: setting != 0,
             policy: setting == 1 ? "ask" : "keepPlan", anchor: setting == 2 ? 540 : 480)
-        check(!next.isTime && next.timeline.isEmpty && next.action.isEmpty,
+        check(!next.timeline.contains { $0.kind == .resume } && next.quotas.map(\.remaining) == shown.quotas.map { $0.name == "5小时" ? 0 : $0.remaining } &&
+            !next.isTime,
             "changed automatic continuation, policy or schedule settings discard the old action plan: \(setting)")
     }
     var selection = MenuPresentation(); _ = render(&selection, usage: stopped, tasks: [task])
     var deselected = ResumeChoices(); deselected.deselectedEpisodes.insert(task.episodeKey)
     let unselected = render(&selection, usage: nil, tasks: [], available: [task], choices: deselected)
-    check(!unselected.isTime && unselected.timeline.isEmpty && unselected.tasks == [task.displayName],
+    check(unselected.isTime && !unselected.timeline.contains { $0.kind == .resume } && unselected.tasks == [task.displayName],
         "changing the task selection clears the previous resume plan while showing the currently available task")
     var cancellation = MenuPresentation(); _ = render(&cancellation, usage: stopped, tasks: [task])
     var canceled = ResumeChoices(); canceled.useKeepAlive(for: [task])
     let afterCancel = render(&cancellation, usage: nil, choices: canceled)
-    check(afterCancel.tasks.isEmpty && afterCancel.timeline.isEmpty && !afterCancel.isTime,
+    check(afterCancel.tasks.isEmpty && afterCancel.isTime && !afterCancel.timeline.contains { $0.kind == .resume },
         "canceling a stop episode cannot retain its old task bubble or continuation node")
     var changedPlan = MenuPresentation(); _ = render(&changedPlan, usage: live)
     let differentPlan = NextAction(mode: .keepAlive, date: reset.addingTimeInterval(18000),
         decision: .wait(reason: "新的计划"), note: "新的计划")
     let replanned = render(&changedPlan, usage: nil, plan: differentPlan)
     let replannedRetry = render(&changedPlan, usage: nil)
-    check(!replanned.isTime && replanned.timeline.isEmpty && !replannedRetry.isTime,
-        "a changed meaningful plan cannot be overwritten by the previous display while quota is stale")
+    check(replanned.isTime && replanned.timeline.contains { $0.date == differentPlan.date && $0.kind == .keepAlive } &&
+        replanned.quotas.map(\.remaining) == shown.quotas.map(\.remaining) && replannedRetry.isTime,
+        "a changed plan uses its current date while independently retaining the original quota facts")
     var nextDay = MenuPresentation(); _ = render(&nextDay, usage: live)
     let overnight = render(&nextDay, usage: nil, time: now.addingTimeInterval(86400), refreshing: true)
     check(overnight.isTime && overnight.quotas.map(\.remaining) == shown.quotas.map(\.remaining) && overnight.timeline.filter(\.isAction).allSatisfy { $0.date >= now.addingTimeInterval(86400) } && overnight.refreshMessage.hasSuffix(String(shown.refreshMessage.suffix(8))),

@@ -75,6 +75,7 @@ enum CodexConnectionError: LocalizedError {
     static func diagnosticDescription(for error: Error) -> String {
         if let error = error as? UsageReadFailure { return diagnosticDescription(for: error.underlying) }
         if let error = error as? ResumeSubmissionError { return diagnosticDescription(for: error.underlying) }
+        if let error = error as? PingSubmissionError { return diagnosticDescription(for: error.underlying) }
         if let error = error as? Self { return error.diagnosticDescription ?? error.localizedDescription }
         if let error = error as? CodexCapabilityError { return L10n.text(error.message) }
         if let error = error as? PingFailure { return error.diagnostic.diagnosticMessage }
@@ -267,6 +268,7 @@ protocol UsageProvider {
     func read() throws -> UsageSnapshot
     func readForUserRefresh() throws -> UsageSnapshot
     func pingModel() throws -> PingModel
+    func invalidatePingModel()
     func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date)
     func setSuspended(_ suspended: Bool)
 }
@@ -282,6 +284,7 @@ extension UsageProvider {
     func pingModel() throws -> PingModel {
         throw CodexConnectionError.server("无法确认保活模型；请更新 Codex 后重试")
     }
+    func invalidatePingModel() {}
     func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date) {}
 }
 
@@ -384,7 +387,9 @@ final class AppServerUsageProvider: UsageProvider {
     private var modelFailure: Error?
     private var modelRetryAfter: TimeInterval = 0
     private var cachedModel: PingModel?
-    private var cachedModelUntil: TimeInterval = 0
+    private var modelAccountID: String?
+    private var modelIdentity: Data?
+    private var modelFallbackPath: String?
 
     init(makeTransport: @escaping () throws -> CodexTransport = { try AppServerClient(usageOnly: true) },
          contextIdentity: (() throws -> Data?)? = nil,
@@ -499,17 +504,23 @@ final class AppServerUsageProvider: UsageProvider {
         }
     }
 
+    func invalidatePingModel() {
+        lock.lock(); defer { lock.unlock() }
+        cachedModel = nil; modelFailure = nil; modelRetryAfter = 0
+    }
+
     func pingModel() throws -> PingModel {
         try requireActive()
-        // A locally cached discovery needs no automatic RPC admission. Authentication is
-        // still checked, and the final quota/account read remains mandatory before sending.
+        // Cached discovery preserves its original account; background preparation may reuse it.
         lock.lock()
         do {
-            if lastFailure != nil, let cachedModel, uptime() < cachedModelUntil, transport != nil, try contextIdentity() == identity,
-               fallbackPath() == lastFallbackPath {
+            let currentIdentity = try contextIdentity()
+            let currentAccount = try accountIdentity()
+            let sameModelAccount = modelAccountID.map { currentAccount == $0 } ?? (currentIdentity == modelIdentity)
+            if let cachedModel, fallbackPath() == modelFallbackPath, sameModelAccount {
                 lock.unlock(); return cachedModel
             }
-        } catch { /* The shared connection path reports and budgets authentication failures. */ }
+        } catch { /* The shared connection path reports authentication failures. */ }
         lock.unlock()
         return try withConnection(resetFailuresOnSuccess: false) { client in
             if uptime() < modelRetryAfter, let modelFailure { throw modelFailure }
@@ -534,7 +545,8 @@ final class AppServerUsageProvider: UsageProvider {
                         modelFailure = nil
                         let model = PingModel(model: "gpt-6-luna", reasoningEffort: effort)
                         cachedModel = model
-                        cachedModelUntil = uptime() + 300
+                        modelAccountID = try accountIdentity()
+                        modelIdentity = try contextIdentity(); modelFallbackPath = fallbackPath()
                         return model
                     }
                     guard let next = page["nextCursor"] as? String, !next.isEmpty else { break }
@@ -577,9 +589,10 @@ final class AppServerUsageProvider: UsageProvider {
             if transport != nil, identity != currentIdentity {
                 transport?.close()
                 transport = nil
-                modelFailure = nil
-                modelRetryAfter = 0
-                cachedModel = nil
+                let currentAccount = try accountIdentity()
+                if modelAccountID == nil || currentAccount == nil || currentAccount != modelAccountID {
+                    modelFailure = nil; modelRetryAfter = 0; cachedModel = nil
+                }
             }
             if transport == nil {
                 try requireActive()
@@ -600,7 +613,6 @@ final class AppServerUsageProvider: UsageProvider {
                 lastFailure = nil
                 failureCount = 0
                 upstreamFailure = false
-                cachedModel = nil
             } else if lastFailure != nil {
                 // Model discovery does not repay a failed quota read or permit an immediate
                 // second automatic batch. Its cached result is available at the next admission.
@@ -626,7 +638,6 @@ final class AppServerUsageProvider: UsageProvider {
             if !retainConnection {
                 transport?.close()
                 transport = nil
-                cachedModel = nil
             }
             lastFailure = failure
             failureCount += 1

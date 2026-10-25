@@ -80,12 +80,17 @@ import SwiftUI
         resetsAt: Date().addingTimeInterval(3600)), weekly: nil, capturedAt: Date(),
         accountID: "disabled-background-fixture", sourceFile: "app-server")
     let provider = DisabledMenuUsageProvider(usage)
+    let preparation = DisabledPreparationPing()
+    let execution = ExecutionCoordinator(provider: provider, defaults: defaults,
+        ledgerURL: root.appendingPathComponent("resume-attempts.json"), pingTransport: preparation, codexHome: home)
     let state = AppState(provider: provider, defaults: defaults,
-        runtimeURL: root.appendingPathComponent("pending-runtime.json"), codexHome: home)
+        runtimeURL: root.appendingPathComponent("pending-runtime.json"), codexHome: home, execution: execution)
     defer { state.usage.stop(); state.sessions.stop() }
     try await Task.sleep(nanoseconds: 150_000_000)
-    check(provider.reads == 0 && !state.sessions.hasScanned,
-        "disabled startup performs no automatic quota read or local task scan")
+    check(provider.reads == 0 && !state.sessions.hasScanned && preparation.checks == 0 && provider.modelReads == 0,
+        "disabled startup performs no quota, model preparation or local task scan")
+    execution.maintainKeepAlive(forceCheck: true)
+    execution.relocateKeepAlive()
     state.environmentChanged(source: "wake")
     state.networkChanged(available: true)
     state.usage.authenticationDidChange()
@@ -94,8 +99,8 @@ import SwiftUI
     state.sessions.refresh()
     state.recompute(source: "timer")
     try await Task.sleep(nanoseconds: 150_000_000)
-    check(provider.reads == 0 && !state.sessions.hasScanned,
-        "disabled wake, network, auth, timer and direct refresh signals cannot restart monitoring")
+    check(provider.reads == 0 && !state.sessions.hasScanned && preparation.checks == 0 && provider.modelReads == 0,
+        "disabled wake, network, auth, timer and relocation signals cannot restart monitoring or model discovery")
 
     defaults.set(true, forKey: "enabled")
     state.environmentChanged(source: "enable")
@@ -103,21 +108,27 @@ import SwiftUI
     while (!state.sessions.hasScanned || state.usage.refreshing || provider.reads == 0) && Date() < deadline {
         try await Task.sleep(nanoseconds: 10_000_000)
     }
-    check(state.sessions.hasScanned && state.usage.hasReliableReading && provider.reads > 0,
-        "re-enabling starts a new reliable task and quota refresh")
+    while preparation.checks == 0 && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+    check(state.sessions.hasScanned && state.usage.hasReliableReading && provider.reads > 0 && preparation.checks > 0 && provider.modelReads > 0,
+        "re-enabling restores background model preparation with a new reliable task and quota refresh")
     state.sessions.start(interval: 0.03)
     state.usage.setPolling(UsagePollingPolicy(interval: 0.03, wakeAt: nil), retryOpportunity: nil)
     defaults.set(false, forKey: "enabled")
     state.environmentChanged(source: "disable")
     let reads = provider.reads
+    let modelReads = provider.modelReads
+    let preparations = preparation.checks
     let scannedAt = state.sessions.scannedAt
+    execution.maintainKeepAlive(forceCheck: true)
+    execution.relocateKeepAlive()
     state.networkChanged(available: false)
     state.environmentChanged(source: "clock")
     state.usage.refresh(critical: true)
     state.sessions.refresh()
     try await Task.sleep(nanoseconds: 200_000_000)
-    check(provider.reads == reads && state.sessions.scannedAt == scannedAt && !state.usage.refreshing,
-        "disabling stops existing short timers and rejects queued follow-up refreshes")
+    check(provider.reads == reads && state.sessions.scannedAt == scannedAt && !state.usage.refreshing &&
+        provider.modelReads == modelReads && preparation.checks == preparations,
+        "disabling stops short timers and rejects both queued refreshes and new background preparation")
 
     let previousCapture = state.usage.snapshot?.capturedAt
     provider.hold()
@@ -156,8 +167,8 @@ import SwiftUI
     let provider = AppServerUsageProvider(makeTransport: {
         let transport = DisabledQueryTransport(); transports.append(transport); return transport
     }, contextIdentity: { identityReads += 1; return nil })
-    _ = try provider.read(); _ = try provider.read()
-    check(transports.count == 1, "active quota reads still reuse their dedicated connection")
+    _ = try provider.read(); _ = try provider.read(); _ = try provider.pingModel()
+    check(transports.count == 1, "active quota reads and background model preparation reuse their dedicated connection")
     provider.setSuspended(true)
     let deadline = Date().addingTimeInterval(3)
     while transports[0].closes == 0 && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
@@ -182,6 +193,18 @@ import SwiftUI
     defer { transport.onAccountRead = nil }
     do { _ = try interrupted.read(); check(false, "suspension between RPCs interrupts the read batch") }
     catch { check(transport.calls == 1, "suspension between RPCs interrupts the read batch before rate limits") }
+
+    let modelTransport = DisabledQueryTransport()
+    let preparing = AppServerUsageProvider(makeTransport: { modelTransport }, contextIdentity: { nil })
+    modelTransport.onAccountRead = { preparing.setSuspended(true) }
+    defer { modelTransport.onAccountRead = nil }
+    do { _ = try preparing.pingModel(); check(false, "suspension interrupts in-flight background model preparation") }
+    catch { check(modelTransport.calls == 1, "suspension interrupts in-flight background preparation before model/list") }
+    preparing.setSuspended(false)
+    modelTransport.onAccountRead = nil
+    check(try preparing.pingModel().model == "gpt-6-luna",
+        "a later enable permits model preparation to recover after its interrupted RPC batch")
+    preparing.setSuspended(true)
 }
 
 private final class DisabledQueryTransport: CodexTransport {
@@ -197,6 +220,7 @@ private final class DisabledQueryTransport: CodexTransport {
             onAccountRead?()
             return ["account": ["type": "chatgpt"]]
         }
+        if method == "model/list" { return ["data": [["id": "gpt-6-luna", "model": "gpt-6-luna"]]] }
         return ["accountId": "paused-query-fixture", "rateLimits": ["primary": [
             "usedPercent": 7, "windowDurationMins": 300, "resetsAt": Date().addingTimeInterval(3600).timeIntervalSince1970]]]
     }
@@ -207,10 +231,16 @@ private final class DisabledQueryTransport: CodexTransport {
 private final class DisabledMenuUsageProvider: UsageProvider, @unchecked Sendable {
     private let lock = NSCondition()
     private var count = 0
+    private var discoveries = 0
     private var held = false
     private let snapshot: UsageSnapshot
     init(_ snapshot: UsageSnapshot) { self.snapshot = snapshot }
     var reads: Int { lock.lock(); defer { lock.unlock() }; return count }
+    var modelReads: Int { lock.lock(); defer { lock.unlock() }; return discoveries }
+    func pingModel() throws -> PingModel {
+        lock.lock(); discoveries += 1; lock.unlock()
+        return PingModel(model: "gpt-6-luna", reasoningEffort: "low")
+    }
     func hold() { lock.lock(); held = true; lock.unlock() }
     func release() { lock.lock(); held = false; lock.broadcast(); lock.unlock() }
     func read() throws -> UsageSnapshot {
@@ -218,4 +248,18 @@ private final class DisabledMenuUsageProvider: UsageProvider, @unchecked Sendabl
         while held { lock.wait() }
         var fresh = snapshot; fresh.capturedAt = Date(); return fresh
     }
+}
+
+private final class DisabledPreparationPing: PingTransport {
+    private let lock = NSLock()
+    private var count = 0
+    var checks: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func maintainPreparation(provider: UsageProvider, forceCheck: Bool) {
+        _ = try? provider.pingModel()
+        lock.lock(); count += 1; lock.unlock()
+    }
+    func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider) throws -> UsageSnapshot {
+        throw CodexConnectionError.unavailable
+    }
+    func cancel() {}
 }

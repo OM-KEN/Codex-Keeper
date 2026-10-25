@@ -33,7 +33,7 @@ import SQLite3
             execution: execution, startMonitoring: false, now: { usage.clock })
         if mode.hasPrefix("broken") {
             check((try? Data(contentsOf: runtime)) == damaged, "unreadable saved choices are not overwritten during initialization: \(mode)")
-            check(state.keepAliveBlockers(ignoring: []).contains(.runtimeUnhealthy), "unreadable saved choices stop new automatic actions: \(mode)")
+            check(!state.keepAliveBlockers().contains(.runtimeUnhealthy), "unreadable resume choices do not block isolated keepalive: \(mode)")
             check(state.pendingStateFailure != nil, "unreadable state has a visible persistent error instead of appearing to synchronize: \(mode)")
         }
         state.refresh(manual: true)
@@ -48,7 +48,7 @@ import SQLite3
             try await logicRepairSettle { !state.usage.refreshing }
             state.recompute()
             try await Task.sleep(nanoseconds: 100_000_000)
-            check(!state.keepAliveBlockers(ignoring: []).contains(.runtimeUnhealthy) && sends.total == 0,
+            check(!state.keepAliveBlockers().contains(.runtimeUnhealthy) && sends.total == 0,
                 "manual reread recovers repaired records and keeps their original choice: \(mode)")
         }
         state.usage.stop(); state.sessions.stop(); execution.stopOwnedTasks()

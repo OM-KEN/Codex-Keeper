@@ -1,7 +1,9 @@
 import Foundation
+import SQLite3
 
 func checkSessionIncrementalReads(_ check: (Bool, String) -> Void, root: URL) throws {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try checkCanonicalIncrementalReplacement(check, home: root.appendingPathComponent("canonical"))
     let id = UUID().uuidString
     let file = root.appendingPathComponent("rollout-\(id).jsonl")
     let base = Date(timeIntervalSince1970: 1_792_800_000)
@@ -79,4 +81,67 @@ func checkSessionIncrementalReads(_ check: (Bool, String) -> Void, root: URL) th
     var legacy = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "payload": ["id": id, "cwd": root.path]])
     legacy.append(10); try legacy.write(to: file); try compare("legacy missing timestamp")
     try append(event("task_started", turn: "legacy")); try compare("legacy fallback after append")
+}
+
+private func checkCanonicalIncrementalReplacement(_ check: (Bool, String) -> Void, home: URL) throws {
+    let directory = home.appendingPathComponent("sessions")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let id = UUID().uuidString
+    let old = directory.appendingPathComponent("rollout-\(id).jsonl")
+    let current = directory.appendingPathComponent("rollout-\(id)_\(UUID().uuidString).jsonl")
+    let base = Date(timeIntervalSince1970: 1_792_800_000)
+    func row(_ type: String, _ payload: [String: Any], after seconds: TimeInterval) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: ["type": type,
+            "timestamp": ISO8601DateFormatter().string(from: base.addingTimeInterval(seconds)), "payload": payload])
+        data.append(10); return data
+    }
+    let metadata = try row("session_meta", ["id": id, "cwd": home.path], after: 0)
+    var trace = metadata
+    trace.append(try row("event_msg", ["type": "task_started", "turn_id": "old"], after: 1))
+    try trace.write(to: old)
+    var state: OpaquePointer?
+    guard sqlite3_open(home.appendingPathComponent("state_5.sqlite").path, &state) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    defer { sqlite3_close(state) }
+    func register(_ file: URL) throws {
+        let path = file.path.replacingOccurrences(of: "'", with: "''")
+        guard sqlite3_exec(state, "DELETE FROM threads; INSERT INTO threads VALUES('\(id)', '\(path)')", nil, nil, nil) == SQLITE_OK else {
+            throw CodexConnectionError.invalidResponse
+        }
+    }
+    guard sqlite3_exec(state, "CREATE TABLE threads(id TEXT, rollout_path TEXT)", nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    try register(old)
+    var logs: OpaquePointer?
+    guard sqlite3_open(home.appendingPathComponent("logs_1.sqlite").path, &logs) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    defer { sqlite3_close(logs) }
+    guard sqlite3_exec(logs, "CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    let worker = SessionScanWorker(codexHome: home)
+    let first = worker.read(watchedIDs: [id])
+    check(first.1 == nil && first.0.first?.taskRunning == true && first.0.first?.currentTurnID == "old",
+        "the incremental worker initially follows the registered running segment")
+    trace = metadata
+    trace.append(try row("event_msg", ["type": "task_started", "turn_id": "current"], after: 2))
+    try trace.write(to: current)
+    try register(current)
+    try Data([0xff]).write(to: old)
+    let replaced = worker.read(watchedIDs: [id], watchedPaths: [old])
+    check(replaced.1 == nil && replaced.0.count == 1 && replaced.0.first?.fileURL.resolvingSymlinksInPath() == current.resolvingSymlinksInPath() &&
+        replaced.0.first?.currentTurnID == "current" && replaced.0.first?.currentRolloutVerified == true,
+        "canonical replacement excludes a corrupt cached running segment before incremental parsing")
+    let quota = try row("event_msg", ["type": "error", "message": "usage_limit_reached", "turn_id": "current"], after: 3)
+    func append(_ bytes: Data) throws {
+        let handle = try FileHandle(forWritingTo: current); defer { try? handle.close() }
+        try handle.seekToEnd(); try handle.write(contentsOf: bytes)
+    }
+    try append(quota.prefix(quota.count / 2))
+    let partial = worker.read(watchedIDs: [id], watchedPaths: [old])
+    check(partial.1 == nil && partial.0.first?.taskRunning == true && partial.0.first?.quotaBlockedAt == nil,
+        "the new canonical segment retains its incremental state across an incomplete append")
+    try append(quota.suffix(quota.count - quota.count / 2))
+    try FileManager.default.removeItem(at: old)
+    let stopped = worker.read(watchedIDs: [id], watchedPaths: [old])
+    check(stopped.1 == nil && stopped.0.count == 1 && stopped.0.first?.quotaTurnID == "current" &&
+        stopped.0.first?.quotaBlockedAt == base.addingTimeInterval(3) && stopped.0.first?.taskRunning == false,
+        "the completed append produces exactly the current pause after obsolete history disappears")
+    check(worker.read(watchedIDs: [id]).0 == stopped.0,
+        "unchanged canonical segments do not replay or revive the replaced running history")
 }

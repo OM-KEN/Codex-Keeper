@@ -61,9 +61,9 @@ final class UsageObserver: ObservableObject {
     private(set) var criticalRefreshPending = false
     private(set) var lastRefreshStartedAt: Date?
     private let provider: UsageProvider
+    private let codexHome: URL
     private let now: () -> Date
 
-    private let codexHome: URL
     private let logURL: URL
     private var timer: Timer?
     private var pendingManualSource: String?
@@ -133,6 +133,7 @@ final class UsageObserver: ObservableObject {
 
     func invalidate(clearAccount: Bool = false) {
         hasReliableReading = false
+        if clearAccount { snapshot = nil }
         // Keep the original reading and its capture time as facts. Critical refresh gates execution.
         // Only a reliable new account response may change the display account.
         if clearAccount { passiveSnapshot = nil; passiveRecovery = nil; displaySnapshot = nil }
@@ -277,13 +278,9 @@ final class UsageObserver: ObservableObject {
                 appendLogEntry(entry)
             }
             hasReliableReading = result.1 == nil && result.0?.isFresh(at: now()) == true && result.0?.accountID?.isEmpty == false
-            if result.2?.isTransient == true, snapshot?.isFresh(at: now()) == true {
-                // Keep the recent live reading during a transient refresh failure.
-            } else if let new = result.0 {
+            if let new = result.0 {
                 if snapshot != new { appendTransitionLog(new) }
                 snapshot = new // Equal values still carry a new freshness timestamp.
-            } else if result.1 != nil {
-                snapshot = nil
             }
             if let live = snapshot, passiveSnapshot?.accountID != live.accountID { passiveSnapshot = nil; passiveRecovery = nil }
             if result.2 != nil, result.2?.isTransient != true { passiveSnapshot = nil; passiveRecovery = nil }

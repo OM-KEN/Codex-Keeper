@@ -84,6 +84,7 @@ import SQLite3
     check(reader.read().last?.snapshot.accountID == "passive-b", "only a current rollout explicitly owned by the new account can reappear")
     try checkConcurrentPassiveIndexUpdates(check, root: root.appendingPathComponent("concurrent-index"))
     try await checkFiveMinuteRecovery(check, root: root.appendingPathComponent("five-minute-recovery"))
+    try await checkPassiveResumeAdmission(check, root: root.appendingPathComponent("resume-admission"))
     try await checkPassiveUsagePresentation(check, root: root.appendingPathComponent("presentation"))
     try await checkNativePassiveDiscovery(check, root: root.appendingPathComponent("native"))
 }
@@ -398,4 +399,67 @@ private struct PassiveUsageFixture {
         try await Task.sleep(nanoseconds: 10_000_000)
     }
     throw NSError(domain: "PassiveUsageTests.wait", code: line, userInfo: [NSLocalizedDescriptionKey: "Timed out at test line \(line)"])
+}
+
+@MainActor private func checkPassiveResumeAdmission(_ check: (Bool, String) -> Void, root: URL) async throws {
+    let fixture = try PassiveUsageFixture(home: root)
+    try fixture.execute("CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", database: "logs_1.sqlite")
+    let schedule = ScheduleEngine(anchorMinutes: 480)
+    let clock = PassiveUsageClock(schedule.nodes()[1].addingTimeInterval(-90))
+    let id = UUID().uuidString
+    let file = fixture.home.appendingPathComponent("sessions/rollout-\(id).jsonl")
+    let reset = clock.value.addingTimeInterval(18000)
+    try fixture.write(file, thread: id, at: clock.value.addingTimeInterval(-2), used: 100, reset: reset)
+    var stop = try JSONSerialization.data(withJSONObject: ["type": "event_msg",
+        "timestamp": ISO8601DateFormatter().string(from: clock.value.addingTimeInterval(-1)),
+        "payload": ["type": "error", "message": "usage_limit_reached"]])
+    stop.append(10); try fixture.appendData(file, data: stop); try fixture.register(file, thread: id)
+    let online = UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 100, windowMinutes: 300, resetsAt: reset),
+        weekly: QuotaWindow(usedPercent: 10, windowMinutes: 10080, resetsAt: clock.value.addingTimeInterval(86400)),
+        capturedAt: clock.value, accountID: "passive-a", sourceFile: "app-server")
+    let provider = PassiveUsageProvider(online)
+    let sender = PassiveResumeTrap()
+    let suite = "keeper.passive.resume-admission." + UUID().uuidString
+    let prefs = UserDefaults(suiteName: suite)!
+    defer { prefs.removePersistentDomain(forName: suite) }
+    prefs.register(defaults: ["enabled": true, "autoResume": true, "dailyAnchorMinutes": 480,
+        "earlyRecoveryPolicy": "immediately", "resumeWorkspaceReminder": false])
+    let execution = ExecutionCoordinator(provider: provider, makeResumeTransport: { sender }, defaults: prefs,
+        ledgerURL: root.appendingPathComponent("keeper/attempts.json"), pingTransport: sender, codexHome: fixture.home, now: { clock.value })
+    let state = AppState(provider: provider, defaults: prefs, runtimeURL: root.appendingPathComponent("keeper/pending.json"),
+        codexHome: fixture.home, execution: execution, startMonitoring: false, now: { clock.value })
+    defer { provider.release(); state.usage.stop(); state.sessions.stop(); execution.stopOwnedTasks() }
+    state.refresh()
+    try await passiveSettle { state.availableTasks.count == 1 && !state.usage.refreshing }
+    state.usage.startPassiveMonitoring()
+    provider.pause()
+    clock.advance(95)
+    var fresh = online; fresh.capturedAt = clock.value; provider.set(fresh)
+    try fixture.append(file, at: clock.value, used: 1, reset: reset, weeklyReset: online.weekly?.resetsAt)
+    state.usage.rescanPassive()
+    try await passiveSettle { state.usage.displaySnapshot?.sourceFile == file.path && state.usage.criticalRefreshPending }
+    state.recompute()
+    check(state.usage.displaySnapshot?.fiveHour?.usedPercent == 1 && state.usage.snapshot?.fiveHour?.usedPercent == 100 &&
+        state.usage.snapshot?.isFresh(at: clock.value) == false && sender.submissions == 0 && execution.operations.isEmpty,
+        "a local recovery at a plan node updates display but cannot authorize continuation while online verification is pending")
+    provider.release()
+    try await passiveSettle { !state.usage.refreshing }
+    state.recompute()
+    check(state.usage.hasReliableReading && state.usage.snapshot?.fiveHour?.usedPercent == 100 &&
+        sender.submissions == 0 && execution.operations.isEmpty,
+        "fresh online exhaustion continues to block continuation even after a local recovery was displayed")
+}
+
+private final class PassiveResumeTrap: ResumeTransport, PingTransport {
+    private let lock = NSLock()
+    private var count = 0
+    var submissions: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func cancel() {}
+    func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider) throws -> UsageSnapshot {
+        throw CodexConnectionError.unavailable
+    }
+    func resume(_ target: BlockedSession, prompt: String) throws -> ResumeReceipt {
+        lock.lock(); count += 1; lock.unlock()
+        throw CodexConnectionError.unavailable
+    }
 }

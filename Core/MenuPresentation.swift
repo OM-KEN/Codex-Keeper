@@ -55,9 +55,10 @@ struct MenuSummary {
         }
     }
     mutating func applyUsageRefreshState(refreshing: Bool, error: String?) {
-        guard isSyncing else { return }
-        headline = refreshing ? "正在同步" : "待同步"
-        action = ""; isSyncing = refreshing
+        if isSyncing {
+            headline = refreshing ? "正在同步" : "待同步"
+            action = ""; isSyncing = refreshing
+        }
         if error != nil {
             let syncNote = refreshing ? "正在重新同步额度…" : "正在自动重试额度读取。"
             note = [note, syncNote].filter { !$0.isEmpty }.joined(separator: "\n")
@@ -77,7 +78,7 @@ struct MenuSummary {
 }
 
 struct MenuTimelinePoint {
-    enum Kind { case start, keepAliveNotNeeded, reset, keepAlive, resume, scheduled, completedKeepAlive, completedResume, resumeRecord }
+    enum Kind { case start, keepAliveNotNeeded, reset, keepAlive, resume, scheduled, completedKeepAlive, completedResume, resumeRecord, pingRecord }
     let date: Date
     let time: String
     let day: String
@@ -85,6 +86,7 @@ struct MenuTimelinePoint {
     let kind: Kind
     let solidBefore: Bool
     var operationIDs: Set<String> = []
+    var pingResult: PingNodeResult? = nil
     var timeLabel: String { [day, time].filter { !$0.isEmpty }.joined(separator: " ") }
     var symbol: String {
         switch kind {
@@ -94,10 +96,11 @@ struct MenuTimelinePoint {
         case .resume: return "paperplane"
         case .scheduled: return "circle"
         case .resumeRecord: return "text.bubble"
+        case .pingRecord: return pingResult?.succeeded == true ? "checkmark.circle.fill" : "info.circle"
         case .completedKeepAlive, .completedResume: return "checkmark.circle.fill"
         }
     }
-    var isHistory: Bool { [.completedKeepAlive, .completedResume, .resumeRecord].contains(kind) }
+    var isHistory: Bool { [.completedKeepAlive, .completedResume, .resumeRecord, .pingRecord].contains(kind) }
     var isAction: Bool { [.keepAlive, .resume, .completedKeepAlive, .completedResume].contains(kind) }
 }
 
@@ -171,7 +174,9 @@ private func menuPlanCycleStart(schedule: ScheduleEngine, now: Date) -> Date {
 extension MenuSummary {
     static func build(plan: NextAction?, usage: UsageSnapshot?, schedule: ScheduleEngine, tasks: [BlockedSession], confirmations: [ExecutionConfirmation] = [], observedWindows: [QuotaWindow] = [], observedResets: [Date] = [], observedResetDetections: [Date] = [], now: Date = Date(), requireFresh: Bool = true) -> MenuSummary {
         if plan?.note == "已停用" { return MenuSummary(headline: "已停用") }
-        guard let usage, (!requireFresh || usage.isFresh(at: now)), let plan else { return MenuSummary(headline: "正在同步", isSyncing: true) }
+        guard let plan else { return MenuSummary(headline: "正在同步", isSyncing: true) }
+        guard plan.mode == .keepAlive || usage.map({ !requireFresh || $0.isFresh(at: now) }) == true else { return MenuSummary(headline: "正在同步", isSyncing: true) }
+        let usage = usage.flatMap { !requireFresh || $0.sourceFile == "app-server" ? $0 : nil } ?? UsageSnapshot(fiveHour: nil, weekly: nil, capturedAt: .distantPast, sourceFile: "")
         let clock = DateFormatter(); clock.dateFormat = "HH:mm"
         let day = DateFormatter(); day.dateFormat = L10n.text("M月d日")
         func dayText(_ date: Date) -> String {
@@ -189,10 +194,6 @@ extension MenuSummary {
             else if name == "5小时", usage.activeFiveHourWindow == nil { detail = "—" }
             else { detail = dayText(window.resetsAt) + " " + clock.string(from: window.resetsAt) }
             return MenuQuota(name: name, remaining: 100 - window.usedPercent, detail: detail)
-        }
-        if plan.mode == .keepAlive && usage.fiveHour != nil && usage.activeFiveHourWindow == nil {
-            result.headline = "正在同步"; result.action = ""; result.isSyncing = true
-            return result
         }
         if let date = plan.date, date >= now {
             result.headline = clock.string(from: date)
@@ -337,10 +338,6 @@ struct MenuPresentation {
         var resetDetections: [Date]? = nil
     }
     private struct CachedSummary {
-        let summary: MenuSummary
-        let usage: UsageSnapshot
-        let confirmations: [ExecutionConfirmation]
-        let capturedAt: Date
         let accountID: String?
         let plan: NextAction
         let tasks: [BlockedSession]
@@ -354,8 +351,9 @@ struct MenuPresentation {
     private var observedWindows: [QuotaWindow] = []
     private var observedResets: [Date] = []
     private var observedResetDetections: [Date] = []
+    private var lastLiveUsage: UsageSnapshot?
     private var cached: CachedSummary?
-    private var executionBase: (summary: MenuSummary, capturedAt: Date?, accountID: String?)?
+    private var executionBase: (summary: MenuSummary, accountID: String?)?
     private var wasRunning = false
     private var wasRefreshing = false
     private var refreshRequested = false
@@ -411,7 +409,9 @@ struct MenuPresentation {
                         running: Bool = false, executionMode: NextActionMode? = nil,
                         executionFailure: String? = nil, executionFailureIsCurrent: Bool = false,
                         executionWarning: String? = nil, executionNotice: String? = nil, refreshing: Bool = false,
-                        refreshMessage: String = "", displayUsage: UsageSnapshot? = nil, now: Date = Date()) -> MenuSummary {
+                        refreshMessage: String = "", displayUsage: UsageSnapshot? = nil, accountContext: String? = nil, now: Date = Date()) -> MenuSummary {
+        // Account context may be locally known while quota is temporarily unavailable.
+        let usage = usage.flatMap { reading in accountContext.map({ $0 != reading.accountID }) == true ? nil : reading }
         // Notification delivery and retired deadlines do not change the user's action plan.
         var currentChoices = choices
         currentChoices.readManualEvents = nil
@@ -425,9 +425,16 @@ struct MenuPresentation {
             earlyRecoveryPolicy: earlyRecoveryPolicy, choices: configuredChoices,
             timeZone: TimeZone.current.identifier)
         let cycleStart = menuPlanCycleStart(schedule: schedule, now: now)
-        let fatalIssue = sessionError != nil || (usageError != nil && !usageErrorIsTransient) || plan?.note == "账户已改变"
-        let changedAccount = usage?.sourceFile == "app-server" && usage?.accountID != nil && usage?.isFresh(at: now) == true && (cached != nil || executionBase != nil || observedAccountID != nil) &&
-            usage?.accountID != (cached?.accountID ?? executionBase?.accountID ?? observedAccountID)
+        let fatalIssue = (plan?.mode == .resume && sessionError != nil) || plan?.note == "账户已改变"
+        let freshAccount = usage.flatMap { $0.sourceFile == "app-server" && $0.isFresh(at: now) ? $0.accountID : nil }
+        let knownAccount = accountContext ?? freshAccount
+        let previousAccount = lastLiveUsage?.accountID ?? cached?.accountID ?? executionBase?.accountID ?? observedAccountID
+        let changedAccount = knownAccount != nil && previousAccount != nil && knownAccount != previousAccount
+        if changedAccount { lastLiveUsage = nil }
+        if let usage, usage.sourceFile == "app-server", usage.accountID?.isEmpty == false, usage.capturedAt <= now.addingTimeInterval(5),
+           lastLiveUsage == nil || (lastLiveUsage?.accountID == usage.accountID && usage.capturedAt >= lastLiveUsage!.capturedAt) {
+            lastLiveUsage = usage
+        }
         if !enabled || fatalIssue || changedAccount || configuration != currentConfiguration {
             cached = nil
             executionBase = nil
@@ -441,7 +448,7 @@ struct MenuPresentation {
             observedResetDetections = []
             observedAccountID = nil
         }
-        if changedAccount, let account = usage?.accountID, let history = accountHistory[account],
+        if changedAccount, let account = knownAccount, let history = accountHistory[account],
            history.configuration == currentConfiguration, history.cycle == cycleStart {
             observedWindows = history.windows; observedResets = history.resets; observedAccountID = account
             observedResetDetections = history.resetDetections ?? []
@@ -493,45 +500,23 @@ struct MenuPresentation {
             }
         }
         persistObservedHistory()
-        var summary = enabled ? MenuSummary.build(plan: plan, usage: fatalIssue ? nil : usage,
-            schedule: schedule, tasks: tasks, confirmations: confirmations,
-            observedWindows: observedWindows, observedResets: observedResets, observedResetDetections: observedResetDetections, now: now) : MenuSummary(headline: "已停用")
-        var capturedAt: Date?
-        var restoredCache = false
-        if enabled && !fatalIssue {
-            if let usage, usage.isFresh(at: now), usage.accountID != nil, let plan {
-                // Every real new reading replaces the previous display, including absent or unknown windows.
-                capturedAt = usage.capturedAt
-                cached = CachedSummary(summary: summary, usage: usage, confirmations: confirmations, capturedAt: usage.capturedAt, accountID: usage.accountID,
-                    plan: plan, tasks: selected, availableTasks: available, choices: currentChoices)
-            } else if let previous = cached {
-                let syncNotes = ["等待额度同步", "额度已过期，等待实时确认", "等待额度恢复确认", "正在同步窗口状态"]
-                let compatiblePlan = plan.map { syncNotes.contains($0.note) ||
-                    ($0.mode == previous.plan.mode && $0.date == previous.plan.date && $0.note == previous.plan.note) } ?? true
-                if compatiblePlan {
-                    let displayPlan: NextAction
-                    if previous.tasks != selected || previous.availableTasks != available {
-                        var current = DecisionEngine(schedule: schedule).plan(now: now, enabled: enabled, autoResume: autoResume,
-                            earlyRecoveryPolicy: earlyRecoveryPolicy, usage: previous.usage, blocked: tasks, reserveIdleDate: tasks.isEmpty)
-                        if case .ping = current.decision {
-                            current.date = schedule.nextKeepAliveNode(after: now)
-                            current.decision = .wait(reason: "等待下一可行计划节点")
-                        }
-                        displayPlan = current
-                    }
-                    else if let date = previous.plan.date, date >= now { displayPlan = previous.plan }
-                    else if let plan, let date = plan.date, date >= now { displayPlan = plan }
-                    else { displayPlan = DecisionEngine(schedule: schedule).plan(now: now, enabled: enabled, autoResume: autoResume,
-                        earlyRecoveryPolicy: earlyRecoveryPolicy, usage: previous.usage, blocked: tasks, reserveIdleDate: tasks.isEmpty) }
-                    summary = MenuSummary.build(plan: displayPlan, usage: previous.usage, schedule: schedule, tasks: tasks,
-                        confirmations: confirmations.isEmpty ? previous.confirmations : confirmations, observedWindows: observedWindows, observedResets: observedResets, observedResetDetections: observedResetDetections, now: now, requireFresh: false)
-                    capturedAt = previous.capturedAt; restoredCache = true
-                } else { cached = nil }
-            }
-            if running, executionMode != .resume, !restoredCache, usage?.isFresh(at: now) != true, let previous = executionBase {
-                summary = previous.summary
-                capturedAt = previous.capturedAt
-            }
+        var displayPlan = plan
+        let hasFreshUsage = usage?.sourceFile == "app-server" && usage?.isFresh(at: now) == true
+        if enabled, !fatalIssue, !hasFreshUsage, let previous = cached,
+           plan?.mode == .resume, ["等待额度同步", "额度已过期，等待实时确认", "等待额度恢复确认", "正在同步窗口状态"].contains(plan?.note ?? ""),
+           previous.tasks == selected, previous.availableTasks == available, previous.choices == currentChoices,
+           previous.plan.date.map({ $0 >= now }) == true {
+            displayPlan = previous.plan
+        }
+        let liveDisplayUsage = lastLiveUsage ?? UsageSnapshot(fiveHour: nil, weekly: nil, capturedAt: .distantPast,
+            accountID: knownAccount ?? observedAccountID, sourceFile: "app-server")
+        var summary = enabled ? MenuSummary.build(plan: displayPlan, usage: plan?.note == "账户已改变" ? nil : liveDisplayUsage,
+            schedule: schedule, tasks: tasks, confirmations: confirmations, observedWindows: observedWindows,
+            observedResets: observedResets, observedResetDetections: observedResetDetections, now: now, requireFresh: false) : MenuSummary(headline: "已停用")
+        var capturedAt = lastLiveUsage?.capturedAt
+        if enabled, !fatalIssue, hasFreshUsage, let usage, let plan {
+            cached = CachedSummary(accountID: usage.accountID,
+                plan: plan, tasks: selected, availableTasks: available, choices: currentChoices)
         }
         if enabled, !fatalIssue, let displayUsage, displayUsage.sourceFile != "app-server",
            let authority = usage, authority.accountID == displayUsage.accountID,
@@ -551,7 +536,7 @@ struct MenuPresentation {
             summary.taskCount = availableTasks.count
         }
         if enabled {
-            if running && !wasRunning { executionBase = (summary, capturedAt, cached?.accountID ?? usage?.accountID) }
+            if running && !wasRunning { executionBase = (summary, cached?.accountID ?? usage?.accountID) }
             summary.applyIssues(usageError: usageError, sessionError: sessionError, executionFailure: executionFailure,
                 executionAction: executionMode == .resume ? "自动继续" : "保活", usageErrorIsTransient: usageErrorIsTransient,
                 executionFailureIsCurrent: executionFailureIsCurrent)
@@ -591,6 +576,27 @@ struct MenuPresentation {
 }
 
 extension MenuSummary {
+    mutating func applyPingHistory(_ results: [PingNodeResult], accountID: String?, now: Date = Date()) {
+        let calendar = Calendar.current
+        let clock = DateFormatter(); clock.dateFormat = "HH:mm"
+        for result in results.sorted(by: { $0.node > $1.node }) where result.accountID == accountID && calendar.isDate(result.node, inSameDayAs: now) && result.at <= now {
+            let point = MenuTimelinePoint(date: result.node, time: clock.string(from: result.node), day: "", label: result.historyLabel,
+                kind: .pingRecord, solidBefore: false, pingResult: result)
+            let matches = timeline.indices.filter { index in
+                let existing = timeline[index]
+                return existing.pingResult?.node == result.node ||
+                    (existing.kind == .completedKeepAlive && existing.date >= result.node && existing.date <= result.node.addingTimeInterval(ScheduleEngine.keepAliveTolerance + 180)) ||
+                    ([.start, .keepAliveNotNeeded].contains(existing.kind) && abs(existing.date.timeIntervalSince(result.node)) <= ScheduleEngine.alignmentTolerance) ||
+                    ([.scheduled, .keepAlive].contains(existing.kind) && existing.date == result.node && existing.date <= now)
+            }
+            if let first = matches.first {
+                timeline[first] = point
+                for index in matches.dropFirst().reversed() { timeline.remove(at: index) }
+            } else if timeline.count < 4 { timeline.append(point) }
+        }
+        timeline.sort { $0.date < $1.date }
+    }
+
     mutating func applyResumeTasks(operations: [ResumeOperation], pending: [BlockedSession], choices: ResumeChoices,
                                    enabled: Bool = true, autoResume: Bool = true) {
         let operations = operations.filter { !(choices.ignoredEpisodes?.contains($0.target.episodeKey) ?? false) }
@@ -643,7 +649,7 @@ extension MenuSummary {
     mutating func applyResumeHistory(_ operations: [ResumeOperation], accountID: String?, confirmations: [ExecutionConfirmation] = [], now: Date = Date()) {
         let visible = operations.filter { $0.accountID == accountID }
         for index in timeline.indices where timeline[index].isHistory {
-            guard timeline[index].kind != .completedKeepAlive else { timeline[index].operationIDs = []; continue }
+            guard timeline[index].kind != .completedKeepAlive && timeline[index].kind != .pingRecord else { timeline[index].operationIDs = []; continue }
             let date = timeline[index].date
             let ids = Set(confirmations.filter { $0.kind == .resume && $0.accountID == accountID &&
                 abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(date)) <= ScheduleEngine.alignmentTolerance
