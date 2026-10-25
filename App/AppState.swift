@@ -299,6 +299,7 @@ import Network
                     "usage_failed": usage.lastError != nil, "usage_refreshing": usage.refreshing,
                     "critical_refresh": usage.criticalRefreshPending,
                     "scanned": sessions.hasScanned, "scan_failed": sessions.detectionError != nil,
+                    "scan_failures": sessions.scanFailures.map(\.logValue),
                     "scan_recent": sessions.scannedAt.map { (-5...60).contains(now.timeIntervalSince($0)) } ?? false,
                     "blocked": blockedSessions.count, "selected": selectedTasks.count,
                     "executing": execution.running, "protected": execution.busyThreadIDs.count,
