@@ -602,7 +602,7 @@ import Network
     private func saveRuntime() -> Bool {
         guard !runtimeReadFailed else {
             recoveryReminderTasks = []
-            let reason = "记录无法读取，请到关于页反馈问题。"
+            let reason = "续跑状态无法读取，自动续跑已暂停。请到 Codex 手动继续任务。"
             decision = .wait(reason: reason)
             nextAction = NextAction(mode: .resume, date: nil, decision: .wait(reason: reason), note: reason)
             return false
@@ -756,7 +756,7 @@ import Network
     var enabled: Bool { defaults.bool(forKey: "enabled") }
     var pendingStateFailure: String? {
         guard !runtimeHealthy else { return nil }
-        return runtimeReadFailed ? L10n.text("记录无法读取，请到关于页反馈问题。") : ResumePreflightReason.runtimeUnhealthy.userMessage
+        return runtimeReadFailed ? L10n.text("续跑状态无法读取，自动续跑已暂停。请到 Codex 手动继续任务。") : ResumePreflightReason.runtimeUnhealthy.userMessage
     }
     var automaticResumeEnabled: Bool { defaults.bool(forKey: "autoResume") }
     var defaultResumeMessage: String { ResumeMessagePreferences.current(defaults: defaults) }

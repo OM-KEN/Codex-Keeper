@@ -184,8 +184,9 @@ import UserNotifications
     private func rebuildMenu() {
         let enabled = UserDefaults.standard.bool(forKey: "enabled")
         if updateChecksEnabled != enabled {
+            let reenabled = updateChecksEnabled == false && enabled
             updateChecksEnabled = enabled
-            if enabled { updateService.startAutomaticChecks() } else { updateService.stop() }
+            if enabled { updateService.startAutomaticChecks(checkImmediately: reenabled) } else { updateService.stop() }
         }
         if !enabled { quotaHost?.menuDidClose() }
         let summary = makeSummary()
@@ -239,7 +240,6 @@ import UserNotifications
         quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
         let hasUpdate = updateService.showsMenuUpdateIndicator
         let versionTitle = MenuVersionTextFormatter.string(version: AppVersion.currentString, hasUpdate: hasUpdate)
-        versionItem?.isHidden = !enabled
         versionItem?.title = versionTitle
         versionItem?.attributedTitle = nil
         if hasUpdate, let image = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: L10n.text("有新版本"))?

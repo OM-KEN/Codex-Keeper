@@ -391,6 +391,60 @@ import Darwin
             await failureRestart.checkAutomaticallyIfDue()
             check(failureRequests == 2 && failureRestart.status == .updateAvailable(newRelease),
                 "failed automatic checks can retry exactly after an hour")
+
+            let reenableSuite = "keeper.reenable-updates.tests." + UUID().uuidString
+            let reenableDefaults = UserDefaults(suiteName: reenableSuite)!
+            defer { reenableDefaults.removePersistentDomain(forName: reenableSuite) }
+            reenableDefaults.set(clock, forKey: "appUpdateLastCheck")
+            var reenableRequests = 0
+            let reenableService = AppUpdateService(defaults: reenableDefaults, currentVersion: "0.1.4", now: { clock }, loadResponse: { _ in
+                reenableRequests += 1
+                return releaseResponse("v0.1.10")
+            })
+            reenableService.startAutomaticChecks()
+            try await Task.sleep(nanoseconds: 50_000_000)
+            check(reenableRequests == 0, "ordinary startup keeps the existing successful-check interval")
+            reenableService.stop()
+            reenableService.startAutomaticChecks(checkImmediately: true)
+            let reenableDeadline = Date().addingTimeInterval(2)
+            while (reenableRequests == 0 || reenableService.status == .checking) && Date() < reenableDeadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            check(reenableRequests == 1 && reenableService.showsMenuUpdateIndicator,
+                "re-enabling Keeper immediately checks once despite a recent successful check")
+            await reenableService.checkAutomaticallyIfDue()
+            check(reenableRequests == 1, "ordinary triggers remain throttled after the re-enable check")
+            reenableService.stop()
+            reenableService.setAutomaticRemindersEnabled(false)
+            reenableService.startAutomaticChecks(checkImmediately: true)
+            try await Task.sleep(nanoseconds: 50_000_000)
+            check(reenableRequests == 1 && !reenableService.showsMenuUpdateIndicator,
+                "re-enabling Keeper respects the user's disabled update reminders")
+            reenableService.stop()
+
+            let interruptedSuite = "keeper.reenable-inflight.tests." + UUID().uuidString
+            let interruptedDefaults = UserDefaults(suiteName: interruptedSuite)!
+            defer { interruptedDefaults.removePersistentDomain(forName: interruptedSuite) }
+            var interruptedRequests = 0
+            var heldUpdate: CheckedContinuation<Void, Never>?
+            let interruptedService = AppUpdateService(defaults: interruptedDefaults, currentVersion: "0.1.4", loadResponse: { _ in
+                interruptedRequests += 1
+                if interruptedRequests == 1 { await withCheckedContinuation { heldUpdate = $0 } }
+                return releaseResponse("v0.1.10")
+            })
+            interruptedService.startAutomaticChecks()
+            let heldDeadline = Date().addingTimeInterval(2)
+            while heldUpdate == nil && Date() < heldDeadline { try await Task.sleep(nanoseconds: 10_000_000) }
+            interruptedService.stop()
+            interruptedService.startAutomaticChecks(checkImmediately: true)
+            heldUpdate?.resume()
+            let interruptedDeadline = Date().addingTimeInterval(2)
+            while (interruptedRequests < 2 || interruptedService.status == .checking) && Date() < interruptedDeadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            check(interruptedRequests == 2 && interruptedService.showsMenuUpdateIndicator,
+                "rapid disable and re-enable queues one fresh check after the cancelled request settles")
+            interruptedService.stop()
             let upgradedService = AppUpdateService(defaults: automaticDefaults, currentVersion: "0.1.10", now: { clock }, loadResponse: { _ in releaseResponse("v0.1.10") })
             check(upgradedService.availableRelease == nil && !upgradedService.showsMenuUpdateIndicator,
                 "installing the cached newer version removes the obsolete menu reminder")
@@ -3525,7 +3579,7 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     let confirmedResetAction = completed(.resume, earlyStart)
     var confirmedReading = afterReset; confirmedReading.capturedAt = earlyStart.addingTimeInterval(40)
     check(render(&actionAtReset, confirmedReading, at: confirmedReading.capturedAt, confirmations: [confirmedResetAction])
-        .timeline.contains { $0.date == earlyStart && $0.kind == .completedResume && $0.label == "已续跑" },
+        .timeline.contains { $0.date == earlyStart && $0.kind == .completedResume && $0.label == "已继续" },
         "a real matching Keeper operation retains its continued fact at a reset boundary")
 
     let now = at(19)

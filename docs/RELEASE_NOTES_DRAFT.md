@@ -1,18 +1,21 @@
-# 下一版发布说明（中文草稿）
+# v1.1.0 发布说明（重要更新）
 
-基于上次正式发布 v1.0.2 整理。文案待 OM 确认，本次仅提交源码，不创建 Release 或新标签。
+比较基线为正式标签 v1.0.2。中文沿用 OM 确认的文案，英文逐条对应。
 
-<!-- keeper-important-update: 1.0.0 -->
+<!-- keeper-important-update: 1.1.0 -->
 
-## 新功能
+## Fixes
 
-- 额度变化在后台及时同步，菜单关闭时也能更新，减少打开菜单后才追上读数的等待。
-- 保活与续跑分别判断；续跑扫描异常不再拖住正常保活，额度暂时读不到时仍可按计划尝试一次保活。
+- Fixed the task splitting caused by recent Codex updates that left Keeper unable to tell which task was the real one...
+- Keeper's lazy keepalive problem is fixed for good (or is it?). Anyway, even if quota checks keep failing to connect, Keeper will still make one scheduled keepalive attempt.
+- Keeper no longer keeps checking quota on its own. Most of the time, it gets it straight from Codex! (Codex now shows quota progress bars in its left sidebar too, but Keeper's are clearer!)
+- Made sure Keeper really stops when you turn it off.
+- A few other little-known fixes, including a major cleanup of keepalive logic. Auto-resume, you're next! Nobody gets away.
 
 ## 修复
 
-- 适配新版 Codex 的任务分段和记录替换，避免续跑时把一个任务识别成两个。
-- 改进后台刷新后的调度推进，以及本地任务记录读取异常时的恢复。
-- 降低后台扫描开销；停用 Keeper 后停止后台查询和轮询。
-- 时间线恢复清晰的“已保活 / 已续跑”和正确图标；点击续跑节点查看原任务详情，窗口等说明留在详情里。
-- 修复旧额度缓存覆盖新读数，以及旧“保活已错过”提示在后续续跑或正常跳过后仍然常驻的问题。
+- 修了 Codex 最近更新导致的任务分裂问题导致的 Keeper 续跑分不清到底哪个是真实任务的问题……
+- 保活偷懒的问题彻底解决了（吗？），总之，现在额度查询一直连不上，也会按计划尝试保活一次。
+- 额度不再总是自己去查了，现在大部分时候直接拿 Codex 的额度！（Codex 自己也在界面左侧显示额度进度条了，但是没 Keeper 的清晰！）
+- 确保了 Keeper 停用的时候是真的停了。
+- 其他一些鲜为人知的小修复，比如大幅优化了保活的逻辑，接下来就是你续跑了！谁也逃不掉。

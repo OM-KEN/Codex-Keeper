@@ -1780,9 +1780,16 @@ private struct AuditFailureUsage: UsageProvider {
         } else { try Data().write(to: directory) }
         defer { try? FileManager.default.removeItem(at: directory) }
         let coordinator = ExecutionCoordinator(provider: ResumeTestUsage(), ledgerURL: ledger, codexHome: URL(fileURLWithPath: target.cwd))
-        check(!coordinator.canStartResume && coordinator.recordingFailure?.contains("反馈") == true &&
-            coordinator.recordingFailure?.contains("刷新") == false && coordinator.recordingFailure?.contains("已在运行") == false,
-            "unreadable records and unavailable lock files give a real recovery path without inventing another instance")
+        let message = coordinator.recordingFailure ?? ""
+        let actionable = corruptLedger ? message.contains("保活和自动续跑已暂停") && message.contains("手动继续任务") :
+            message.contains("磁盘空间与访问权限") && message.contains("重启 Keeper")
+        check(!coordinator.canStartResume && actionable && !message.contains("反馈") &&
+            !message.contains("刷新") && !message.contains("已在运行"),
+            "unreadable records and inaccessible folders explain their impact and give the matching next action")
+        if corruptLedger {
+            check((try? Data(contentsOf: ledger)) == Data("invalid ledger".utf8),
+                "an unreadable execution ledger stays unchanged while automatic execution is paused")
+        }
     }
     let legacy = ResumeOperation(id: "copy", batchID: "copy", accountID: nil, target: target, actionAt: Date(), phase: .notSubmitted,
         failure: "fixture-only technical failure", protectsThread: false)

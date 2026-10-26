@@ -179,6 +179,7 @@ enum AppUpdateStatus: Equatable {
     private var automaticTimer: Timer?
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var automaticTask: Task<Void, Never>?
+    private var checkImmediatelyAfterCurrent = false
 
     init(defaults: UserDefaults = .standard, currentVersion: String = AppVersion.currentString,
          now: @escaping () -> Date = Date.init,
@@ -210,11 +211,11 @@ enum AppUpdateStatus: Equatable {
         return release
     }
 
-    func startAutomaticChecks() {
+    func startAutomaticChecks(checkImmediately: Bool = false) {
         automaticChecksStarted = true
         guard automaticRemindersEnabled else { return }
         installAutomaticTriggers()
-        triggerAutomaticCheck()
+        triggerAutomaticCheck(immediately: checkImmediately)
     }
 
     func setAutomaticRemindersEnabled(_ enabled: Bool) {
@@ -224,6 +225,7 @@ enum AppUpdateStatus: Equatable {
             installAutomaticTriggers()
             triggerAutomaticCheck()
         } else if !enabled {
+            checkImmediatelyAfterCurrent = false
             removeAutomaticTriggers()
             automaticTask?.cancel()
         }
@@ -231,6 +233,7 @@ enum AppUpdateStatus: Equatable {
 
     func stop() {
         automaticChecksStarted = false
+        checkImmediatelyAfterCurrent = false
         removeAutomaticTriggers()
         automaticTask?.cancel()
     }
@@ -258,19 +261,27 @@ enum AppUpdateStatus: Equatable {
         observers.removeAll()
     }
 
-    private func triggerAutomaticCheck() {
-        guard automaticChecksStarted, automaticRemindersEnabled, automaticTask == nil else { return }
+    private func triggerAutomaticCheck(immediately: Bool = false) {
+        guard automaticChecksStarted, automaticRemindersEnabled else { return }
+        guard automaticTask == nil else {
+            if immediately { checkImmediatelyAfterCurrent = true }
+            return
+        }
         automaticTask = Task { [weak self] in
             guard let self else { return }
-            await self.checkAutomaticallyIfDue()
+            await self.checkAutomaticallyIfDue(ignoreInterval: immediately)
             self.automaticTask = nil
+            if self.checkImmediatelyAfterCurrent {
+                self.checkImmediatelyAfterCurrent = false
+                self.triggerAutomaticCheck(immediately: true)
+            }
         }
     }
 
-    func checkAutomaticallyIfDue() async {
+    func checkAutomaticallyIfDue(ignoreInterval: Bool = false) async {
         guard automaticRemindersEnabled, status != .checking else { return }
         let interval: TimeInterval = defaults.bool(forKey: Self.lastCheckFailedKey) ? 60 * 60 : 24 * 60 * 60
-        if let lastCheck = defaults.object(forKey: Self.lastCheckKey) as? Date,
+        if !ignoreInterval, let lastCheck = defaults.object(forKey: Self.lastCheckKey) as? Date,
            now().timeIntervalSince(lastCheck) < interval { return }
         await performCheck(manual: false)
     }

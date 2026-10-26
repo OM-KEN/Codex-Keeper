@@ -101,7 +101,7 @@ struct MenuTimelinePoint {
         }
     }
     var isHistory: Bool { [.completedKeepAlive, .completedResume, .resumeRecord, .pingRecord].contains(kind) }
-    var isAction: Bool { [.keepAlive, .resume, .completedKeepAlive, .completedResume].contains(kind) }
+    var isAction: Bool { [.keepAlive, .resume].contains(kind) }
 }
 
 struct MenuQuota: Identifiable {
@@ -255,7 +255,7 @@ extension MenuSummary {
                     // Only a confirmed operation matching this real window can claim completion.
                     let confirmed = confirmation(for: start)
                     if let confirmed {
-                        result.timeline.append(point(start, confirmed.kind == .resume ? "已续跑" : "已保活",
+                        result.timeline.append(point(start, confirmed.kind == .resume ? "已继续" : "已保活",
                             confirmed.kind == .resume ? .completedResume : .completedKeepAlive))
                     } else { result.timeline.append(observedWindow(five)) }
                     if abs(actionDate.timeIntervalSince(five.resetsAt)) < ScheduleEngine.alignmentTolerance {
@@ -287,7 +287,7 @@ extension MenuSummary {
                           confirmation.actionAt <= confirmation.confirmedAt, date <= confirmation.confirmedAt,
                           date >= historyStart, date < first else { return nil }
                     return point(date,
-                        confirmation.kind == .resume ? "已续跑" : "已保活",
+                        confirmation.kind == .resume ? "已继续" : "已保活",
                         confirmation.kind == .resume ? .completedResume : .completedKeepAlive)
                 }
                 let observed = observedWindows.map(observedWindow) + observedResets.map { point($0, "已重置", .reset) }
@@ -680,7 +680,7 @@ extension MenuSummary {
                 guard !matching.isEmpty else { timeline[index].operationIDs = []; continue }
                 ids.formUnion(matching.map(\.id))
                 timeline[index] = MenuTimelinePoint(date: point.date, time: point.time, day: point.day,
-                    label: "已续跑", kind: .completedResume, solidBefore: point.solidBefore, pingResult: ping)
+                    label: "已继续", kind: .completedResume, solidBefore: point.solidBefore, pingResult: ping)
             } else {
                 ids.formUnion(validConfirmations.filter {
                     abs(($0.windowStart ?? $0.actionAt).timeIntervalSince(point.date)) <= ScheduleEngine.alignmentTolerance
@@ -701,7 +701,7 @@ extension MenuSummary {
             guard !timeline.contains(where: { $0.operationIDs.contains(operation.id) }) else { continue }
             timeline.append(MenuTimelinePoint(date: operation.actionAt, time: clock.string(from: operation.actionAt),
                 day: "",
-                label: confirmedIDs.contains(operation.id) ? "已续跑" : "续跑记录", kind: confirmedIDs.contains(operation.id) ? .completedResume : .resumeRecord,
+                label: confirmedIDs.contains(operation.id) ? "已继续" : "续跑记录", kind: confirmedIDs.contains(operation.id) ? .completedResume : .resumeRecord,
                 solidBefore: false, operationIDs: Set(visible.filter { $0.batchID == operation.batchID }.map(\.id))))
         }
         timeline.sort { $0.date < $1.date }

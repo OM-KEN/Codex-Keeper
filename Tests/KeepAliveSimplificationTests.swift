@@ -32,7 +32,7 @@ func checkTimelineResumeHistory(_ check: (Bool, String) -> Void) {
         return summary
     }
     var summary = history([operation])
-    check(summary.timeline.first?.kind == .completedResume && summary.timeline.first?.label == "已续跑" &&
+    check(summary.timeline.first?.kind == .completedResume && summary.timeline.first?.label == "已继续" &&
         summary.timeline.first?.symbol == "checkmark.circle.fill",
         "a confirmed resume takes precedence over a skipped same-node keepalive when all four slots are occupied")
     check(summary.timeline.first?.operationIDs == [operation.id], "the merged resume retains the exact successful operation association")
@@ -113,7 +113,7 @@ func checkTimelineResumeHistory(_ check: (Bool, String) -> Void) {
             independent.timeline.first?.operationIDs.isEmpty == true,
             "an independent \(outcome.rawValue) keepalive result cannot be absorbed by a nearby resume")
     }
-    var reverse = MenuSummary(timeline: [MenuTimelinePoint(date: operation.actionAt, time: "08:00", day: "", label: "已续跑",
+    var reverse = MenuSummary(timeline: [MenuTimelinePoint(date: operation.actionAt, time: "08:00", day: "", label: "已继续",
         kind: .completedResume, solidBefore: false, operationIDs: [operation.id])])
     reverse.applyPingHistory([skipped], accountID: account, now: now)
     check(reverse.timeline.count == 1 && reverse.timeline.first?.kind == .completedResume && reverse.timeline.first?.pingResult?.outcome == .skipped,
@@ -487,13 +487,23 @@ final class PreparationGatePing: PingTransport {
     menu.applyPingHistory([fact], accountID: "facts-account", now: after.capturedAt)
     check(menu.timeline.first?.pingResult?.outcome == .windowActive && menu.timeline.first?.label == fact.historyLabel,
         "menu history uses the same canonical result fact as execution events and notification text")
-    for outcome: PingOutcome in [.newWindow, .windowActive, .windowPending, .skipped] {
+    for outcome: PingOutcome in [.newWindow, .windowActive, .windowPending] {
         let result = PingNodeResult(node: fact.node, accountID: fact.accountID, at: fact.at, outcome: outcome)
         var history = MenuSummary()
         history.applyPingHistory([result], accountID: fact.accountID, now: fact.at)
         check(history.timeline.first?.label == "已保活" && history.timeline.first?.isHistory == true &&
             history.timeline.first?.pingResult?.message == result.message && result.message != L10n.text("已保活"),
             "keepalive history has a compact label and retains the distinct \(outcome.rawValue) result for details")
+    }
+    let skippedHistory = PingNodeResult(node: fact.node, accountID: fact.accountID, at: fact.at, outcome: .skipped)
+    var skippedMenu = MenuSummary()
+    skippedMenu.applyPingHistory([skippedHistory], accountID: fact.accountID, now: fact.at)
+    check(skippedMenu.timeline.first?.label == "无需保活" && skippedMenu.timeline.first?.pingResult?.message == L10n.text("已有有效 5 小时窗口"),
+        "an existing active window skips sending and displays no keepalive needed with its reason in details")
+    for kind: MenuTimelinePoint.Kind in [.completedKeepAlive, .completedResume] {
+        let point = MenuTimelinePoint(date: fact.at, time: "13:00", day: "", label: "", kind: kind, solidBefore: false)
+        check(point.symbol == "checkmark.circle.fill" && !point.isAction,
+            "completed \(kind) history uses the same secondary-colored checkmark")
     }
     for outcome: PingOutcome in [.submitted, .failed, .unknown, .notExecuted] {
         let result = PingNodeResult(node: fact.node, accountID: fact.accountID, at: fact.at, outcome: outcome)

@@ -75,7 +75,7 @@ import Darwin
                     operations[key] = operation
                 }
             } else if let data = try? Data(contentsOf: self.ledgerURL), let saved = try? JSONDecoder().decode([String].self, from: data) { attempts = Set(saved) }
-            else { attempts = []; ledgerHealthy = false; status = L10n.text("记录无法读取，请到关于页反馈问题。") }
+            else { attempts = []; ledgerHealthy = false; status = L10n.text("执行记录无法读取，保活和自动续跑已暂停。请到 Codex 手动继续任务。") }
         } else { attempts = [] }
         pingResults = events.pingResults()
         lastPingResult = pingResults.last
@@ -88,7 +88,7 @@ import Darwin
         executionLock = Darwin.open(self.ledgerURL.deletingLastPathComponent().appendingPathComponent("execution.lock").path, O_CREAT | O_RDWR, 0o600)
         if executionLock < 0 || flock(executionLock, LOCK_EX | LOCK_NB) != 0 {
             ledgerHealthy = false
-            status = L10n.text(executionLock < 0 ? "记录无法读取，请到关于页反馈问题。" : "Keeper 已在运行，请使用已打开的 Keeper。")
+            status = L10n.text(executionLock < 0 ? "无法访问记录目录，自动操作已暂停。请检查磁盘空间与访问权限后重启 Keeper。" : "Keeper 已在运行，请使用已打开的 Keeper。")
         }
         if !ledgerHealthy { permanentlyUnhealthy = true; lastFailure = status; recordingFailure = status }
         else {

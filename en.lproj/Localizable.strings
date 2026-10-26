@@ -35,7 +35,6 @@
 "计划内" = "On Schedule";
 "计划外" = "Off Schedule";
 "已保活" = "Kept Active";
-"已续跑" = "Resumed";
 "点击查看详情" = "Click to view details";
 "已继续" = "Resumed";
 "继续" = "Continue";
@@ -473,7 +472,9 @@
 "Keeper 已在运行，请使用已打开的 Keeper。" = "Keeper is already running, use the Keeper that is already open.";
 "任务读取失败，请打开 Codex 后刷新。" = "Tasks could not be read, open Codex, then refresh.";
 
-"记录无法读取，请到关于页反馈问题。" = "Records could not be read, report the problem from About.";
+"续跑状态无法读取，自动续跑已暂停。请到 Codex 手动继续任务。" = "Resume state could not be read; auto-resume is paused. Continue your tasks manually in Codex.";
+"执行记录无法读取，保活和自动续跑已暂停。请到 Codex 手动继续任务。" = "Execution records could not be read; keepalive and auto-resume are paused. Continue your tasks manually in Codex.";
+"无法访问记录目录，自动操作已暂停。请检查磁盘空间与访问权限后重启 Keeper。" = "The records folder could not be accessed; automatic actions are paused. Check disk space and access permissions, then restart Keeper.";
 
 "确认中，请等待。" = "Confirming, please wait.";
 "等待状态更新。" = "Waiting for a status update.";
