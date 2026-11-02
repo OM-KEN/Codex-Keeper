@@ -124,6 +124,7 @@ struct PingNodeResult: Codable {
         case .skipped: return L10n.text("已有有效 5 小时窗口")
         case .notExecuted:
             let message = L10n.text("本次保活已错过，请等待下次保活或手动保活。")
+            let detail = preflight?.errorDescription ?? diagnostic?.failureMessage ?? detail
             guard let detail, !detail.isEmpty, detail != L10n.text("正在确认中") else { return message }
             return message + "\n" + L10n.format("上轮原因：%@", detail)
         case .failed, .unknown: return preflight?.errorDescription ?? diagnostic?.failureMessage ?? detail ?? L10n.text("结果待确认，请刷新查看额度。")
@@ -145,6 +146,7 @@ struct PingNodeResult: Codable {
 
 enum PingFailureReason: String, Codable {
     case unknown, requestTimeout = "request_timeout", connection, proxy, server
+    case quotaExhausted = "quota_exhausted"
     case model, request, launch, configuration, processExit = "process_exit", quotaRead = "quota_read", accountChanged = "account_changed", cancelled
 }
 
@@ -170,6 +172,7 @@ struct PingDiagnostic: Codable {
         switch reason {
         case .launch: return L10n.text("无法启动 Codex，请更新后刷新。")
         case .model: return L10n.text("当前模型不可用，请更新 Codex 后刷新。")
+        case .quotaExhausted: return L10n.text("当时额度不足，本轮未能保活。")
         case .request: return L10n.text("保活请求失败，请等待下次保活。")
         case .configuration: return L10n.text("设置未就绪，请更新 Codex。")
         case .accountChanged: return L10n.text("账户已切换，请切回原账户。")
@@ -183,6 +186,7 @@ struct PingDiagnostic: Codable {
         switch reason {
         case .launch: return L10n.text("保活未发送：Codex 无法启动")
         case .model, .request: return L10n.text("保活请求已报错；本轮不再重试")
+        case .quotaExhausted: return L10n.text("保活因额度不足未完成；本轮不再重试")
         case .configuration: return L10n.text("保活未发送：Codex 无法读取保活配置")
         case .processExit: return L10n.text("保活进程提前退出，未确认新窗口；本轮不再重试")
         case .quotaRead: return L10n.text("保活已发送，但额度读取失败，未确认新窗口；本轮不再重试")

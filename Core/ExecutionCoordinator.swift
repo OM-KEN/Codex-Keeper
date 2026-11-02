@@ -370,7 +370,7 @@ import Darwin
                         outcome: "not_submitted", errorCode: "\(failure.domain):\(failure.code)", stage: local.stage)
                 }
                 let preflight = underlying as? PingPreflightDiagnostic
-                let outcome: PingOutcome = submitted ? (diagnostic?.reason == .model || diagnostic?.reason == .request || diagnostic?.reason == .configuration ? .failed : .unknown) : .failed
+                let outcome: PingOutcome = submitted ? (diagnostic?.reason == .model || diagnostic?.reason == .request || diagnostic?.reason == .quotaExhausted || diagnostic?.reason == .configuration ? .failed : .unknown) : .failed
                 let result = PingNodeResult(node: node, accountID: boundAccount, at: now(), outcome: outcome, diagnostic: diagnostic,
                     preflight: preflight, detail: preflight?.errorDescription ?? diagnostic?.failureMessage ?? CodexConnectionError.capabilityMessage(for: error))
                 let unchanged = lastPingResult?.node == node && lastPingResult?.outcome == outcome &&

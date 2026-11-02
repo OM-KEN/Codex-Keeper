@@ -85,9 +85,12 @@ struct PingReceipt {
             if ((type == "error" || type == "turn_failed") && payload["will_retry"] as? Bool != true) ||
                 (type == "task_complete" && payload["error"] != nil && !(payload["error"] is NSNull)) {
                 let detail = String(describing: payload["error"] ?? payload["message"] ?? payload).lowercased()
-                receipt.failure = ["model_not_found", "unsupported_model", "invalid_model", "model_not_available"].contains(where: detail.contains) ? .model : .request
-                let code = (payload["error"] as? [String: Any])?["code"] as? String ?? payload["code"] as? String
-                if let code, ["model_not_found", "unsupported_model", "invalid_model", "model_not_available", "usage_limit_reached", "usage_limit_exceeded", "request_timeout", "server_error"].contains(code) { receipt.errorCode = code }
+                receipt.failure = ResumeModelActivity.quotaError(detail) ? .quotaExhausted :
+                    ["model_not_found", "unsupported_model", "invalid_model", "model_not_available"].contains(where: detail.contains) ? .model : .request
+                let error = payload["error"] as? [String: Any]
+                let code = error?["code"] as? String ?? error?["codex_error_info"] as? String ??
+                    payload["code"] as? String ?? payload["codex_error_info"] as? String
+                if let code, ["model_not_found", "unsupported_model", "invalid_model", "model_not_available", "usage_limit_reached", "usage_limit_exceeded", "quota_exhausted", "insufficient_quota", "request_timeout", "server_error"].contains(code) { receipt.errorCode = code }
                 receipt.completed = false
             }
         }
@@ -264,7 +267,7 @@ final class PTYPingTransport: PingTransport {
             let exited = !process.isRunning
             if elapsed >= nextRead || (exited && (diagnostic.threadID == nil || !diagnostic.taskCompleted)) || (lastWarning == nil && elapsed >= timing.warning) {
                 refreshDiagnostic()
-                if diagnostic.reason == .model || diagnostic.reason == .request { try fail(diagnostic.reason) }
+                if diagnostic.reason == .model || diagnostic.reason == .request || diagnostic.reason == .quotaExhausted { try fail(diagnostic.reason) }
                 // Publish the warning before a potentially slow quota query.
                 if diagnostic.elapsedSeconds >= timing.warning, lastWarning != diagnostic.warning {
                     lastWarning = diagnostic.warning; progress(diagnostic)

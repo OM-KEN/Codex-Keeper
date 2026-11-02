@@ -228,11 +228,51 @@ func checkTimelineResumeHistory(_ check: (Bool, String) -> Void) {
         state.usage.stop(); state.sessions.stop(); execution.stopOwnedTasks()
     }
     try await checkKeepAliveFacts(root.appendingPathComponent("facts"), check)
+    try checkPingQuotaFailure(root.appendingPathComponent("quota-failure"), check)
     try checkPingNoticeLifecycle(check, root: root.appendingPathComponent("notice-lifecycle"))
     try await checkKeepAliveHardGates(root.appendingPathComponent("hard-gates"), check)
     try await checkCurrentAuthenticationDisplay(root.appendingPathComponent("authentication-display"), check)
     try checkKeepAlivePreparation(root.appendingPathComponent("preparation"), check)
     try await checkIsolatedPingCompletion(root.appendingPathComponent("pty"), check)
+}
+
+private func checkPingQuotaFailure(_ root: URL, _ check: (Bool, String) -> Void) throws {
+    let sessions = root.appendingPathComponent("sessions")
+    try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+    let file = sessions.appendingPathComponent("rollout-quota.jsonl")
+    let thread = UUID().uuidString; let turn = UUID().uuidString
+    let failures: [([String: Any], String, String?)] = [
+        (["message": "You’ve hit your usage limit.", "codex_error_info": "usage_limit_exceeded"], "quota_exhausted", "usage_limit_exceeded"),
+        (["message": "Limit reached", "code": "usage_limit_reached"], "quota_exhausted", "usage_limit_reached"),
+        (["message": "You've hit your usage limit."], "quota_exhausted", nil),
+        (["message": "Request failed", "code": "server_error"], "request", "server_error"),
+        (["message": "model_not_found", "code": "model_not_found"], "model", "model_not_found")
+    ]
+    for (error, reason, code) in failures {
+        let rows: [[String: Any]] = [
+            ["type": "session_meta", "payload": ["id": thread]],
+            ["type": "event_msg", "payload": ["type": "task_started", "turn_id": turn]],
+            ["type": "event_msg", "payload": ["type": "task_complete", "turn_id": turn, "error": error]]
+        ]
+        var trace = Data()
+        for row in rows { trace.append(try JSONSerialization.data(withJSONObject: row)); trace.append(10) }
+        try trace.write(to: file)
+        let receipt = PingReceipt.read(home: root, excluding: [])
+        check(receipt.failure?.rawValue == reason && receipt.errorCode == code && !receipt.completed,
+            "isolated failure preserves the real quota, request or model cause: \(error)")
+        if reason == "quota_exhausted" {
+            let diagnostic = PingDiagnostic(elapsedSeconds: 15, warningSeconds: 90, timeoutSeconds: 180,
+                reason: receipt.failure ?? .unknown, outcome: "failed", errorCode: receipt.errorCode)
+            let result = PingNodeResult(node: Date(), accountID: "quota-account", at: Date(), outcome: .notExecuted,
+                diagnostic: diagnostic, detail: L10n.text("保活请求失败，请等待下次保活。"))
+            check(result.message.contains("额度不足") && !result.message.contains("请求失败"),
+                "missed quota failure uses structured evidence even when an older detail says request failed")
+            let log = ExecutionEventLog(url: root.appendingPathComponent("events.jsonl"))
+            try log.record("not_executed", kind: "ping", node: result.node, pingResult: result)
+            check(log.pingResults().last?.message == result.message,
+                "quota failure remains distinct after execution history is reopened")
+        }
+    }
 }
 
 func writeKeepAliveAuthentication(home: URL, account: String, token: String = "fixture-only") throws {
@@ -701,6 +741,30 @@ private func checkKeepAlivePreparation(_ root: URL, _ check: (Bool, String) -> V
     check(invalid.after == nil && invalid.diagnostic.taskCompleted && invalid.diagnostic.outcome == "completed_pending" &&
         invalid.diagnostic.reason == .quotaRead && invalid.diagnostic.quotaReadFailure?.reason == "invalid_response" && invalid.diagnostic.elapsedSeconds < timing.timeout,
         "nonretryable quota decoding failure preserves a completed request and reports pending window immediately")
+    let quotaScript = script.replacingOccurrences(of: "'type':'task_complete','turn_id':'\(turn)'",
+        with: "'type':'task_complete','turn_id':'\(turn)','error':{'message':'Limit reached','codex_error_info':'usage_limit_exceeded'}")
+    try quotaScript.write(to: binary, atomically: true, encoding: .utf8)
+    let quotaRoot = root.appendingPathComponent("quota-exhausted")
+    let quotaTransport = PTYPingTransport(codexHome: auth, supportRoot: quotaRoot.appendingPathComponent("ping"), binary: binary, timing: timing)
+    let suite = "keeper.ping-quota." + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.register(defaults: ["enabled": true])
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let schedule = ScheduleEngine(anchorMinutes: 480)
+    let node = schedule.nodes()[1]
+    var clock = node.addingTimeInterval(5)
+    let coordinator = ExecutionCoordinator(provider: provider, defaults: defaults, ledgerURL: quotaRoot.appendingPathComponent("resume-attempts.json"),
+        pingTransport: quotaTransport, codexHome: auth, now: { clock })
+    coordinator.observeKeepAlive(schedule: schedule, accountID: "pty-account", usage: nil, reason: nil)
+    coordinator.ping(schedule: schedule, blockers: { [] })
+    for _ in 0..<100 where coordinator.running { try await Task.sleep(nanoseconds: 10_000_000) }
+    check(coordinator.lastPingResult?.outcome == .failed && coordinator.lastPingResult?.diagnostic?.reason.rawValue == "quota_exhausted" && reads == 2,
+        "a real isolated quota refusal ends as a known failure without quota confirmation reads")
+    clock = node.addingTimeInterval(601)
+    coordinator.observeKeepAlive(schedule: schedule, accountID: "pty-account", usage: nil, reason: nil)
+    check(coordinator.lastPingResult?.outcome == .notExecuted && coordinator.lastPingResult?.message.contains("额度不足") == true &&
+        coordinator.hasAttemptedKeepAlive(node: node, accountID: "pty-account"),
+        "the missed fixed opportunity retains its quota cause and original-node duplicate protection")
 }
 
 private struct IsolatedConfirmationUsage: UsageProvider {

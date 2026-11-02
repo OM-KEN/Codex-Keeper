@@ -239,12 +239,12 @@ extension MenuSummary {
             }
             func observedWindow(_ window: QuotaWindow) -> MenuTimelinePoint {
                 let start = window.resetsAt.addingTimeInterval(-Double(window.windowMinutes) * 60)
+                if let detected = observedResetDetections.filter({ $0 <= now && abs(start.timeIntervalSince($0)) <= ScheduleEngine.alignmentTolerance }).max() {
+                    return point(detected, "发现重置", .reset)
+                }
                 if let reset = observedResets.filter({ $0 <= now && abs($0.timeIntervalSince(start)) <= ScheduleEngine.alignmentTolerance })
                     .min(by: { abs($0.timeIntervalSince(start)) < abs($1.timeIntervalSince(start)) }) {
                     return point(reset, "已重置", .reset)
-                }
-                if let detected = observedResetDetections.filter({ $0 <= start && start.timeIntervalSince($0) <= ScheduleEngine.alignmentTolerance }).max() {
-                    return point(detected, "发现重置", .reset)
                 }
                 return point(start, plan.mode == .keepAlive ? "窗口开始" : "开始", plan.mode == .keepAlive ? .keepAliveNotNeeded : .start)
             }
@@ -267,16 +267,16 @@ extension MenuSummary {
             }
             result.timeline.append(point(actionDate, plan.mode == .resume ? "继续" : "保活",
                 plan.mode == .resume ? .resume : .keepAlive, solid: joinsCurrentWindow))
+            if result.timeline.count < 4, let detected = observedResetDetections.filter({
+                   $0 >= max(menuPlanCycleStart(schedule: schedule, now: now), Calendar.current.startOfDay(for: now)) && $0 <= now
+               }).max(), !result.timeline.contains(where: { $0.date <= now && abs($0.date.timeIntervalSince(detected)) <= ScheduleEngine.alignmentTolerance }) {
+                let index = result.timeline.firstIndex { $0.date > detected } ?? result.timeline.count
+                result.timeline.insert(point(detected, "发现重置", .reset), at: index)
+            }
             if result.badge == "计划内", plan.mode == .keepAlive {
                 for date in schedule.nodes(on: actionDate) where date > actionDate && result.timeline.count < 4 {
                     result.timeline.append(point(date, "计划", .scheduled))
                 }
-            }
-            if result.timeline.count < 4, let first = result.timeline.first?.date,
-               let detected = observedResetDetections.filter({
-                   $0 >= max(menuPlanCycleStart(schedule: schedule, now: now), Calendar.current.startOfDay(for: now)) && $0 < first && $0 <= now
-               }).max(), !result.timeline.contains(where: { $0.date <= now && abs($0.date.timeIntervalSince(detected)) <= ScheduleEngine.alignmentTolerance }) {
-                result.timeline.insert(point(detected, "发现重置", .reset), at: 0)
             }
             if result.timeline.count < 3, let first = result.timeline.first?.date,
                let accountID = usage.accountID, !accountID.isEmpty {
@@ -431,6 +431,7 @@ struct MenuPresentation {
         let previousAccount = lastLiveUsage?.accountID ?? cached?.accountID ?? executionBase?.accountID ?? observedAccountID
         let changedAccount = knownAccount != nil && previousAccount != nil && knownAccount != previousAccount
         if changedAccount { lastLiveUsage = nil }
+        let previousLiveUsage = lastLiveUsage
         if let usage, usage.sourceFile == "app-server", usage.accountID?.isEmpty == false, usage.capturedAt <= now.addingTimeInterval(5),
            lastLiveUsage == nil || (lastLiveUsage?.accountID == usage.accountID && usage.capturedAt >= lastLiveUsage!.capturedAt) {
             lastLiveUsage = usage
@@ -468,15 +469,14 @@ struct MenuPresentation {
             if !running { executionBase = nil }
         }
 
-        if enabled, !fatalIssue, let usage, usage.isFresh(at: now), let accountID = usage.accountID, !accountID.isEmpty, observedAccountID == accountID,
-           let five = usage.fiveHour, five.usedPercent == 0, five.resetsAt > usage.capturedAt, usage.activeFiveHourWindow == false,
-           let previous = observedWindows.max(by: { $0.resetsAt < $1.resetsAt }), previous.windowMinutes == five.windowMinutes,
-           previous.resetsAt.timeIntervalSince(usage.capturedAt) > ScheduleEngine.alignmentTolerance {
-            let previousStart = previous.resetsAt.addingTimeInterval(-Double(previous.windowMinutes) * 60)
-            // The read proves the old window ended early, but only supplies a discovery time.
-            if previousStart < usage.capturedAt && !observedResetDetections.contains(where: { $0 >= previousStart && $0 < previous.resetsAt }) {
-                observedResetDetections.append(usage.capturedAt)
-            }
+        if enabled, !fatalIssue, let usage, usage.isFresh(at: now), let accountID = usage.accountID, !accountID.isEmpty,
+           let previous = previousLiveUsage, previous.accountID == accountID, previous.capturedAt < usage.capturedAt,
+           let weekly = usage.weekly, let previousWeekly = previous.weekly,
+           weekly.windowMinutes == previousWeekly.windowMinutes, weekly.usedPercent == 0, previousWeekly.usedPercent > 0,
+           previousWeekly.resetsAt.timeIntervalSince(usage.capturedAt) > ScheduleEngine.alignmentTolerance,
+           weekly.resetsAt.timeIntervalSince(previousWeekly.resetsAt) > ScheduleEngine.alignmentTolerance {
+            observedAccountID = accountID
+            observedResetDetections.append(usage.capturedAt)
         }
         if enabled, !fatalIssue, let usage, usage.isFresh(at: now), let accountID = usage.accountID, !accountID.isEmpty,
            let five = usage.fiveHour, usage.activeFiveHourWindow == true, five.resetsAt > now, five.windowMinutes > 0 {

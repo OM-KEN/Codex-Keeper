@@ -551,6 +551,8 @@
 "自动继续暂不可用" = "Auto-resume is temporarily unavailable";
 
 "保活请求失败，请等待下次保活。" = "The keepalive request failed. Wait for the next scheduled keepalive.";
+"当时额度不足，本轮未能保活。" = "Quota was exhausted, so this keepalive could not complete.";
+"保活因额度不足未完成；本轮不再重试" = "Keepalive could not complete because quota was exhausted; no retry this round";
 
 "保活请求已报错；本轮不再重试" = "The keepalive request returned an error; this round will not retry.";
 

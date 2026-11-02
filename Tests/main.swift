@@ -3453,12 +3453,14 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     let idleResetURL = directory.appendingPathComponent("idle-reset.json")
     var idleReset = MenuPresentation(historyURL: idleResetURL)
     let idleWindowStart = at(13, 0, 43)
-    let idleBefore = reading(idleWindowStart, at: at(14, 22, 10))
+    var idleBefore = reading(idleWindowStart, at: at(14, 22, 10))
+    idleBefore.weekly = QuotaWindow(usedPercent: 95, windowMinutes: 10080, resetsAt: at(13, days: 5))
     let idleConfirmation = completed(.keepAlive, idleWindowStart)
     _ = render(&idleReset, idleBefore, at: idleBefore.capturedAt, confirmations: [idleConfirmation])
     let detectedAt = at(14, 32, 54)
     var idleEmpty = reading(detectedAt, at: detectedAt)
     idleEmpty.fiveHour?.usedPercent = 0; idleEmpty.zeroUseWindowActive = false
+    idleEmpty.weekly = QuotaWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: at(14, 32, 54, days: 7))
     let detectedMenu = render(&idleReset, idleEmpty, at: detectedAt, confirmations: [idleConfirmation])
     check(detectedMenu.timeline.map(\.date) == [idleWindowStart, detectedAt, at(18)] &&
         detectedMenu.timeline[1].label == "发现重置" && detectedMenu.timeline[1].kind == .reset &&
@@ -3496,21 +3498,114 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     let pendingResume = render(&reopenedIdleReset, userWindow, at: userWindow.capturedAt, plan: resumePlan)
     check(pendingResume.headline == "23:00" && pendingResume.action == "自动继续" && pendingResume.statusSymbol == "paperplane",
         "an approved continuation keeps its own primary time even in an off-plan quota window")
-    for invalid in 0..<9 {
+    for invalid in [0, 1, 2, 3, 6, 7] {
         var state = MenuPresentation()
-        if invalid != 0 { _ = render(&state, idleBefore, at: idleBefore.capturedAt) }
+        var previous = idleBefore
         var candidate = idleEmpty
         if invalid == 1 { candidate.accountID = "another-account" }
         if invalid == 2 { candidate.sourceFile = "rollout.jsonl" }
-        if invalid == 4 { candidate.fiveHour?.windowMinutes = 360 }
-        if invalid == 5 { candidate.zeroUseWindowActive = nil }
-        if invalid == 6 { candidate.capturedAt = at(18, 1); candidate.fiveHour?.resetsAt = at(23, 1) }
+        if invalid == 6 { candidate.capturedAt = at(18, 1); candidate.fiveHour?.resetsAt = at(23, 1); previous.weekly?.resetsAt = at(18) }
         if invalid == 7 { candidate.accountID = nil }
-        if invalid == 8 { candidate.fiveHour?.usedPercent = 12; candidate.fiveHour?.resetsAt = at(14) }
+        if invalid != 0 { _ = render(&state, previous, at: previous.capturedAt) }
         let now = candidate.capturedAt.addingTimeInterval(invalid == 3 ? 61 : 0)
         check(!render(&state, candidate, at: now).timeline.contains { $0.label == "发现重置" },
-            "unverified or normally expired windows cannot claim an early idle reset: \(invalid)")
+            "unverified readings or naturally recovered weekly quota cannot claim an early reset: \(invalid)")
     }
+
+    // Replay November 2: the five-hour window was idle, but the weekly limit reset early.
+    var weeklyBefore = reading(at(16, 3, 46), at: at(16, 3, 46))
+    weeklyBefore.fiveHour?.usedPercent = 0; weeklyBefore.zeroUseWindowActive = false
+    weeklyBefore.weekly = QuotaWindow(usedPercent: 100, windowMinutes: 10080, resetsAt: at(17, 15, 10, days: 2))
+    var weeklyAfter = reading(at(16, 8, 41), at: at(16, 8, 46))
+    weeklyAfter.fiveHour?.usedPercent = 0; weeklyAfter.zeroUseWindowActive = true
+    weeklyAfter.weekly = QuotaWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: at(16, 8, 46, days: 7))
+    let weeklyHistoryURL = directory.appendingPathComponent("weekly-reset.json")
+    var weeklyReset = MenuPresentation(historyURL: weeklyHistoryURL)
+    _ = render(&weeklyReset, weeklyBefore, at: weeklyBefore.capturedAt)
+    let weeklyResetMenu = render(&weeklyReset, weeklyAfter, at: weeklyAfter.capturedAt)
+    check(weeklyResetMenu.timeline.contains { $0.date == weeklyAfter.capturedAt && $0.label == "发现重置" && $0.kind == .reset } &&
+        !weeklyResetMenu.timeline.contains { $0.date == at(16, 8, 41) && $0.label == "窗口开始" },
+        "an early weekly reset from an idle five-hour window shows its discovery rather than a neutral window start")
+    var repeatedWeekly = weeklyAfter; repeatedWeekly.capturedAt = at(16, 8, 57)
+    repeatedWeekly.weekly?.resetsAt = at(16, 8, 56, days: 7)
+    var reopenedWeekly = MenuPresentation(historyURL: weeklyHistoryURL)
+    check(render(&reopenedWeekly, repeatedWeekly, at: repeatedWeekly.capturedAt).timeline.filter { $0.label == "发现重置" }.map(\.date) == [weeklyAfter.capturedAt],
+        "weekly reset discovery keeps its first observation time across refresh and restart")
+    var weeklyIdle = weeklyAfter; weeklyIdle.zeroUseWindowActive = false
+    var idleWeeklyReset = MenuPresentation()
+    _ = render(&idleWeeklyReset, weeklyBefore, at: weeklyBefore.capturedAt)
+    check(render(&idleWeeklyReset, weeklyIdle, at: weeklyIdle.capturedAt).timeline.contains { $0.label == "发现重置" },
+        "an early weekly reset is visible before any new five-hour window opens")
+    for invalid in 0..<9 {
+        var previous = weeklyBefore; var candidate = weeklyAfter
+        if invalid == 0 { candidate.accountID = "another-account" }
+        if invalid == 1 { candidate.sourceFile = "rollout.jsonl" }
+        if invalid == 2 { candidate.accountID = nil }
+        if invalid == 3 { previous.weekly?.resetsAt = candidate.capturedAt }
+        if invalid == 4 { candidate.weekly?.resetsAt = previous.weekly!.resetsAt }
+        if invalid == 5 { candidate.weekly?.windowMinutes = 1440 }
+        if invalid == 6 { candidate.weekly?.usedPercent = 100 }
+        if invalid == 7 { candidate.capturedAt = previous.capturedAt.addingTimeInterval(-1) }
+        var presentation = MenuPresentation()
+        _ = render(&presentation, previous, at: previous.capturedAt)
+        let now = candidate.capturedAt.addingTimeInterval(invalid == 8 ? 61 : 0)
+        check(!render(&presentation, candidate, at: now).timeline.contains { $0.label == "发现重置" },
+            "unverified, corrected, out-of-order or normally recovered weekly quota cannot claim an early reset: \(invalid)")
+    }
+    for invalid in [0, 5] {
+        var candidate = weeklyAfter
+        if invalid == 0 { candidate.weekly?.usedPercent = 25 }
+        if invalid == 5 { candidate.weekly = nil }
+        var presentation = MenuPresentation()
+        _ = render(&presentation, weeklyBefore, at: weeklyBefore.capturedAt)
+        check(!render(&presentation, candidate, at: candidate.capturedAt).timeline.contains { $0.label == "发现重置" },
+            "a partial weekly quota drop or missing weekly evidence cannot prove reset: \(invalid)")
+    }
+    for variant in 0..<8 {
+        var previous = weeklyBefore; var candidate = weeklyAfter
+        if variant == 0 { candidate.fiveHour?.usedPercent = 5 }
+        if variant == 1 { candidate.fiveHour?.resetsAt = weeklyBefore.capturedAt.addingTimeInterval(18000 - 60) }
+        if variant == 2 { candidate.zeroUseWindowActive = nil }
+        if variant == 3 { candidate.fiveHour = nil }
+        if variant == 4 { candidate.fiveHour?.windowMinutes = 360 }
+        if variant == 5 { candidate.fiveHour?.usedPercent = 100 }
+        if variant == 6 { previous.fiveHour = nil }
+        if variant == 7 { candidate.fiveHour?.resetsAt = candidate.capturedAt.addingTimeInterval(-1) }
+        var presentation = MenuPresentation()
+        _ = render(&presentation, previous, at: previous.capturedAt)
+        check(render(&presentation, candidate, at: candidate.capturedAt).timeline.contains {
+            $0.date == candidate.capturedAt && $0.label == "发现重置"
+        }, "a confirmed weekly reset is visible independently of five-hour usage, activity, history or availability: \(variant)")
+    }
+    for invalid in 0..<4 {
+        var previous = weeklyBefore; var candidate = weeklyIdle
+        previous.fiveHour?.usedPercent = 40; previous.fiveHour?.resetsAt = at(18)
+        if invalid == 0 { candidate.weekly?.usedPercent = 1 }
+        if invalid == 1 { candidate.weekly?.resetsAt = previous.weekly!.resetsAt }
+        if invalid == 2 { candidate.weekly = nil }
+        if invalid == 3 { previous.weekly?.usedPercent = 0 }
+        var presentation = MenuPresentation()
+        _ = render(&presentation, previous, at: previous.capturedAt)
+        check(!render(&presentation, candidate, at: candidate.capturedAt).timeline.contains { $0.label == "发现重置" },
+            "an early cleared five-hour window still needs corroborating weekly reset evidence: \(invalid)")
+    }
+    var crowdedBefore = reading(at(8), at: at(9, 3))
+    crowdedBefore.weekly = weeklyBefore.weekly
+    var crowdedAfter = crowdedBefore; crowdedAfter.capturedAt = at(9, 8)
+    crowdedAfter.weekly = QuotaWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: at(9, 8, days: 7))
+    var crowded = MenuPresentation()
+    _ = render(&crowded, crowdedBefore, at: crowdedBefore.capturedAt)
+    let crowdedMenu = render(&crowded, crowdedAfter, at: crowdedAfter.capturedAt)
+    check(crowdedMenu.timeline.count == 4 && crowdedMenu.timeline.contains { $0.date == at(9, 8) && $0.label == "发现重置" } &&
+        crowdedMenu.timeline.contains { $0.date == at(13) && $0.kind == .keepAlive },
+        "weekly reset discovery fits a full timeline and preserves the next action even when the five-hour window keeps its old start")
+    var boundaryBefore = weeklyBefore
+    boundaryBefore.fiveHour = QuotaWindow(usedPercent: 12, windowMinutes: 300, resetsAt: at(16, 8, 41))
+    var boundary = MenuPresentation()
+    _ = render(&boundary, boundaryBefore, at: boundaryBefore.capturedAt)
+    check(render(&boundary, weeklyAfter, at: weeklyAfter.capturedAt).timeline.contains {
+        $0.date == weeklyAfter.capturedAt && $0.label == "发现重置"
+    }, "weekly reset discovery takes precedence when a five-hour window naturally expires at the same time")
 
     // Replay the real early reset: both limits cleared before the previous five-hour deadline.
     let beforeResetAt = at(14, 11, 43)
@@ -3524,6 +3619,11 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     var afterReset = reading(earlyStart, at: at(14, 13, 27))
     afterReset.fiveHour?.usedPercent = 0; afterReset.zeroUseWindowActive = true
     afterReset.weekly = QuotaWindow(usedPercent: 0, windowMinutes: 10080, resetsAt: at(14, 13, 15, days: 7))
+    var alreadyReopened = MenuPresentation()
+    _ = render(&alreadyReopened, beforeReset, at: beforeReset.capturedAt)
+    check(render(&alreadyReopened, afterReset, at: afterReset.capturedAt).timeline.contains {
+        $0.date == afterReset.capturedAt && $0.label == "发现重置"
+    }, "weekly reset discovery survives a missed idle interval even when the previous five-hour window was still active")
     let resetHistoryURL = directory.appendingPathComponent("early-reset.json")
     var earlyReset = MenuPresentation(historyURL: resetHistoryURL)
     let beforeResetMenu = render(&earlyReset, beforeReset, at: beforeResetAt)
@@ -3566,16 +3666,15 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     let backwardsWindow = reading(at(13, 30), at: at(14, 30))
     check(!render(&backwardsPresentation, backwardsWindow, at: backwardsWindow.capturedAt).timeline.contains { $0.date == at(13, 30) && $0.label == "已重置" },
         "a server window timestamp moving backwards is not a new reset")
-    for source in 0..<4 {
+    for source in 0..<3 {
         var limited = MenuPresentation()
         _ = render(&limited, beforeReset, at: beforeResetAt)
         var candidate = afterReset
         if source == 0 { candidate.accountID = "another-account" }
         if source == 1 { candidate.sourceFile = "rollout.jsonl" }
-        if source == 3 { candidate.fiveHour?.windowMinutes = 360 }
         let captured = candidate.capturedAt.addingTimeInterval(source == 2 ? 61 : 0)
-        check(!render(&limited, candidate, at: captured).timeline.contains { $0.label == "已重置" && $0.date <= captured },
-            "another account, rollout fallback, stale data or changed window length cannot prove an early reset: \(source)")
+        check(!render(&limited, candidate, at: captured).timeline.contains { $0.kind == .reset && $0.date <= captured },
+            "another account, rollout fallback or stale data cannot prove an early reset: \(source)")
     }
     var firstReading = MenuPresentation()
     check(render(&firstReading, afterReset, at: afterReset.capturedAt).timeline.first?.label == "窗口开始",
@@ -3583,8 +3682,8 @@ private func checkMenuTimelineHistory(_ check: (Bool, String) -> Void) throws {
     var afterMissedZero = afterReset; afterMissedZero.fiveHour?.usedPercent = 4
     var missedZero = MenuPresentation()
     _ = render(&missedZero, beforeReset, at: beforeResetAt)
-    check(render(&missedZero, afterMissedZero, at: afterMissedZero.capturedAt).timeline.contains { $0.date == earlyStart && $0.label == "已重置" },
-        "a real replacement window still proves reset when polling misses the exact zero-usage reading")
+    check(render(&missedZero, afterMissedZero, at: afterMissedZero.capturedAt).timeline.contains { $0.date == afterMissedZero.capturedAt && $0.label == "发现重置" },
+        "weekly reset discovery survives polling that misses zero five-hour usage")
     var actionAtReset = MenuPresentation()
     _ = render(&actionAtReset, beforeReset, at: beforeResetAt)
     let confirmedResetAction = completed(.resume, earlyStart)
