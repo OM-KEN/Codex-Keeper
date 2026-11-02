@@ -231,6 +231,7 @@ func checkTimelineResumeHistory(_ check: (Bool, String) -> Void) {
     try checkPingQuotaFailure(root.appendingPathComponent("quota-failure"), check)
     try checkPingNoticeLifecycle(check, root: root.appendingPathComponent("notice-lifecycle"))
     try await checkKeepAliveHardGates(root.appendingPathComponent("hard-gates"), check)
+    try await checkKeepAliveSwitch(root.appendingPathComponent("keepalive-switch"), check)
     try await checkCurrentAuthenticationDisplay(root.appendingPathComponent("authentication-display"), check)
     try checkKeepAlivePreparation(root.appendingPathComponent("preparation"), check)
     try await checkIsolatedPingCompletion(root.appendingPathComponent("pty"), check)
@@ -391,24 +392,128 @@ final class PreparationGatePing: PingTransport {
     private var held = false
     private var preparations = 0
     private var sends = 0
+    private var maintenance = 0
+    private var cancellations = 0
+    private var sendHeld = false
     private let clock: () -> Date
     init(clock: @escaping () -> Date = Date.init) { self.clock = clock }
     var preparationCount: Int { condition.lock(); defer { condition.unlock() }; return preparations }
     var count: Int { condition.lock(); defer { condition.unlock() }; return sends }
+    var maintenanceCount: Int { condition.lock(); defer { condition.unlock() }; return maintenance }
+    var cancellationCount: Int { condition.lock(); defer { condition.unlock() }; return cancellations }
     func holdPreparation() { condition.lock(); held = true; condition.unlock() }
     func releasePreparation() { condition.lock(); held = false; condition.broadcast(); condition.unlock() }
+    func holdSend() { condition.lock(); sendHeld = true; condition.unlock() }
+    func releaseSend() { condition.lock(); sendHeld = false; condition.broadcast(); condition.unlock() }
+    func maintainPreparation(provider: UsageProvider, forceCheck: Bool) { condition.lock(); maintenance += 1; condition.unlock() }
     func prepareForSend() {
         condition.lock(); defer { condition.unlock() }
         preparations += 1
         while held { condition.wait() }
     }
     func ping(before: UsageSnapshot, model: PingModel, provider: UsageProvider) throws -> UsageSnapshot {
-        condition.lock(); sends += 1; condition.unlock()
+        condition.lock(); sends += 1
+        while sendHeld { condition.wait() }
+        condition.unlock()
         let now = clock()
         return UsageSnapshot(fiveHour: QuotaWindow(usedPercent: 1, windowMinutes: 300, resetsAt: now.addingTimeInterval(18000)),
             weekly: nil, capturedAt: now, accountID: before.accountID, sourceFile: "app-server")
     }
-    func cancel() { releasePreparation() }
+    func cancel() { condition.lock(); cancellations += 1; condition.unlock(); releasePreparation(); releaseSend() }
+}
+
+@MainActor private func checkKeepAliveSwitch(_ home: URL, _ check: (Bool, String) -> Void) async throws {
+    try writeKeepAliveAuthentication(home: home, account: "keepalive-tests")
+    let suite = "keeper.keepalive-switch." + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.register(defaults: ["enabled": true, "autoResume": true, "dailyAnchorMinutes": 480])
+    defaults.set(false, forKey: "keepAliveEnabled")
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let schedule = ScheduleEngine(anchorMinutes: 480)
+    var clock = schedule.nodes()[1].addingTimeInterval(5)
+    let provider = SimplificationUsage(clock: clock, unknown: false)
+    let transport = PreparationGatePing(clock: { clock })
+    let support = home.appendingPathComponent("support")
+    let execution = ExecutionCoordinator(provider: provider, defaults: defaults, ledgerURL: support.appendingPathComponent("attempts.json"),
+        pingTransport: transport, codexHome: home, now: { clock })
+    let state = AppState(provider: provider, defaults: defaults, runtimeURL: support.appendingPathComponent("pending-runtime.json"),
+        codexHome: home, execution: execution, startMonitoring: false, now: { clock })
+    defer { transport.releasePreparation(); transport.releaseSend(); state.usage.stop(); state.sessions.stop(); execution.stopOwnedTasks() }
+    func settle() async throws {
+        for _ in 0..<200 where execution.running || state.usage.refreshing {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+    execution.maintainKeepAlive(forceCheck: true)
+    execution.ping(schedule: schedule, blockers: { [] })
+    try await settle()
+    check(transport.count == 0 && transport.maintenanceCount == 0,
+        "the independent keepalive preference rejects direct sends and background model preparation")
+    state.refresh(); try await settle()
+    for _ in 0..<200 where !state.sessions.hasScanned { try await Task.sleep(nanoseconds: 10_000_000) }
+    check(state.enabled && state.automaticResumeEnabled && state.usage.hasReliableReading && state.sessions.hasScanned,
+        "keepalive disabled preserves the master switch, automatic continuation and live quota/task monitoring")
+    check(state.nextAction?.date == nil && state.nextAction?.note == "保活已关闭",
+        "an idle keepalive-disabled AppState has no future keepalive action")
+    let live = try provider.read()
+    let target = BlockedSession(id: UUID().uuidString, project: "switch", cwd: home.path,
+        blockedAt: clock.addingTimeInterval(-60), fiveHourResetAt: nil, weeklyResetAt: nil, fileURL: home.appendingPathComponent("task.jsonl"))
+    let engine = DecisionEngine(schedule: schedule)
+    let continuing = engine.plan(now: clock, enabled: true, keepAliveEnabled: false, autoResume: true,
+        earlyRecoveryPolicy: "keepPlan", usage: live, blocked: [target])
+    check(continuing.mode == .resume && continuing.date == clock && continuing.decision == .resume(project: target.project, reason: "计划节点，额度已确认可用"),
+        "disabling keepalive still permits scheduled continuation with available quota")
+    var later = live; later.capturedAt = clock.addingTimeInterval(300)
+    let held = engine.plan(now: later.capturedAt, enabled: true, keepAliveEnabled: false, autoResume: true,
+        earlyRecoveryPolicy: "keepPlan", usage: later, blocked: [target], heldForPlan: true)
+    check(held.mode == .resume && held.date == schedule.nodes()[2],
+        "shared schedule times still reserve continuation after the current node")
+    var presenter = MenuPresentation()
+    var menu = presenter.build(plan: state.nextAction, usage: live, schedule: schedule, tasks: [], availableTasks: [],
+        choices: state.choices, keepAliveEnabled: false, now: clock)
+    let history = PingNodeResult(node: schedule.nodes()[0], accountID: live.accountID, at: schedule.nodes()[0].addingTimeInterval(5), outcome: .windowActive)
+    menu.applyPingHistory([history], accountID: live.accountID, now: clock)
+    check(menu.headline == "保活已关闭" && !menu.quotas.isEmpty && menu.timeline.count == 1 && menu.timeline.first?.pingResult?.node == history.node && menu.timeline.first?.pingResult?.outcome == history.outcome,
+        "keepalive-disabled menus retain real quota and recorded history without a future keepalive node")
+    clock = schedule.nodes()[2]
+    execution.observeKeepAlive(schedule: schedule, accountID: "keepalive-tests", usage: nil, reason: nil)
+    clock = clock.addingTimeInterval(ScheduleEngine.keepAliveTolerance + 1)
+    execution.observeKeepAlive(schedule: schedule, accountID: "keepalive-tests", usage: nil, reason: nil)
+    check(!execution.pingResults.contains { $0.outcome == .notExecuted },
+        "disabled opportunities never create missed keepalive records")
+
+    clock = schedule.nodes()[3].addingTimeInterval(5)
+    defaults.set(true, forKey: "keepAliveEnabled"); state.recompute(allowExecution: false)
+    check(state.keepAliveEnabled && UserDefaults(suiteName: suite)?.bool(forKey: "keepAliveEnabled") == true,
+        "the independent keepalive preference persists without changing auto-resume")
+    let previousSends = transport.count
+    let previousPreparations = transport.preparationCount
+    transport.holdPreparation()
+    execution.ping(schedule: schedule, blockers: { [] })
+    for _ in 0..<200 where transport.preparationCount == previousPreparations { try await Task.sleep(nanoseconds: 10_000_000) }
+    defaults.set(false, forKey: "keepAliveEnabled"); state.recompute(allowExecution: false)
+    transport.releasePreparation(); try await settle()
+    check(transport.count == previousSends && !execution.hasAttemptedKeepAlive(node: schedule.nodes()[3], accountID: "keepalive-tests"),
+        "disabling during asynchronous preparation revokes sending without consuming the node")
+    check(execution.lastPingResult?.preflight?.reasons.contains(.keepAliveDisabled) == true,
+        "revoked keepalive preparation retains an explicit non-submission diagnostic")
+    check(execution.lastPingResult?.needsAttention == false && execution.lastPingResult?.historyLabel == "保活已关闭" && execution.visibleFailure == nil,
+        "deliberately disabled preparation stays neutral in history and does not request an error notification")
+
+    defaults.set(true, forKey: "keepAliveEnabled"); state.recompute(allowExecution: false)
+    transport.holdSend()
+    execution.ping(schedule: schedule, blockers: { [] })
+    for _ in 0..<200 where transport.count == previousSends { try await Task.sleep(nanoseconds: 10_000_000) }
+    let cancellations = transport.cancellationCount
+    defaults.set(false, forKey: "keepAliveEnabled"); state.recompute(allowExecution: false)
+    check(execution.running && transport.cancellationCount == cancellations,
+        "disabling keepalive preserves an already submitted request and its confirmation work")
+    transport.releaseSend(); try await settle()
+    check(execution.lastPingResult?.succeeded == true && execution.hasAttemptedKeepAlive(node: schedule.nodes()[3], accountID: "keepalive-tests"),
+        "submitted keepalive keeps its real outcome and durable duplicate protection after disabling")
+    defaults.removeObject(forKey: "keepAliveEnabled")
+    check(state.keepAliveEnabled && state.automaticResumeEnabled,
+        "older saved preferences without a keepalive key retain enabled keepalive and automatic continuation")
 }
 
 @MainActor func checkPingNoticeLifecycle(_ check: (Bool, String) -> Void, root: URL) throws {

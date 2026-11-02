@@ -2,7 +2,7 @@ import Foundation
 
 enum PingPreflightReason: String, Codable {
     case modelDiscoveryFailed = "model_discovery_failed", usageReadFailed = "usage_read_failed"
-    case generationChanged = "generation_changed", disabled
+    case generationChanged = "generation_changed", disabled, keepAliveDisabled = "keepalive_disabled"
     case anchorChanged = "anchor_changed", accountChanged = "account_changed", accountUnconfirmed = "account_unconfirmed"
     case runtimeUnhealthy = "runtime_unhealthy", sessionsUnscanned = "sessions_unscanned", sessionScanFailed = "session_scan_failed"
     case criticalRefresh = "critical_refresh", keeperBusy = "keeper_busy", codexTaskRunning = "codex_task_running"
@@ -16,6 +16,7 @@ enum PingPreflightReason: String, Codable {
         case .usageReadFailed: return L10n.text("保活未发送：额度读取失败")
         case .generationChanged: return L10n.text("保活未发送：本次准备已取消")
         case .disabled: return L10n.text("保活未发送：自动执行已关闭")
+        case .keepAliveDisabled: return L10n.text("保活未发送：保活已关闭")
         case .anchorChanged: return L10n.text("保活未发送：每日开始时间已改变")
         case .accountChanged: return L10n.text("保活未发送：账户已改变")
         case .accountUnconfirmed: return L10n.text("保活未发送：账户暂时无法确认")
@@ -39,6 +40,7 @@ enum PingPreflightReason: String, Codable {
         case .accountChanged: return CodexConnectionError.userMessage(reason: "account_changed")
         case .accountUnconfirmed: return L10n.text("账户待确认，请在 Codex 检查登录后刷新。")
         case .disabled: return L10n.text("已暂停，Keeper 已停用")
+        case .keepAliveDisabled: return L10n.text("保活已关闭")
         case .runtimeUnhealthy: return L10n.text("记录不可用，请检查磁盘空间后刷新。")
         case .keeperBusy, .codexTaskRunning, .newPause: return L10n.text("正在确认中")
         case .opportunityExpired: return L10n.text("本次保活已错过，请等待下次保活或手动保活。")
@@ -51,7 +53,7 @@ enum PingPreflightReason: String, Codable {
 
     var needsAttention: Bool {
         switch self {
-        case .generationChanged, .disabled, .anchorChanged, .sessionsUnscanned, .criticalRefresh,
+        case .generationChanged, .disabled, .keepAliveDisabled, .anchorChanged, .sessionsUnscanned, .criticalRefresh,
              .keeperBusy, .codexTaskRunning, .taskSelectionChanged, .newPause, .usageNotFresh,
              .timeZoneChanged, .opportunityExpired, .nodeChanged: return false
         default: return true
@@ -87,6 +89,7 @@ struct PingPreflightDiagnostic: Codable, LocalizedError {
             return reason.userMessage
         }
         if reasons.contains(.disabled) { return PingPreflightReason.disabled.userMessage }
+        if reasons.contains(.keepAliveDisabled) { return PingPreflightReason.keepAliveDisabled.userMessage }
         if reasons.contains(.opportunityExpired) { return PingPreflightReason.opportunityExpired.userMessage }
         if reasons.contains(.usageReadFailed) { return L10n.text("正在确认中") }
         return reasons.first?.userMessage
@@ -131,13 +134,16 @@ struct PingNodeResult: Codable {
         }
     }
     var succeeded: Bool { outcome == .newWindow || outcome == .windowActive }
-    var needsAttention: Bool { acknowledgedAt == nil && [.failed, .unknown, .windowPending, .notExecuted].contains(outcome) }
+    private var disabledBeforeSubmission: Bool {
+        outcome == .failed && preflight?.needsAttention == false && preflight?.reasons.contains(.keepAliveDisabled) == true
+    }
+    var needsAttention: Bool { !disabledBeforeSubmission && acknowledgedAt == nil && [.failed, .unknown, .windowPending, .notExecuted].contains(outcome) }
     var historyLabel: String {
         switch outcome {
         case .submitted: return "正在确认中"
         case .newWindow, .windowActive, .windowPending: return "已保活"
         case .skipped: return "无需保活"
-        case .failed: return "保活失败"
+        case .failed: return disabledBeforeSubmission ? "保活已关闭" : "保活失败"
         case .unknown: return "结果待确认"
         case .notExecuted: return "本轮未执行"
         }

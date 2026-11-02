@@ -294,7 +294,7 @@ import UserNotifications
         let enabled = defaults.bool(forKey: "enabled")
         var summary = presentation.build(plan: appState.nextAction, usage: appState.usage.snapshot,
             schedule: appState.schedule, tasks: appState.selectedTasks, availableTasks: appState.availableTasks,
-            choices: appState.choices, enabled: enabled, autoResume: defaults.bool(forKey: "autoResume"),
+            choices: appState.choices, enabled: enabled, keepAliveEnabled: appState.keepAliveEnabled, autoResume: defaults.bool(forKey: "autoResume"),
             earlyRecoveryPolicy: defaults.string(forKey: "earlyRecoveryPolicy") ?? "ask",
             confirmations: appState.execution.confirmations,
             usageError: appState.usage.lastError, usageErrorIsTransient: appState.usage.lastErrorIsTransient,
@@ -393,7 +393,11 @@ import UserNotifications
         }
         let alert = NSAlert()
         alert.messageText = L10n.text("取消下一次自动继续？")
-        alert.informativeText = L10n.format("取消后，所有因达到使用上限而停止的会话不会在%@自动继续，Keeper 将会按照计划在%@继续保持活动。", time(plan.resume), time(plan.keepAlive))
+        if let keepAlive = plan.keepAlive {
+            alert.informativeText = L10n.format("取消后，所有因达到使用上限而停止的会话不会在%@自动继续，Keeper 将会按照计划在%@继续保持活动。", time(plan.resume), time(keepAlive))
+        } else {
+            alert.informativeText = L10n.format("取消后，所有因达到使用上限而停止的会话不会在%@自动继续。", time(plan.resume))
+        }
         alert.addButton(withTitle: L10n.text("取消自动继续"))
         alert.addButton(withTitle: L10n.text("保留自动继续"))
         alert.buttons[0].keyEquivalent = ""

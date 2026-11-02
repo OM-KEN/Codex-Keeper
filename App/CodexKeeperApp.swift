@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // @AppStorage 与 NSMenu 共享 UserDefaults，先注册默认值保证两侧一致
         UserDefaults.standard.register(defaults: [
             "enabled": true,
+            "keepAliveEnabled": true,
             "autoResume": true,
             "resumeMessage": L10n.text("继续"),
             "resumeWorkspaceReminder": true,

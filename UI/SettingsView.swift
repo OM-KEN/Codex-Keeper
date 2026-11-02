@@ -4,6 +4,7 @@ import AppKit
 
 struct SettingsView: View {
     @AppStorage("enabled") private var enabled = true
+    @AppStorage("keepAliveEnabled") private var keepAliveEnabled = true
     @AppStorage("dailyAnchorMinutes") private var dailyAnchorMinutes = 480
     @AppStorage("autoResume") private var autoResume = true
     @AppStorage("resumeMessage") private var savedResumeMessage = L10n.text("继续")
@@ -54,6 +55,7 @@ struct SettingsView: View {
                 Toggle(L10n.text("启用 Codex Keeper"), isOn: $enabled)
             }
             Section(L10n.text("保持活动")) {
+                Toggle(L10n.text("启用保活"), isOn: $keepAliveEnabled)
                 DatePicker(L10n.text("每日开始时间"), selection: anchor, displayedComponents: .hourAndMinute)
                 Text(L10n.format("计划预览：%@", dailySchedule))
                     .font(.callout).foregroundStyle(.secondary).monospacedDigit()
