@@ -27,6 +27,7 @@ import SQLite3
         if mode.hasPrefix("broken") { try damaged.write(to: runtime) }
         let usage = LogicRepairUsage(clock)
         let sends = LogicRepairSends()
+        if mode == "valid-held" { defaults.set(false, forKey: "keepAliveEnabled") }
         let execution = ExecutionCoordinator(provider: usage, makeResumeTransport: { LogicRepairTransport(sends) }, defaults: defaults,
             ledgerURL: home.appendingPathComponent("support/resume-attempts.json"), codexHome: home, now: { usage.clock })
         let state = AppState(provider: usage, defaults: defaults, runtimeURL: runtime, codexHome: home,
@@ -41,6 +42,14 @@ import SQLite3
         state.recompute()
         try await Task.sleep(nanoseconds: 150_000_000)
         check(sends.total == (mode == "missing" ? 1 : 0), "saved user choices survive startup without authorizing another send: \(mode)")
+        if mode == "valid-held" {
+            check(state.cancellationPlan?.resume == state.nextAction?.date && state.cancellationPlan?.keepAlive == nil && state.nextAction?.mode == .resume,
+                "scheduled continuation can be cancelled with keepalive disabled without promising a keepalive date")
+            state.useKeepAlive(for: [target])
+            check(state.nextAction?.date == nil && state.nextAction?.note == "保活已关闭" && state.automaticResumeEnabled,
+                "cancelling the current continuation keeps keepalive disabled and future continuation enabled")
+            defaults.removeObject(forKey: "keepAliveEnabled")
+        }
         if mode.hasPrefix("broken") {
             check((try? Data(contentsOf: runtime)) == damaged, "refresh preserves unreadable original records: \(mode)")
             try logicRepairRuntime(runtime, tasks: [target], choices: choices, held: mode.hasSuffix("held") ? [target.episodeKey] : [])
@@ -183,6 +192,36 @@ import SQLite3
     }
     try await checkLogicRepairNetwork(root.appendingPathComponent("network"), defaults, clock, check)
     try await checkLogicRepairScanner(root.appendingPathComponent("scanner"), defaults, clock, check)
+    try await checkContinuationRetryWithoutKeepAlive(root.appendingPathComponent("continuation-retry"), defaults, check)
+}
+
+@MainActor private func checkContinuationRetryWithoutKeepAlive(_ home: URL, _ defaults: UserDefaults,
+                                                             _ check: (Bool, String) -> Void) async throws {
+    let node = ScheduleEngine(anchorMinutes: 480).nodes()[1]
+    let clock = node.addingTimeInterval(-120)
+    let target = try logicRepairTask(home: home, clock: clock, reset: clock.addingTimeInterval(-60))
+    let runtime = home.appendingPathComponent("support/pending-runtime.json")
+    try logicRepairRuntime(runtime, tasks: [target], choices: ResumeChoices(), held: [target.episodeKey])
+    defaults.set(false, forKey: "keepAliveEnabled")
+    defer { defaults.removeObject(forKey: "keepAliveEnabled") }
+    let usage = LogicRepairUsage(clock)
+    let state = AppState(provider: usage, defaults: defaults, runtimeURL: runtime, codexHome: home,
+        startMonitoring: false, now: { usage.clock })
+    defer { state.usage.stop(); state.sessions.stop(); state.execution.stopOwnedTasks() }
+    state.refresh()
+    try await logicRepairSettle { state.sessions.hasScanned && !state.usage.refreshing }
+    check(state.nextAction?.mode == .resume && state.nextAction?.date == node && usage.retryOpportunity == nil,
+        "keepalive-disabled scheduled continuation prepares quota without starting retry budget early")
+    state.usage.onRefreshCompleted = nil; state.sessions.onRefreshCompleted = nil
+    usage.setClock(node.addingTimeInterval(5))
+    state.environmentChanged(source: "continuation_node")
+    try await logicRepairSettle { !state.usage.refreshing }
+    state.recompute(allowExecution: false)
+    check(usage.retryOpportunity == UsageRetryOpportunity(node: node, end: node.addingTimeInterval(ScheduleEngine.alignmentTolerance)),
+        "critical refresh and normal polling supply the provider a bounded continuation retry opportunity with keepalive off")
+    usage.setClock(node.addingTimeInterval(ScheduleEngine.alignmentTolerance + 1))
+    state.recompute(allowExecution: false)
+    check(usage.retryOpportunity == nil, "continuation-only retry budget ends after the original three-minute node")
 }
 
 private final class LogicRepairUsage: UsageProvider {
@@ -190,9 +229,12 @@ private final class LogicRepairUsage: UsageProvider {
     private var value: Date
     private var readsValue = 0
     private var readBody: (() -> Void)?
+    private var opportunity: UsageRetryOpportunity?
     init(_ clock: Date) { value = clock }
     var clock: Date { lock.lock(); defer { lock.unlock() }; return value }
     var reads: Int { lock.lock(); defer { lock.unlock() }; return readsValue }
+    var retryOpportunity: UsageRetryOpportunity? { lock.lock(); defer { lock.unlock() }; return opportunity }
+    func setRetryOpportunity(_ opportunity: UsageRetryOpportunity?, now: Date) { lock.lock(); self.opportunity = opportunity; lock.unlock() }
     func setClock(_ date: Date) { lock.lock(); value = date; lock.unlock() }
     func onRead(_ body: (() -> Void)?) { lock.lock(); readBody = body; lock.unlock() }
     func read() throws -> UsageSnapshot {
@@ -274,6 +316,11 @@ private final class LogicRepairGate {
             for _ in 0..<12 { state.networkChanged(available: true) }
             try await Task.sleep(nanoseconds: 100_000_000)
             check(!state.usage.criticalRefreshPending, "duplicate network signals cannot revoke an already prepared independent preflight")
+            let reads = usage.reads
+            defaults.set(false, forKey: "keepAliveEnabled"); state.recompute(allowExecution: false)
+            check(!state.keepAliveEnabled && state.automaticResumeEnabled && !state.usage.criticalRefreshPending && usage.reads == reads &&
+                execution.operations.values.contains { $0.phase == .preparing },
+                "changing only keepalive preserves admitted continuation preparation and fresh recovery evidence")
         }
         gate.release()
         try await logicRepairSettle { !execution.operations.values.contains { $0.phase == .preparing } }
@@ -281,6 +328,7 @@ private final class LogicRepairGate {
         check(sends.total == (changedIdentity ? 0 : 1),
             "stable signals allow progress while changed identity revokes old preparation: \(changedIdentity)")
         state.usage.stop(); state.sessions.stop(); execution.stopOwnedTasks()
+        defaults.removeObject(forKey: "keepAliveEnabled")
     }
 }
 

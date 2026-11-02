@@ -108,6 +108,12 @@ import Darwin
         for (id, transport) in activeTransports where operations[id]?.phase == .preparing { transport.cancel() }
     }
 
+    /// The keepalive preference revokes unsent work without interrupting continuation or confirmation.
+    func revokeKeepAlivePreparation() {
+        pingGeneration += 1
+        observedPing = nil
+    }
+
     /// Switching future execution off also cancels Keeper's isolated ping.
     func cancelCurrent() {
         invalidatePreparations()
@@ -135,6 +141,7 @@ import Darwin
     var hasBusyTasks: Bool { !busyThreadIDs.isEmpty || !independentTaskNames.isEmpty }
     var isKeepingAlive: Bool { pingRunning }
     var canStartResume: Bool { ledgerHealthy && !pingRunning && defaults.bool(forKey: "enabled") }
+    private var keepAliveEnabled: Bool { defaults.object(forKey: "keepAliveEnabled") as? Bool ?? true }
 
     private func saveLedger(operations proposed: [String: ResumeOperation]? = nil, keys: Set<String>? = nil) throws {
         let proposed = proposed ?? operations
@@ -229,11 +236,11 @@ import Darwin
     }
 
     func maintainKeepAlive(forceCheck: Bool = false) {
-        guard defaults.bool(forKey: "enabled"), !preparationRunning else { return }
+        guard defaults.bool(forKey: "enabled"), keepAliveEnabled, !preparationRunning else { return }
         preparationRunning = true
         let transport = pingTransport; let provider = provider
         Task {
-            guard defaults.bool(forKey: "enabled") else { preparationRunning = false; return }
+            guard defaults.bool(forKey: "enabled"), keepAliveEnabled else { preparationRunning = false; return }
             await Task.detached { transport.maintainPreparation(provider: provider, forceCheck: forceCheck) }.value
             preparationRunning = false
         }
@@ -241,6 +248,7 @@ import Darwin
 
     /// Remember why an observed opportunity was not used; later read recovery cannot erase it.
     func observeKeepAlive(schedule: ScheduleEngine, accountID: String?, usage: UsageSnapshot?, reason: String?) {
+        guard keepAliveEnabled else { observedPing = nil; return }
         let clock = now()
         if let previous = observedPing, clock > previous.node.addingTimeInterval(ScheduleEngine.keepAliveTolerance) {
             if !pingResults.contains(where: { $0.node == previous.node && $0.accountID == previous.account &&
@@ -279,7 +287,7 @@ import Darwin
 
     func ping(schedule: ScheduleEngine, usage: UsageSnapshot? = nil,
               blockers: @escaping () -> [PingPreflightReason]) {
-        guard ledgerHealthy, defaults.bool(forKey: "enabled"), !running, !hasBusyTasks,
+        guard ledgerHealthy, defaults.bool(forKey: "enabled"), keepAliveEnabled, !running, !hasBusyTasks,
               let node = schedule.currentKeepAliveNode(at: now()) else { return }
         let startedAt = now(); let startedUptime = ProcessInfo.processInfo.systemUptime
         let opportunity = schedule.keepAliveOpportunities(at: startedAt).first { $0.node == node }
@@ -313,6 +321,7 @@ import Darwin
                 var reasons = appBlockers
                 if operation != pingGeneration { reasons.append(.generationChanged) }
                 if !defaults.bool(forKey: "enabled") { reasons.append(.disabled) }
+                if !keepAliveEnabled, !reasons.contains(.keepAliveDisabled) { reasons.append(.keepAliveDisabled) }
                 if (defaults.object(forKey: "dailyAnchorMinutes") as? Int ?? 480) != schedule.anchorMinutes { reasons.append(.anchorChanged) }
                 if Calendar.current.timeZone.identifier != schedule.timeZoneID { reasons.append(.timeZoneChanged) }
                 if currentAccount == nil { reasons.append(.accountUnconfirmed) }
@@ -330,7 +339,7 @@ import Darwin
                 // A previously good read can age during local preparation; unknown quota still permits one attempt.
                 let currentBefore = before.isFresh(at: checkedAt) ? before : UsageSnapshot(fiveHour: nil, weekly: nil,
                     capturedAt: .distantPast, accountID: boundAccount, sourceFile: "")
-                let decision = DecisionEngine(schedule: schedule).decide(now: checkedAt, enabled: true, autoResume: false,
+                let decision = DecisionEngine(schedule: schedule).decide(now: checkedAt, enabled: true, keepAliveEnabled: keepAliveEnabled, autoResume: false,
                     earlyRecoveryPolicy: "ask", usage: currentBefore, blocked: [])
                 guard case .ping = decision else { pingRunning = false; updateRunning(); return }
                 do { try saveLedger(keys: attempts.union([key])) }

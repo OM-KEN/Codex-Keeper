@@ -13,8 +13,8 @@ import SQLite3
         capturedAt: day, accountID: "polling-account", sourceFile: "app-server")
     func policy(_ usage: UsageSnapshot? = nil, at now: Date? = nil, scanned: Bool = true, error: String? = nil,
                 reliable: Bool = true, running: Bool = false, demand: Bool = false,
-                executing: Bool = false, critical: Bool = false, plan: ScheduleEngine? = nil) -> UsagePollingPolicy {
-        UsagePollingPolicy.evaluate(now: now ?? day, schedule: plan ?? schedule, enabled: true,
+                executing: Bool = false, critical: Bool = false, plan: ScheduleEngine? = nil, keepAlive: Bool = true) -> UsagePollingPolicy {
+        UsagePollingPolicy.evaluate(now: now ?? day, schedule: plan ?? schedule, enabled: true, keepAliveEnabled: keepAlive,
             scanned: scanned, scanError: error, reliableUsage: reliable, usage: usage ?? live,
             runningTask: running, resumeDemand: demand, executing: executing, criticalRefresh: critical)
     }
@@ -31,6 +31,12 @@ import SQLite3
     check(policy(unknown).interval == 20, "unknown zero-percent window cannot be classified as idle")
     check(policy(at: nodes[1].addingTimeInterval(-120)).interval == 20,
         "original plan boundary wakes idle quota polling two minutes early")
+    check(policy(at: nodes[1].addingTimeInterval(-120), keepAlive: false).interval == 300,
+        "disabling keepalive removes its idle fixed-node polling acceleration")
+    check(policy(at: nodes[1].addingTimeInterval(-120), demand: true, keepAlive: false).interval == 20 &&
+        policy(at: nodes[1].addingTimeInterval(180), demand: true, keepAlive: false).interval == 20 &&
+        policy(at: nodes[1].addingTimeInterval(181), demand: true, keepAlive: false).interval == 300,
+        "scheduled continuation keeps its preparation and three-minute node boundary with keepalive disabled")
     check(schedule.retryOpportunity(at: nodes[1].addingTimeInterval(-120)) == nil &&
         schedule.retryOpportunity(at: nodes[1].addingTimeInterval(599))?.node == nodes[1],
         "two-minute preparation does not consume the last two minutes of the bounded retry opportunity")
@@ -42,6 +48,7 @@ import SQLite3
         if weekly { close.weekly?.resetsAt = day.addingTimeInterval(120) }
         else { close.fiveHour?.resetsAt = day.addingTimeInterval(120) }
         check(policy(close).interval == 20, "each quota boundary independently wakes two minutes early: \(weekly)")
+        check(policy(close, keepAlive: false).interval == 20, "quota recovery polling is independent of keepalive: \(weekly)")
     }
     var both = blocked; both.weekly?.usedPercent = 100; both.fiveHour?.resetsAt = day.addingTimeInterval(-1)
     check(policy(both).interval == 20 && policy(both, demand: true).interval == 20,

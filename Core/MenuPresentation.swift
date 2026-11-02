@@ -403,7 +403,7 @@ struct MenuPresentation {
 
     mutating func build(plan: NextAction?, usage: UsageSnapshot?, schedule: ScheduleEngine,
                         tasks: [BlockedSession], availableTasks: [BlockedSession], choices: ResumeChoices,
-                        enabled: Bool = true, autoResume: Bool = true, earlyRecoveryPolicy: String = "ask",
+                        enabled: Bool = true, keepAliveEnabled: Bool = true, autoResume: Bool = true, earlyRecoveryPolicy: String = "ask",
                         confirmations: [ExecutionConfirmation] = [], usageError: String? = nil,
                         usageErrorIsTransient: Bool = false, sessionError: String? = nil,
                         running: Bool = false, executionMode: NextActionMode? = nil,
@@ -571,6 +571,7 @@ struct MenuPresentation {
             summary.refreshMessage = L10n.format("上次更新 · %@", clock.string(from: capturedAt))
         }
         if showsRefreshFeedback && !refreshMessage.isEmpty { summary.refreshMessage = refreshMessage }
+        if !keepAliveEnabled { summary.timeline.removeAll { $0.date > now && [.keepAlive, .scheduled].contains($0.kind) } }
         return enabled ? summary : MenuSummary(headline: "已停用")
     }
 }

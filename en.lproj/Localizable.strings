@@ -26,6 +26,9 @@
 "每 5 小时让 Codex 自动保持活动，帮你更充分地利用每天的额度。" = "Keep Codex active every 5 hours to make better use of your daily quota.";
 "因额度用尽而暂停的任务，将在额度正常恢复后自动继续；提前恢复时先等你选择，未选择则等到确认正常恢复后自动继续。" = "Tasks paused by quota exhaustion resume after normal recovery. If quota recovers early, Keeper waits for your choice; without a choice, it continues after normal recovery is confirmed.";
 "保持活动" = "Keep Active";
+"启用保活" = "Enable Keepalive";
+"保活已关闭" = "Keepalive Is Off";
+"保活未发送：保活已关闭" = "Keepalive not sent: keepalive is off";
 "自动继续" = "Resume";
 "自动继续任务" = "Auto-resume Tasks";
 "正在保活" = "Keeping Active";
@@ -106,6 +109,7 @@
 "取消下一次自动继续" = "Cancel Next Auto-resume";
 "取消下一次自动继续？" = "Cancel the Next Auto-resume?";
 "取消后，所有因达到使用上限而停止的会话不会在%@自动继续，Keeper 将会按照计划在%@继续保持活动。" = "The tasks paused by the usage limit will not resume automatically at %@. Keeper will continue its scheduled keep-alive at %@.";
+"取消后，所有因达到使用上限而停止的会话不会在%@自动继续。" = "The tasks paused by the usage limit will not resume automatically at %@.";
 "取消自动继续" = "Cancel Auto-resume";
 "保留自动继续" = "Keep Auto-resume";
 "同步完成后即可确认取消时间。" = "Wait for sync to finish before confirming the cancellation time.";

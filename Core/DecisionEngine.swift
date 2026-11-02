@@ -21,13 +21,13 @@ enum KeeperDecision: Equatable {
 struct DecisionEngine {
     let schedule: ScheduleEngine
 
-    func decide(now: Date = Date(), enabled: Bool, autoResume: Bool, earlyRecoveryPolicy: String,
+    func decide(now: Date = Date(), enabled: Bool, keepAliveEnabled: Bool = true, autoResume: Bool, earlyRecoveryPolicy: String,
                 usage: UsageSnapshot?, blocked: [BlockedSession], observedRecovery: Bool = false) -> KeeperDecision {
-        plan(now: now, enabled: enabled, autoResume: autoResume, earlyRecoveryPolicy: earlyRecoveryPolicy,
+        plan(now: now, enabled: enabled, keepAliveEnabled: keepAliveEnabled, autoResume: autoResume, earlyRecoveryPolicy: earlyRecoveryPolicy,
              usage: usage, blocked: blocked, observedRecovery: observedRecovery).decision
     }
 
-    func plan(now: Date = Date(), calendar: Calendar = .current, enabled: Bool, autoResume: Bool,
+    func plan(now: Date = Date(), calendar: Calendar = .current, enabled: Bool, keepAliveEnabled: Bool = true, autoResume: Bool,
               earlyRecoveryPolicy: String, usage: UsageSnapshot?, blocked: [BlockedSession],
               reservationUsage: UsageSnapshot? = nil, observedRecovery: Bool = false, heldForPlan: Bool = false, needsRecoveryDecision: Bool = false,
               reserveIdleDate: Bool = false) -> NextAction {
@@ -37,7 +37,10 @@ struct DecisionEngine {
             NextAction(mode: mode, date: date, decision: .wait(reason: reason), note: reason, needsRecoveryDecision: needsRecoveryDecision)
         }
         guard enabled else { return wait("已停用") }
-        if target == nil { return keepAlivePlan(now: now, calendar: calendar, usage: usage) }
+        if target == nil {
+            guard keepAliveEnabled else { return wait("保活已关闭") }
+            return keepAlivePlan(now: now, calendar: calendar, usage: usage)
+        }
         guard let usage, usage.fiveHour != nil || usage.weekly != nil else { return wait("等待额度同步") }
         guard usage.isFresh(at: now) else {
             if reserveIdleDate, let target, autoResume, !needsRecoveryDecision {

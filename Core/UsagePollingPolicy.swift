@@ -9,7 +9,7 @@ struct UsagePollingPolicy: Equatable {
     let interval: TimeInterval
     let wakeAt: Date?
 
-    static func evaluate(now: Date, schedule: ScheduleEngine, enabled: Bool,
+    static func evaluate(now: Date, schedule: ScheduleEngine, enabled: Bool, keepAliveEnabled: Bool = true,
                          scanned: Bool, scanError: String?, reliableUsage: Bool,
                          usage: UsageSnapshot?, runningTask: Bool, resumeDemand: Bool,
                          executing: Bool, criticalRefresh: Bool, recoveryDates: [Date] = []) -> UsagePollingPolicy {
@@ -20,9 +20,10 @@ struct UsagePollingPolicy: Equatable {
               usage.activeFiveHourWindow != nil, !criticalRefresh else { return fast }
         // Task activity and recovery demand are local facts, not reasons to poll the network.
         var boundaries = recoveryDates.filter { $0 > now }
-        if enabled {
+        if enabled && (keepAliveEnabled || resumeDemand) {
             for opportunity in schedule.keepAliveOpportunities(at: now) {
-                if now >= opportunity.node.addingTimeInterval(-preparation), now <= opportunity.deadline { return fast }
+                let deadline = keepAliveEnabled ? opportunity.deadline : opportunity.node.addingTimeInterval(ScheduleEngine.alignmentTolerance)
+                if now >= opportunity.node.addingTimeInterval(-preparation), now <= deadline { return fast }
                 boundaries.append(opportunity.node)
             }
         }
