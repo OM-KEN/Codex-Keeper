@@ -35,6 +35,7 @@ SOURCES=(
     Core/DecisionEngine.swift
     Core/NextAction.swift
     Core/MenuPresentation.swift
+    Core/TokenUsageHistory.swift
     Core/PingPreparation.swift
     Core/PingEngine.swift
     Core/PingDiagnostics.swift
@@ -48,10 +49,13 @@ SOURCES=(
     Codex/QuotaErrorLogProvider.swift
     Codex/UsageObserver.swift
     Codex/RolloutUsageMonitor.swift
+    Codex/TokenUsageHistoryReader.swift
+    Codex/RolloutFile.swift
     Codex/SessionWatcher.swift
     Codex/BlockedSessionDetector.swift
     UI/MenuSummaryView.swift
     UI/MenuBarQuotaView.swift
+    UI/TokenUsageHistoryView.swift
     UI/ResumeTasksView.swift
     UI/SettingsView.swift
     UI/AboutView.swift
@@ -60,7 +64,7 @@ SOURCES=(
 )
 ICON_SOURCE="Codex Keeper.jpg"
 RESOURCES=(Info.plist LICENSE assets/NOTICE.md en.lproj/Localizable.strings zh-Hans.lproj/Localizable.strings "$ICON_SOURCE")
-BUILD_FILES=(build.sh VERSION)
+BUILD_FILES=(build.sh VERSION Codex/ZstdBridge/KeeperZstd.c Codex/ZstdBridge/KeeperZstd.h Codex/ZstdBridge/module.modulemap Vendor/zstd/zstddeclib.c Vendor/zstd/LICENSE)
 
 echo "🔨 Building CodexKeeper..."
 
@@ -82,7 +86,9 @@ STAGED_APP="$STAGING/$APP_NAME.app"
 MACOS_DIR="$STAGED_APP/Contents/MacOS"
 mkdir -p "$MACOS_DIR" "$STAGED_APP/Contents/Resources"
 
-swiftc -O \
+clang -O2 -target "arm64-apple-macosx$MIN_OS" -c Codex/ZstdBridge/KeeperZstd.c -o "$STAGING/zstd.o"
+
+swiftc -O -I Codex/ZstdBridge "$STAGING/zstd.o" \
     -num-threads "$NPROC" \
     -o "$MACOS_DIR/$APP_NAME" \
     -target "arm64-apple-macosx$MIN_OS" \
@@ -98,6 +104,7 @@ plutil -replace CFBundleVersion -string "$VERSION" "$STAGED_APP/Contents/Info.pl
 
 cp LICENSE "$STAGED_APP/Contents/Resources/LICENSE"
 cp assets/NOTICE.md "$STAGED_APP/Contents/Resources/ThirdPartyNotices.md"
+cp Vendor/zstd/LICENSE "$STAGED_APP/Contents/Resources/ZstdLicense"
 cp -R en.lproj zh-Hans.lproj "$STAGED_APP/Contents/Resources/"
 
 # Generate the standard macOS icon sizes from the supplied artwork.

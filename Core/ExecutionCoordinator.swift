@@ -488,7 +488,7 @@ import Darwin
             var reasons = ResumePreflight.sessionBlockers(target: target, session: current, stage: .beforeSend)
             do {
                 if let path = try SessionScanWorker.currentRolloutPaths(codexHome: codexHome)[target.id],
-                   path.resolvingSymlinksInPath() != target.fileURL.resolvingSymlinksInPath() { reasons.append(.pauseChanged) }
+                   path.resolvingSymlinksInPath() != RolloutFile.resolvedURL(target.fileURL).resolvingSymlinksInPath() { reasons.append(.pauseChanged) }
             } catch { reasons.append(.sessionScanFailed) }
             if operationGeneration != generation { reasons.append(.generationChanged) }
             if !ledgerHealthy { reasons.append(.ledgerUnhealthy) }

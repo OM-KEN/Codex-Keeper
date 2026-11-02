@@ -59,9 +59,10 @@ struct PingReceipt {
     var errorCode: String?
 
     static func read(home: URL, excluding previous: Set<URL>) -> PingReceipt {
-        let files = SessionWatcher.recentRollouts(codexHome: home, limit: 20).filter { !previous.contains($0.url) }
+        let previousPaths = Set(previous.map(RolloutFile.logicalURL))
+        let files = SessionWatcher.recentRollouts(codexHome: home, limit: 20).filter { !previousPaths.contains(RolloutFile.logicalURL($0.url)) }
         guard files.count == 1, let file = files.first,
-              let content = try? String(contentsOf: file.url, encoding: .utf8) else { return PingReceipt() }
+              let data = try? RolloutFile.read(file.url), let content = String(data: data, encoding: .utf8) else { return PingReceipt() }
         var receipt = PingReceipt()
         for line in content.split(separator: "\n") {
             guard let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],

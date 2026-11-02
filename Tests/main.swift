@@ -12,6 +12,14 @@ import Darwin
             if !value { failed += 1; print("FAIL: \(name)") }
             else if CommandLine.arguments.contains("--verbose") { print("PASS: \(name)") }
         }
+        if CommandLine.arguments.contains("--token-history-only") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-token-history-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try checkTokenUsageHistory(check, root: root)
+            print("\(count - failed)/\(count) token history checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
         if CommandLine.arguments.contains("--timeline-resume-only") {
             checkTimelineResumeHistory(check)
             print("\(count - failed)/\(count) timeline resume checks passed")
@@ -30,6 +38,7 @@ import Darwin
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-menu-cpu-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }
             try checkSessionIncrementalReads(check, root: root.appendingPathComponent("sessions"))
+            try await checkIgnoredPauseAppState(check, home: root.appendingPathComponent("ignored-state"))
             try checkNativeMenuQuotaUpdates(check, root: root.appendingPathComponent("ui"))
             print("\(count - failed)/\(count) menu and CPU checks passed")
             if failed > 0 { exit(1) }
@@ -3390,8 +3399,10 @@ import Darwin
         try await checkUsagePollingAndDrift(check, root: temp.appendingPathComponent("polling-regression"))
         try await checkPassiveUsage(check, root: temp.appendingPathComponent("passive-usage-regression"))
         try checkSessionIncrementalReads(check, root: temp.appendingPathComponent("incremental-sessions"))
+        try await checkIgnoredPauseAppState(check, home: temp.appendingPathComponent("ignored-state"))
         try checkNativeMenuQuotaUpdates(check, root: temp.appendingPathComponent("native-menu-updates"))
         try await checkDisabledMenu(check, root: temp.appendingPathComponent("disabled-menu"))
+        try checkTokenUsageHistory(check, root: temp.appendingPathComponent("token-history"))
         print("\(count - failed)/\(count) regression checks passed")
         if failed > 0 { exit(1) }
     }

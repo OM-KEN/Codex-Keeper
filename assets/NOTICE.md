@@ -1,4 +1,6 @@
-# 复用的 Copied 内容
+# 第三方内容说明
+
+## Copied
 
 `dmg_background.png`、安装布局和重要更新窗口参考 Copied，遵循以下 MIT 许可。重要更新窗口及发布说明排版参考提交 `f0ce1b54331d3dc0bc974adfdf74734a46cc9752`。此处许可仅说明所复用的 Copied 内容。
 
@@ -23,3 +25,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Zstandard
+
+随附的 Zstandard 1.5.7 解压器由 Meta Platforms, Inc. 及其关联方提供，采用 BSD 许可。源码与原始许可位于 `Vendor/zstd/`；应用资源中的 `ZstdLicense` 包含完整许可。它静态编译用于只读解压 Codex 会话记录。

@@ -89,6 +89,7 @@ final class SessionWatcher: ObservableObject {
     private var generation = 0
     var watchedIDs: Set<String> = []
     var watchedPaths: [URL] = []
+    var ignoredPauses: [String: BlockedSession] = [:]
     @Published private(set) var scannedAt: Date?
 
     init(codexHome: URL = CodexEnvironment.home, worker: SessionScanWorker? = nil) {
@@ -115,11 +116,12 @@ final class SessionWatcher: ObservableObject {
         let worker = worker
         let ids = watchedIDs
         let paths = watchedPaths
+        let ignored = ignoredPauses
         let generation = self.generation
         Task {
             guard !suspended, self.generation == generation else { return }
             let result = await Task.detached { () -> ([SessionActivity], String?, AuthenticationObservation, [SessionScanDiagnostic]) in
-                let sessions = worker.read(watchedIDs: ids, watchedPaths: paths)
+                let sessions = worker.read(watchedIDs: ids, watchedPaths: paths, ignoredPauses: ignored, protectedIDs: ids)
                 let auth: AuthenticationObservation
                 do { auth = .known(try AppServerUsageProvider.authenticationIdentity(home: worker.codexHome)) }
                 catch { auth = .unreadable }
@@ -155,7 +157,8 @@ final class SessionWatcher: ObservableObject {
         ) else { return [] }
 
         var files: [(url: URL, mtime: Date)] = []
-        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" || (url.pathExtension == "zst" && url.deletingPathExtension().pathExtension == "jsonl") {
+            guard RolloutFile.resolvedURL(url) == url else { continue }
             guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
                   values.isRegularFile == true,
                   let mtime = values.contentModificationDate else { continue }
@@ -168,7 +171,7 @@ final class SessionWatcher: ObservableObject {
     // MARK: - rollout 解析
 
     nonisolated static func rolloutThreadID(_ url: URL) -> String? {
-        let name = url.deletingPathExtension().lastPathComponent
+        let name = RolloutFile.plainURL(url).deletingPathExtension().lastPathComponent
         guard let range = name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?=_[0-9a-fA-F-]{36}$|$)"#, options: .regularExpression) else { return nil }
         return String(name[range])
     }
@@ -367,6 +370,15 @@ final class SessionRolloutReader {
     func retainFiles(_ paths: Set<URL>) { cursors = cursors.filter { paths.contains($0.key) } }
 
     func read(url: URL, mtime: Date) throws -> SessionActivity? {
+        let actual = RolloutFile.resolvedURL(url)
+        if actual.pathExtension == "zst" {
+            let content = try RolloutFile.read(actual)
+            guard let text = String(data: content, encoding: .utf8) else { throw SessionRolloutReadError.invalidUTF8 }
+            var state = SessionRolloutState()
+            state.append(text, mtime: mtime)
+            return state.snapshot(url: actual, mtime: mtime)
+        }
+        let url = actual
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -434,8 +446,16 @@ final class SessionScanWorker: @unchecked Sendable {
         self.parseRollout = parseRollout ?? rolloutReader.read
         quotaLogs = QuotaErrorLogProvider(codexHome: codexHome)
     }
-    func read(watchedIDs: Set<String>, watchedPaths: [URL] = []) -> ([SessionActivity], String?, [SessionScanDiagnostic]) {
+    // Shared with preflight: an explicitly watched target always overrides this isolation.
+    private var ignoredPauses: [String: BlockedSession] = [:]
+    private var protectedIDs: Set<String> = []
+    private var protectedPaths: [URL] = []
+    func read(watchedIDs: Set<String>, watchedPaths: [URL]? = nil, ignoredPauses: [String: BlockedSession]? = nil, protectedIDs: Set<String>? = nil) -> ([SessionActivity], String?, [SessionScanDiagnostic]) {
         lock.lock(); defer { lock.unlock() }
+        if let ignoredPauses { self.ignoredPauses = ignoredPauses }
+        if let protectedIDs { self.protectedIDs = protectedIDs }
+        if let watchedPaths { self.protectedPaths = watchedPaths }
+        let watchedPaths = self.protectedPaths
         var stops: [String: QuotaStop] = [:]
         var errorMessage: String?
         var failures: [SessionScanDiagnostic] = []
@@ -456,9 +476,12 @@ final class SessionScanWorker: @unchecked Sendable {
         do { currentPaths = try Self.currentRolloutPaths(codexHome: codexHome) }
         catch { errorMessage = error.localizedDescription; diagnose("state_database", error: error) }
         var all = SessionWatcher.recentRollouts(codexHome: codexHome, limit: Int.max)
-        for path in watchedPaths where !all.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
-            if let values = try? path.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]), values.isRegularFile == true,
-               let mtime = values.contentModificationDate { all.append((path, mtime)) }
+        for original in watchedPaths {
+            let path = RolloutFile.resolvedURL(original)
+            if !all.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
+                if let values = try? path.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]), values.isRegularFile == true,
+                   let mtime = values.contentModificationDate { all.append((path, mtime)) }
+            }
         }
         do { stops = try quotaLogs.read() }
         catch {
@@ -466,7 +489,16 @@ final class SessionScanWorker: @unchecked Sendable {
             if !all.isEmpty || !watchedIDs.isEmpty { errorMessage = errorMessage ?? error.localizedDescription; diagnose("quota_log_database", error: error) }
         }
         let runningIDs = Set(cache.values.filter { $0.activity.taskRunning }.map { $0.activity.id })
-        let ids = watchedIDs.union(stops.keys).union(runningIDs)
+        func isolated(_ id: String) -> Bool {
+            guard let ignored = self.ignoredPauses[id], !watchedIDs.contains(id), !self.protectedIDs.contains(id), !runningIDs.contains(id),
+                  !watchedPaths.contains(where: { SessionWatcher.rolloutThreadID($0) == id || RolloutFile.resolvedURL($0) == currentPaths[id] }) else { return false }
+            if let stop = stops[id] {
+                guard stop.at <= ignored.blockedAt,
+                      stop.turnID == nil || stop.turnID == ignored.stoppedTurnID else { return false }
+            }
+            return true
+        }
+        let ids = watchedIDs.union(self.protectedIDs).union(stops.keys.filter { !isolated($0) }).union(runningIDs)
         let recent = Set(all.prefix(20).map { $0.url })
         let candidates = ids.union(recent.compactMap(SessionWatcher.rolloutThreadID))
         let registered = Set(currentPaths.filter { candidates.contains($0.key) }.map { $0.value.resolvingSymlinksInPath() })
@@ -480,8 +512,8 @@ final class SessionScanWorker: @unchecked Sendable {
         }
         // Validate registered current files after excluding replaced history, before parsing candidates.
         for (id, path) in currentPaths where candidates.contains(id) && !files.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
-            errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
-            diagnose("canonical_rollout_missing", file: path)
+            if !isolated(id) { errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录") }
+            diagnose(isolated(id) ? "ignored_rollout_missing" : "canonical_rollout_missing", file: path)
         }
         var titles: [String: String] = [:]
         if let index = try? String(contentsOf: codexHome.appendingPathComponent("session_index.jsonl"), encoding: .utf8) {
@@ -507,7 +539,11 @@ final class SessionScanWorker: @unchecked Sendable {
                 if let parsed = activity {
                     cache[file.url] = (file.mtime, size ?? 0, inode ?? 0, parsed)
                 } else {
-                    let name = file.url.deletingPathExtension().lastPathComponent
+                    if let id = SessionWatcher.rolloutThreadID(file.url), isolated(id) {
+                        diagnose("ignored_rollout_parse", error: parseError, file: file.url)
+                        continue
+                    }
+                    let name = RolloutFile.plainURL(file.url).deletingPathExtension().lastPathComponent
                     if cache[file.url] != nil || name.range(of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#, options: .regularExpression) != nil {
                         errorMessage = errorMessage ?? L10n.text("无法读取 Codex 本地暂停记录")
                         diagnose("rollout_parse", error: parseError, file: file.url)
@@ -565,7 +601,13 @@ final class SessionScanWorker: @unchecked Sendable {
             for file in missing.keys { diagnose("running_rollout_missing", file: file) }
             activities += missing.map { $0.value.activity }
         }
-        cache = cache.filter { existing.contains($0.key) || $0.value.activity.taskRunning }
+        let verifiedPaths = Dictionary(uniqueKeysWithValues: activities.filter(\.currentRolloutVerified).map {
+            ($0.id, $0.fileURL.resolvingSymlinksInPath())
+        })
+        cache = cache.filter { entry in
+            if let current = verifiedPaths[entry.value.activity.id], entry.key.resolvingSymlinksInPath() != current { return false }
+            return existing.contains(entry.key) || entry.value.activity.taskRunning
+        }
         rolloutReader.retainFiles(Set(cache.keys))
         if errorMessage != nil { activities = activities.map { var value = $0; value.currentRolloutVerified = false; return value } }
         return (activities.sorted { $0.lastActivityAt > $1.lastActivityAt }, errorMessage,
@@ -588,7 +630,7 @@ final class SessionScanWorker: @unchecked Sendable {
         var step = try reader.step(statement)
         while step == SQLITE_ROW {
             if let id = sqlite3_column_text(statement, 0), let path = sqlite3_column_text(statement, 1) {
-                result[String(cString: id)] = URL(fileURLWithPath: String(cString: path))
+                result[String(cString: id)] = RolloutFile.resolvedURL(URL(fileURLWithPath: String(cString: path)))
             }
             step = try reader.step(statement)
         }

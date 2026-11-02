@@ -12,12 +12,16 @@ import UserNotifications
     private var quotaHost: MenuQuotaHostView?
     private let quotaItem = NSMenuItem()
     private let quotaSeparator = NSMenuItem.separator()
+    private var tokenHistoryHost: TokenUsageMenuView?
+    private let tokenHistoryItem = NSMenuItem()
+    private let tokenHistorySeparator = NSMenuItem.separator()
     private var cancelResumeItem: NSMenuItem?
     private var versionItem: NSMenuItem?
     private var settingsWindow: NSWindow?
     private var aboutWindow: NSWindow?
     private var cliPathWindow: NSWindow?
     private var tasksWindow: NSWindow?
+    private var tokenHistoryWindow: NSWindow?
     private let appState = AppState()
     private let updateService = AppUpdateService()
     private var updateScheduled = false
@@ -108,15 +112,16 @@ import UserNotifications
     func menuWillOpen(_ menu: NSMenu) {
         menuIsTracking = true
         statusQuotaView.setHighlighted(true)
-        if appState.enabled { quotaHost?.menuWillOpen() }
+        if appState.enabled { quotaHost?.menuWillOpen(); tokenHistoryHost?.menuWillOpen() }
     }
     func menuDidClose(_ menu: NSMenu) {
         menuIsTracking = false
         appState.execution.acknowledgePingResult()
         statusQuotaView.setHighlighted(false); quotaHost?.menuDidClose()
+        tokenHistoryHost?.menuDidClose()
         scheduleImportantUpdatePrompt()
     }
-    func shutdown() { updateService.stop(); appState.execution.stopOwnedTasks() }
+    func shutdown() { tokenHistoryHost?.menuDidClose(); updateService.stop(); appState.tokenHistory.stop(); appState.execution.stopOwnedTasks() }
     func confirmQuit() -> Bool {
         let names = appState.execution.independentTaskNames
         guard !names.isEmpty else { return true }
@@ -225,6 +230,14 @@ import UserNotifications
             self.quotaHost = quotaHost
             quotaItem.view = quotaHost
             menu.addItem(quotaItem)
+            menu.addItem(tokenHistorySeparator)
+            let tokenHost = TokenUsageMenuView(analysis: appState.tokenHistory.analysis)
+            tokenHost.openHistory = { [weak self] in
+                self?.menu.cancelTracking()
+                DispatchQueue.main.async { [weak self] in self?.openTokenHistory() }
+            }
+            tokenHistoryHost = tokenHost; tokenHistoryItem.view = tokenHost
+            menu.addItem(tokenHistoryItem)
             menu.addItem(.separator())
             row(L10n.text("设置…"), action: #selector(openKeeperSettings)).keyEquivalent = ","
             versionItem = row(L10n.format("版本 %@", AppVersion.currentString), action: #selector(openAbout))
@@ -238,6 +251,9 @@ import UserNotifications
         quotaHost?.update(quotas: summary.quotas, accountID: summary.quotaAccountID)
         quotaItem.isHidden = summary.quotas.isEmpty
         quotaSeparator.isHidden = summary.quotas.isEmpty && cancelResumeItem?.isHidden != false
+        tokenHistoryHost?.update(appState.tokenHistory.analysis)
+        tokenHistoryItem.isHidden = !enabled
+        tokenHistorySeparator.isHidden = !enabled
         let hasUpdate = updateService.showsMenuUpdateIndicator
         let versionTitle = MenuVersionTextFormatter.string(version: AppVersion.currentString, hasUpdate: hasUpdate)
         versionItem?.title = versionTitle
@@ -304,6 +320,20 @@ import UserNotifications
         summary.applyPingHistory(appState.execution.pingResults, accountID: appState.authenticatedAccountID ?? appState.displayAccountID ?? appState.execution.lastPingResult?.accountID)
         summary.applyResumeHistory(appState.visibleOperations, accountID: appState.displayAccountID, confirmations: appState.execution.confirmations)
         return summary
+    }
+
+    private func openTokenHistory() {
+        if tokenHistoryWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 800),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.title = L10n.text("Token 用量历史")
+            window.contentView = NSHostingView(rootView: TokenUsageHistoryView(history: appState.tokenHistory))
+            window.minSize = NSSize(width: 860, height: 720)
+            window.isReleasedWhenClosed = false; window.center()
+            tokenHistoryWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        tokenHistoryWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func showExecutionIssue() {

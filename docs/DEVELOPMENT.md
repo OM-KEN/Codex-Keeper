@@ -12,6 +12,8 @@ open .build/CodexKeeper.app
 
 原生 Swift / SwiftUI / AppKit 应用，无 xcodeproj。`build.sh` 的 SOURCES 显式列出 Swift 文件；新增源文件要更新列表。版本来自 `VERSION`，部署版本来自 `Info.plist`。
 
+Zstandard 解压器随源码保存在 `Vendor/zstd/`，通过 `Codex/ZstdBridge/` 静态编译进应用、回归程序和 CLI 兼容性探针，不依赖 Homebrew 或外部解压进程。桥接源码、模块声明和解压器也纳入构建指纹；BSD 许可随应用复制为 `ZstdLicense`。
+
 界面支持简体中文与英语，跟随 macOS 为应用选择的语言。中文文案作为 `L10n` 的回退键，英文位于 `en.lproj/Localizable.strings`；新增面向用户的文字须补齐英文键值。`build.sh` 将两种语言资源复制入 App，并把它们计入构建指纹。设置中的默认续跑内容不可编辑，按当前语言发送“继续”或“Continue”；选择自定义后通过弹窗保存内容，切回默认时保留自定义文字以便再次选择。旧偏好没有明确模式时，保存的内置默认值按默认处理，其他非空内容和已标记的自定义值按自定义处理；旧版手动改回与默认值完全相同的文字无法区分，按默认值处理。
 
 默认使用临时签名，避免安装包包含个人开发者证书中的邮箱和身份标识，因此其他开发者不需要作者证书也能编译。如需证书签名，可显式设置 `CODE_SIGN_IDENTITY`，该证书的公开身份信息会随应用分发。构建先在临时目录完成并验证签名，再替换目标应用；运行中的目标应用不会被覆盖。使用 `BUILD_DIR=.build/candidate ./build.sh` 可以保留当前运行版本。
@@ -29,7 +31,8 @@ open .build/CodexKeeper.app
 - **手动兜底**：正常设置页不显示备用路径。找不到可用的 Codex CLI 时，点击菜单中的错误提示打开独立的路径窗口，可输入或选择文件，保存后立即重试。保存前去除首尾空白并展开 `~/`，要求绝对路径指向存在且可执行的普通文件，支持文件符号链接及路径中的空格；空白输入不能提交，不执行 shell 展开或 `--version` 探测。已保存路径仍仅在自动候选不可用时使用。额度查询、保活及独立 app-server 续跑共用 `CodexLocator`，直接将路径传给进程。
 - **数据目录**：统一使用 `CODEX_HOME`，未设置则为 `~/.codex`；由 Finder 启动时不会自动继承 shell 配置里的环境变量。自定义目录必须传入启动环境，且与目标 Codex 使用同一目录。
 - **任务范围**：当前 Mac 的本地任务；不承诺云端、远程主机和其他操作系统。
-- **当前会话记录**：同一 thread ID 出现多个 rollout 时，以当前 `state*.sqlite` 的 `threads.rollout_path` 为准，先排除已被替换的旧文件再解析，只产生一个任务；不按修改时间猜测归属，也不把文件名末尾的分段 UUID 当作 thread ID。关注、运行及在途任务退出最近 20 个文件后仍继续监测。当前登记文件缺失、索引不兼容或身份无法确定时暂停自动续跑；隔离保活不依赖完整任务扫描。
+- **当前会话记录**：同一 thread ID 出现多个 rollout 时，以当前 `state*.sqlite` 的 `threads.rollout_path` 为准，先排除已被替换的旧文件再解析，只产生一个任务；不按修改时间猜测归属，也不把文件名末尾的分段 UUID 当作 thread ID。普通 `.jsonl` 与其 `.jsonl.zst` 是同一段的两种表示，优先读取仍存在的普通文件，登记路径不变时也能跟随压缩与恢复。关注、运行及在途任务退出最近 20 个文件后仍继续监测；新的当前记录核实后退役被替代文件的旧运行缓存。当前登记文件缺失、索引不兼容或身份无法确定时暂停自动续跑；隔离保活不依赖完整任务扫描。
+- **已忽略暂停**：已持久化忽略的旧暂停不再作为普通监视目标，其文件损坏或缺失只留脱敏诊断，不阻塞其他任务。明确监视、Keeper 在途保护、当前运行事实或不同轮次／更新的额度停止证据会覆盖这层隔离；同一任务出现有效的新暂停时仍正常发现，不将“忽略本轮”扩展为忽略整个任务。
 - **故障处理**：按主库及 WAL 修改时间发现当前 `logs*.sqlite`，轮换或截断时重读。会话索引与暂停日志共用 `ReadOnlyDatabase`：仅打开已存在数据库，允许 SQLite 正常管理 WAL/SHM，立即启用并核验 `query_only`，只执行只读语句。保留打开、准备、读取阶段及主/扩展错误码，锁冲突、权限和损坏不一概报成格式不兼容。已有任务却无法读取所需证据时暂停自动续跑；不清库、不改 journal_mode、不绕过活动 WAL。保活准备、发送、确认与诊断均不直接读取 SQLite。
 
 官方接口用于账户、额度、模型发现和独立 app-server 续跑。桌面 IPC、rollout、日志数据库、认证和草稿文件仍含非公开兼容层，因此不能承诺支持 Codex 的所有历史与未来版本。升级 Codex 后应重新核验；用户原任务无法可靠确认时暂停续跑，隔离保活按下述准入与真实完成证据分别处理。
@@ -39,6 +42,22 @@ open .build/CodexKeeper.app
 ### CLI 兼容性验证
 
 人工验证可运行 `./Probes/check-cli-compatibility.sh --identity` 核对 CLI 路径、版本和 SHA-256，或使用 `--check` 检查账户/额度/模型及无提示词 TUI 启动；配置生成函数由生产保活与探针共用，覆盖全新目录与旧后台服务路径。启动通过不等于保活成功，完整结果仍从计划操作的真实日志确认。提交、推送及发布仍需维护者明确同意。
+
+### Token 用量历史
+
+当前开发主线提供菜单中的近七日 Token 堆叠柱状图，点击打开原生历史窗口，可按天、5 小时窗口和模型逐级查看输入、缓存、输出与推理细分。跨午夜的完整 5 小时窗口归入开始日；缺少时间或窗口的信息保留未知。菜单和历史窗口显示今日 Token、平均输出 tps，以及完整额度窗口的 API 等值估算。此功能尚未单独发布，不代表既有 v1.1.0 安装包已经包含它。
+
+统计只读取本机正常、归档及 Keeper 隔离保活的 rollout，按可靠账户归属过滤，并去重累计快照、继承历史和 fork。普通与压缩表示共用逻辑身份；压缩、恢复及两者共存时不重复计量，未变化的压缩记录复用解析缓存。缓存为运行目录中的 `token-usage-cache-v1.json`，属于可重建的统计数据，不替代或修改原任务历史及尝试账本。
+
+刷新跟随现有会话扫描完成信号，并有独立 60 秒兜底；关闭 Keeper 同时停止历史监测。手动刷新和环境变化也可触发本地读取。统计不调用模型、不增加额度 RPC，价格表内置于版本中，只有点击来源链接才打开浏览器。
+
+tps 按可确认请求的输出 Token（已经包含推理）除以有效耗时计算，扣除成对工具调用与返回的等待区间，重叠等待先合并；重复快照和回合结束后的闲置时间不计入。汇总采用总输出／总耗时。记录边界不完整时保留未知；耗时仍包含首 Token 等待、上下文处理与日志写入延迟，不等同于服务端纯生成速度。
+
+完整额度估算仅使用 Plus、同模型同速度档位且可完整配对的本机样本；每个实际窗口累计匹配消耗严格超过 25 个百分点后，以配对 API 成本／额度消耗比例加权。Token 估算使用相同区间与分母。混合模型、档位未知、账户不明、记录损坏或覆盖不完整时不硬分用量，也不补造估算；前七日同期使用当前同一模型和档位比较。模型基准取最新普通会话的正用量，保活和子代理计入历史但不选择基准。
+
+速度档位来自日志中的线程设置和逐回合字段，不以当前全局配置反推历史；未记录档位的旧用量按标准 API 价显示，但不参与额度校准。价格表版本为 `2026-10-30`，来源为 [OpenAI API 价格表](https://developers.openai.com/api/docs/pricing)，输入、缓存、输出、上下文长度和明确缓存写入保留期分别计价。美元数是本机样本的 API 等值，既不是官方订阅余额或账单，也不是固定套餐 Token 上限；其他设备、云任务和未落盘消耗均可能影响估算。
+
+专项检查为 `./run-tests.sh --token-history-only` 与 `./run-tests.sh --menu-cpu-only`。`Probes/TokenUsagePreview.swift` 仅用隔离夹具生成原生预览，不初始化真实调度器或读取用户历史。
 
 OM 的每日 Codex 更新提醒属于本机个人工具，源码和测试已于 2026-10-12 迁至仓库外；启动配置及运行数据也保存在仓库外，不纳入 Git 或 Keeper 安装包。本机位置为 `~/Library/Application Support/CodexKeeper/update-reminder/tool/`，维护说明见该目录的 `README.md`；每天 09:00 由用户 LaunchAgent 运行，不调用模型或发送 Codex 聊天消息。原高频 Codex 自动化不恢复。
 
@@ -190,9 +209,11 @@ PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 - 保活模型固定为 `gpt-6-luna`，不自动换模型。CLI、能力与隔离配置首次在后台准备；之后利用现有调度，通常至多每 5 分钟比较已知 CLI、所属应用 Info.plist 和认证文件元数据，唤醒/激活合并检查，不运行版本子进程、不遍历会话。CLI/版本或备用路径变化重新定位，模型能力在首次、CLI 或真实账户变化、实际模型错误后经 `model/list` 查询；同账户令牌刷新不重新发现模型，健康额度读取不清空能力缓存。准备未完成不成为保活硬门槛；没有已确认推理能力时使用 CLI 默认参数。发送时只核对本地可执行性，路径失效允许一次本地重定位；配置在相关能力变化、文件缺失或被修改时修复，不每日重写。每次发送读取当前认证并以私有权限更新隔离副本，不回用旧账户。续跑继承原任务模型。
 - 保活配置生成必须使用 TOML 可接受的字符串转义，不能将路径中的 `/` 写成 `\/`。启动失败和窗口确认超时分别报告。
 - 保活确认要求本次隔离 JSONL 中精确匹配的任务/轮次真正完成，再核对同账户新鲜额度。发送前已可靠确认无窗口、发送后真实新窗口成立才记录“新窗口已确认”；发送前未知或原窗口已有效、发送后窗口有效则记录“请求完成，窗口有效”，不宣称新建。任务完成但窗口无法核实记录“请求完成，窗口待确认”。启动、普通 OK 或进程退出码都不能代替完成证据，任何确认结果都不改变固定日程。
+- 保活排除既有记录时按解析符号链接后的普通／压缩文件逻辑身份比较，旧日志压缩后仍属于旧记录；本次压缩回执也须成功解压并满足同样的精确任务完成证据，损坏或截断不能确认成功。
 - 单次保活确认目标为 180 秒，90 秒仍未确认时提示并发送一次“正在确认中”通知。精确任务完成事实取得后缓存，只重查额度，不重复解析完整任务；暂时额度错误沿用共享 provider 的连接与冷却，进程退出不提前终止已完成任务的窗口核实。账户变化、致命读取错误或取消结束相应核实，保留已知完成事实及具体原因；持续额度失败到期保留窗口待确认，不另发模型请求。取消和进程清理有界；已发出的额度查询可能使返回略晚于目标，到期不再发起新查询。通知权限未允许时仍保留菜单信息。
 - `execution-events.jsonl` 复用每账户/原节点的 `ping_result` 事实供菜单、历史与结果通知读取，区分提交、新窗口、窗口有效、完成待确认、失败、未知、未执行及无需发送。启动前原子保存发送意图；能确定没有启动的错误可安全撤销本节点意图，已启动或未知不补发。重启把缺少终局的 submitted 保留为未知；已观察机会到期时保存未执行原因，后续扫描或读取恢复不抹除。诊断只取本次阶段、进程、隔离 JSONL 结构化事件与额度 RPC，不再访问运行日志 SQL；保留可确认的错误分类与错误码，不猜测只有上游库才可能提供的代理/重试细节。旧成功记录继续展示，顺延专用来源加载已删除。
 - 续跑：优先通过桌面 IPC 找到原写入者并发送 `thread-follower-start-turn`；没有写入者时才使用独立 app-server。发送结果不明确时不切换通道重发。
+- 桌面续跑跟随冷日志时，先保存解压后的基线，普通文件恢复后核对基线一致，再只读取新追加内容；不将压缩字节交给模型响应解析器，也不凭文件恢复或发送回执确认启动。
 - 独立 app-server 续跑的 `thread/resume` 使用 `excludeTurns=true`，只向 Keeper 返回任务元数据和实时状态；历史上下文仍由 Codex 恢复，原模型、权限和工作目录不覆盖。会话历史总量不再直接占用 Keeper 的 JSONL 响应缓冲，但 Codex 自身恢复大任务的耗时和内存限制仍存在。
 - `AppServerClient` 的 JSONL 读取仍保留 8 MiB 缓冲上限，只扫描新读入的字节寻找行尾；超限诊断为 `response_too_large`，界面提示更新 Codex 后刷新，不自动重试，不再混同为格式无法识别。
 - 续跑发送与启动确认按任务独立处理；收到准确关联本轮的首个真实模型响应即记为“已继续”，释放启动等待，让任务正常运行，不等待整个任务结束。发送回执、空占位、单纯的 started 或结束事件都不算模型响应。结束事件中的非空 `last_agent_message` 或 `turn.items` 中的真实模型内容仍可证明响应；MCP、动态工具及命令/文件工具必须明确为 completed，`error:null` 仅表示无错误。桌面跟随与重启核实遵守同一证据要求。独立 app-server 已接手的任务保留通道至真正结束；退出 Keeper 前明确列出受影响的任务，桌面端原任务不会因停止监听而中断。
@@ -223,11 +244,11 @@ PYTHON=.build/dmg-tools/bin/python ./create-dmg.sh
 ## 代码地图与数据
 
 - `App/`：生命周期、状态汇总、系统事件、菜单及窗口。
-- `Core/`：日程、决策、展示模型、执行协调、尝试记录、保活与续跑；`ResumeState.swift` 定义逐任务续跑事实与模型活动证据；`UsagePollingPolicy.swift` 负责五分钟额度兜底与边界提前唤醒；`AppUpdateService.swift` 负责应用更新检查和提醒，`FeedbackSupport.swift` 生成反馈链接。
-- `Codex/`：只读额度接口、`RolloutUsageMonitor.swift` 本地额度监听、桌面 IPC、任务扫描、额度错误判定、草稿读取。
-- `UI/`：菜单摘要、任务编辑、设置、引导及关于页。
-- `Tests/main.swift`、`PollingTests.swift`、`PassiveUsageTests.swift`、`SessionIncrementalTests.swift`、`MenuLiveUpdateTests.swift`、`MenuDisabledTests.swift`、`ResumeStateTests.swift`、`LogicRepairTests.swift`、`KeepAliveSimplificationTests.swift`：回归检查；`Probes/`：早期探针与原生界面示例。
-- `~/Library/Application Support/CodexKeeper/`：`execution-events.jsonl`、`resume-attempts.json`、`usage-transitions.jsonl`、`pending-runtime.json`、`menu-history.json`。这些运行数据独立于源码位置，搬迁不改变它们。
+- `Core/`：日程、决策、展示模型、执行协调、尝试记录、保活与续跑；`ResumeState.swift` 定义逐任务续跑事实与模型活动证据；`UsagePollingPolicy.swift` 负责五分钟额度兜底与边界提前唤醒；`TokenUsageHistory.swift` 负责统计、窗口归属和 API 等值估算；`AppUpdateService.swift` 负责应用更新检查和提醒，`FeedbackSupport.swift` 生成反馈链接。
+- `Codex/`：只读额度接口、`RolloutUsageMonitor.swift` 本地额度监听、`RolloutFile.swift` 普通／压缩记录读取、`TokenUsageHistoryReader.swift` 增量用量历史、桌面 IPC、任务扫描、额度错误判定、草稿读取。
+- `UI/`：菜单摘要、用量历史图表与窗口、任务编辑、设置、引导及关于页。
+- `Tests/main.swift`、`PollingTests.swift`、`PassiveUsageTests.swift`、`SessionIncrementalTests.swift`、`TokenUsageHistoryTests.swift`、`MenuLiveUpdateTests.swift`、`MenuDisabledTests.swift`、`ResumeStateTests.swift`、`LogicRepairTests.swift`、`KeepAliveSimplificationTests.swift`：回归检查；`Probes/`：早期探针与原生界面示例。
+- `~/Library/Application Support/CodexKeeper/`：`execution-events.jsonl`、`resume-attempts.json`、`usage-transitions.jsonl`、`pending-runtime.json`、`menu-history.json`、`token-usage-cache-v1.json`。这些运行数据独立于源码位置，搬迁不改变它们。
 - 执行日志中的 started 只表示保存意图/开始尝试。保活 confirmed 区分新窗口与本次请求完成后窗口有效，completed_pending 仅确认任务完成；具体事实以 `ping_result` 为准。续跑仍必须取得真实模型响应才能确认启动。
 - 保活提交前仅复核本地准备、开关、原机会、时区、当前认证、Keeper 自身互斥与账本健康。失败记录 `preflight` 的具体阶段和分类；额度、模型发现、完整扫描不再是发送准入步骤。旧 `after_usage`、`session_scan` 等字段和枚举继续支持旧历史读取，不恢复旧门槛。
 - 保活失败、未知或错过机会保留相应结果，已读后可解除当前提醒，历史事实与尝试保护保留；后续成功可解除之前提醒。窗口待确认用中性文案，不套用“失败”前缀。自动续跑的正常额度等待、设置变化、原任务已继续等仍使用各自普通状态，账户、记录、目录、归档、授权及内容读取等硬阻塞保留原优先级；不因展示暂缓而推断成功或重发。

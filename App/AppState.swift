@@ -5,6 +5,7 @@ import Network
 
 @MainActor final class AppState: ObservableObject {
     let usage: UsageObserver
+    let tokenHistory: TokenUsageHistoryObserver
     let sessions: SessionWatcher
     let execution: ExecutionCoordinator
     @Published private(set) var schedule: ScheduleEngine
@@ -60,6 +61,7 @@ import Network
         self.monitorsAutomatically = startMonitoring
         self.runtimeURL = runtimeURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CodexKeeper/pending-runtime.json")
         usage = UsageObserver(codexHome: codexHome, provider: provider, logURL: self.runtimeURL.deletingLastPathComponent().appendingPathComponent("usage-transitions.jsonl"), now: now)
+        tokenHistory = TokenUsageHistoryObserver(home: codexHome, support: self.runtimeURL.deletingLastPathComponent())
         let scanWorker = SessionScanWorker(codexHome: codexHome)
         sessions = SessionWatcher(codexHome: codexHome, worker: scanWorker)
         self.execution = execution ?? ExecutionCoordinator(provider: provider, defaults: defaults,
@@ -90,17 +92,20 @@ import Network
         usage.onPassiveChange = { [weak self] in self?.recompute(allowExecution: false, source: "passive_usage") }
         sessions.onRefreshCompleted = { [weak self] in
             self?.usage.rescanPassive()
+            self?.tokenHistory.refresh()
             self?.recompute(source: "sessions")
         }
         self.execution.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         usage.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
+        tokenHistory.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         self.execution.$running.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] running in
             if !running, self?.execution.lastFailure == nil { self?.requestAutomaticRefresh(source: "execution_finished") }
             self?.recompute(allowExecution: false)
         }.store(in: &cancellables)
         monitoringSettings = settingsFingerprint()
         environmentDay = Calendar.current.startOfDay(for: now())
-        sessions.watchedIDs = Set(confirmed.keys).union(self.execution.busyThreadIDs)
+        sessions.ignoredPauses = pauseRegistry.filter { choices.ignoredEpisodes?.contains($0.value.episodeKey) == true }
+        sessions.watchedIDs = Set(confirmed.values.filter { choices.ignoredEpisodes?.contains($0.episodeKey) != true }.map(\.id)).union(self.execution.busyThreadIDs)
         sessions.watchedPaths = self.execution.protectedPaths
         observers.append(NotificationCenter.default.addObserver(forName: CodexLocator.fallbackPathChanged, object: defaults, queue: .main) { [weak self] _ in
             Task { @MainActor in
@@ -132,6 +137,7 @@ import Network
         monitoringEnabled = enabled
         if enabled {
             sessions.start()
+            tokenHistory.start()
             usage.start()
             execution.maintainKeepAlive(forceCheck: true)
             let monitor = NWPathMonitor()
@@ -150,6 +156,7 @@ import Network
             network?.cancel(); network = nil; networkAvailable = nil
             usage.stop()
             sessions.stop()
+            tokenHistory.stop()
             execution.cancelCurrent()
         }
     }
@@ -202,6 +209,7 @@ import Network
         if monitoring { execution.maintainKeepAlive(forceCheck: true) }
         environmentDay = Calendar.current.startOfDay(for: now())
         environmentTimeZone = Calendar.current.timeZone.identifier
+        tokenHistory.refresh()
         previousUsage = nil
         naturalRecoveries.removeAll()
         execution.invalidatePreparations(keepAlive: invalidateKeepAlive)
@@ -463,7 +471,8 @@ import Network
         // Recovery evidence and admission must use the same snapshot in this recomputation.
         let earlyRecoveryAt = observeRecovery(usage.snapshot)
         sessions.watchedPaths = execution.protectedPaths
-        sessions.watchedIDs = Set(blockedSessions.map { $0.id }).union(confirmed.keys).union(execution.busyThreadIDs)
+        sessions.ignoredPauses = pauseRegistry.filter { choices.ignoredEpisodes?.contains($0.value.episodeKey) == true }
+        sessions.watchedIDs = Set((blockedSessions + Array(confirmed.values)).filter { choices.ignoredEpisodes?.contains($0.episodeKey) != true }.map(\.id)).union(execution.busyThreadIDs)
             .union(sessions.sessions.filter { $0.taskRunning }.map(\.id))
         if sessions.hasScanned && sessions.detectionError == nil {
             let current = Set(blockedSessions.filter { !execution.hasAttempted($0, accountID: displayAccountID) }.map(\.episodeKey))

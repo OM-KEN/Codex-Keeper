@@ -65,7 +65,7 @@ final class OwnedSessionResumeTransport: ResumeTransport {
     private let lock = NSLock()
     private var desktop: DesktopConnection?
     private var owner: String?
-    private var file: FileHandle?
+    private var file: RolloutTailReader?
     private var stopped = false
     private var usesFallback = false
 
@@ -84,8 +84,7 @@ final class OwnedSessionResumeTransport: ResumeTransport {
         guard !cancelled else { throw CodexConnectionError.ended }
         do {
             if let connection, let owner = try connection.owner(of: target.id) {
-                let file = try FileHandle(forReadingFrom: target.fileURL)
-                try file.seekToEnd()
+                let file = try RolloutTailReader(url: target.fileURL)
                 lock.lock(); self.owner = owner; self.file = file; lock.unlock()
             } else {
                 connection?.cancel()

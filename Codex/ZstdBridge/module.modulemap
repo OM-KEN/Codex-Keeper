@@ -1,0 +1,4 @@
+module KeeperZstd {
+    header "KeeperZstd.h"
+    export *
+}
