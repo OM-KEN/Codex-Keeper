@@ -6,16 +6,36 @@ import SQLite3
     let menu: NSMenu
     let view: TokenUsageMenuView
     let chart: TokenUsageChartView
+    let followingView: NSView
+    let availableAnalysis: TokenUsageHistoryAnalysis
+    let unavailableAnalysis: TokenUsageHistoryAnalysis
+    let weeklyOnlyAnalysis: TokenUsageHistoryAnalysis
     var results: [(Bool, String)] = []
     private var ticks = 0
     private var step = 0
     private var pointer = NSPoint.zero
+    private var expandedHeight: CGFloat = 0
+    private var expandedChartY: CGFloat = 0
+    private var expandedMenuHeight: CGFloat = 0
+    private var expandedFollowingOffset: CGFloat = 0
 
-    init(menu: NSMenu, view: TokenUsageMenuView) {
+    init(menu: NSMenu, view: TokenUsageMenuView, followingView: NSView, availableAnalysis: TokenUsageHistoryAnalysis,
+         unavailableAnalysis: TokenUsageHistoryAnalysis, weeklyOnlyAnalysis: TokenUsageHistoryAnalysis) {
         self.menu = menu; self.view = view; self.chart = view.chart
+        self.followingView = followingView; self.availableAnalysis = availableAnalysis
+        self.unavailableAnalysis = unavailableAnalysis
+        self.weeklyOnlyAnalysis = weeklyOnlyAnalysis
         super.init()
         menu.delegate = self
         view.pointerLocation = { [weak self] in self?.pointer ?? .zero }
+    }
+    private var followingOffset: CGFloat {
+        view.convert(view.bounds, to: nil).maxY - followingView.convert(followingView.bounds, to: nil).maxY
+    }
+    private func moveToMetric(_ point: NSPoint) {
+        if let window = view.window, let metrics = view.subviews.first {
+            pointer = window.convertPoint(toScreen: metrics.convert(point, to: nil))
+        }
     }
     func menuWillOpen(_ menu: NSMenu) { view.menuWillOpen() }
     func menuDidClose(_ menu: NSMenu) { view.menuDidClose() }
@@ -36,6 +56,8 @@ import SQLite3
             return
         }
         if step == 0 {
+            expandedHeight = view.frame.height; expandedChartY = chart.frame.minY
+            expandedMenuHeight = window.frame.height; expandedFollowingOffset = followingOffset
             let bitmap = chart.bitmapImageRepForCachingDisplay(in: chart.bounds)!
             chart.cacheDisplay(in: chart.bounds, to: bitmap)
             let point = NSPoint(x: chart.plotRect.minX + chart.plotRect.width * 6.5 / 7, y: 24)
@@ -60,10 +82,59 @@ import SQLite3
             if let metrics = view.subviews.first {
                 pointer = window.convertPoint(toScreen: metrics.convert(NSPoint(x: tpsFrame.midX, y: tpsFrame.midY), to: nil))
             }
-        } else {
+        } else if step == 4 {
             results.append((chart.visibleHoverText == nil && view.visibleMetricHoverText ==
                 L10n.text("tps 表示平均每秒生成的 Token 数，用来衡量输出速度。"),
                 "actual menu pointer tracking follows the left-aligned tps text and shows its plain definition"))
+            if let metrics = view.subviews.first {
+                pointer = window.convertPoint(toScreen: metrics.convert(NSPoint(x: 20, y: 70), to: nil))
+            }
+        } else if step == 5 {
+            results.append((view.visibleMetricHoverText == L10n.text("5小时真实额度估算") + "\n8.8K Token",
+                "actual menu tracking preserves the existing hint when an estimate is available"))
+            view.update(unavailableAnalysis)
+        } else if step == 6 {
+            let reduction = expandedHeight - view.frame.height
+            results.append((reduction > 0 && abs(expandedChartY - chart.frame.minY - reduction) < 0.1,
+                "hiding both estimates contracts the custom view and moves its chart up by \(reduction) points"))
+            results.append((abs(expandedMenuHeight - window.frame.height - reduction) < 0.1 &&
+                abs(expandedFollowingOffset - followingOffset - reduction) < 0.1,
+                "the live menu and following row move up with the hidden estimates: menu \(expandedMenuHeight)->\(window.frame.height), row \(expandedFollowingOffset)->\(followingOffset)"))
+            view.hoverMetric(at: NSPoint(x: 20, y: 70))
+            results.append((view.visibleMetricHoverText == nil,
+                "the removed estimate row has no invisible metric tooltip at its former position"))
+            let tpsFrame = view.metricTPSFrame
+            moveToMetric(NSPoint(x: tpsFrame.midX, y: tpsFrame.midY))
+        } else if step == 7 {
+            results.append((view.visibleMetricHoverText == L10n.text("tps 表示平均每秒生成的 Token 数，用来衡量输出速度。"),
+                "TPS pointer tracking still works after the estimate row is removed"))
+            view.update(weeklyOnlyAnalysis)
+            moveToMetric(NSPoint(x: 20, y: 70))
+        } else if step == 8 {
+            results.append((view.frame.height == expandedHeight && chart.frame.minY == expandedChartY &&
+                abs(followingOffset - expandedFollowingOffset) < 0.1,
+                "a single weekly estimate restores one row and the live menu's following-item position"))
+            results.append((view.visibleMetricHoverText == L10n.text("每周真实额度估算") + "\n" +
+                (weeklyOnlyAnalysis.weeklyEstimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token",
+                "a weekly-only row maps its left-hand hover to the weekly estimate"))
+            moveToMetric(NSPoint(x: 240, y: 70))
+        } else if step == 9 {
+            results.append((view.visibleMetricHoverText == L10n.text("每周真实额度估算") + "\n" +
+                (weeklyOnlyAnalysis.weeklyEstimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token",
+                "a weekly-only row uses the same weekly hover across its available width"))
+            view.update(availableAnalysis)
+            moveToMetric(NSPoint(x: 20, y: 70))
+        } else if step == 10 {
+            results.append((view.frame.height == expandedHeight && chart.frame.minY == expandedChartY &&
+                abs(window.frame.height - expandedMenuHeight) < 0.1 && abs(followingOffset - expandedFollowingOffset) < 0.1,
+                "restoring both estimates preserves the original chart, menu and following-row layout"))
+            results.append((view.visibleMetricHoverText == L10n.text("5小时真实额度估算") + "\n8.8K Token",
+                "restoring both estimates restores the left-hand five-hour hover"))
+            moveToMetric(NSPoint(x: 240, y: 70))
+        } else {
+            results.append((view.visibleMetricHoverText == L10n.text("每周真实额度估算") + "\n" +
+                (availableAnalysis.weeklyEstimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token",
+                "restoring both estimates restores the right-hand weekly hover"))
             timer.invalidate(); menu.cancelTracking()
         }
         step += 1
@@ -236,6 +307,60 @@ import SQLite3
     let restored = cached.read(now: now)
     check(restored.records == updated.records && cached.bytesRead == 0,
         "persistent cursors restore history without rescanning old JSONL bytes")
+
+    let gapHome = root.appendingPathComponent("gap-home"), gapCache = root.appendingPathComponent("gap-cache.json")
+    let gapSessions = gapHome.appendingPathComponent("sessions")
+    try FileManager.default.createDirectory(at: gapSessions, withIntermediateDirectories: true)
+    try Data("{\"tokens\":{\"account_id\":\"account-a\"}}".utf8).write(to: gapHome.appendingPathComponent("auth.json"))
+    let oldGapAt = start.addingTimeInterval(-20 * 86400)
+    for boundAccount in [true, false] {
+        let id = boundAccount ? "owned-gap" : "unbound-gap"
+        var header = ["id": id]
+        if boundAccount { header["creator_account_id"] = "account-a" }
+        var gapData = try line("session_meta", header, oldGapAt.addingTimeInterval(-2))
+        gapData += try line("turn_context", ["model": "gpt-6.1-sol", "service_tier": "standard"], oldGapAt.addingTimeInterval(-1))
+        gapData += try line("event_msg", tokens(100, last: 100, used: 0, reset: reset), oldGapAt)
+        gapData += try line("event_msg", tokens(900, last: 100, used: 30, reset: reset), oldGapAt.addingTimeInterval(1))
+        try gapData.write(to: gapSessions.appendingPathComponent(id + ".jsonl"))
+    }
+    let gapReader = TokenUsageHistoryReader(home: gapHome, cacheURL: gapCache)
+    let gaps = gapReader.read(now: now)
+    let ownedGap = gaps.records.first { $0.id.hasSuffix(":gap") }
+    let unboundGap = gaps.unboundRecords.first { $0.id.hasSuffix(":gap") }
+    check(ownedGap?.usageUpperBound == oldGapAt.addingTimeInterval(1) && ownedGap?.timestamp == nil &&
+        ownedGap?.model == nil && ownedGap?.counts?.total == 700 && unboundGap?.usageUpperBound == ownedGap?.usageUpperBound &&
+        unboundGap?.accountID == nil && unboundGap?.model == nil && unboundGap?.timestamp == nil,
+        "cumulative gaps keep only their snapshot time bound without inventing usage time, model or account")
+    let warmGapReader = TokenUsageHistoryReader(home: gapHome, cacheURL: gapCache)
+    let warmGaps = warmGapReader.read(now: now)
+    check(warmGaps.records == gaps.records && warmGaps.unboundRecords == gaps.unboundRecords && warmGapReader.bytesRead == 0,
+        "owned and unknown-account gap bounds survive warm cache loading without reading rollout bytes")
+    var oldCache = try JSONSerialization.jsonObject(with: Data(contentsOf: gapCache)) as! [String: Any]
+    oldCache["version"] = 3
+    var oldFiles = oldCache["files"] as! [String: [String: Any]]
+    for (path, var file) in oldFiles {
+        var parser = file["parser"] as! [String: Any]
+        parser["records"] = (parser["records"] as! [[String: Any]]).map { record in
+            var record = record; record.removeValue(forKey: "usageUpperBound"); return record
+        }
+        file["parser"] = parser; oldFiles[path] = file
+    }
+    oldCache["files"] = oldFiles
+    try JSONSerialization.data(withJSONObject: oldCache).write(to: gapCache)
+    let rebuiltGapReader = TokenUsageHistoryReader(home: gapHome, cacheURL: gapCache)
+    let rebuiltGaps = rebuiltGapReader.read(now: now)
+    let rebuiltCache = try JSONSerialization.jsonObject(with: Data(contentsOf: gapCache)) as! [String: Any]
+    check(rebuiltGapReader.bytesRead > 0 && rebuiltGaps.records == gaps.records && rebuiltGaps.unboundRecords == gaps.unboundRecords &&
+        rebuiltCache["version"] as? Int == 4,
+        "version-three caches are rebuilt from rollout snapshots to recover cumulative gap bounds")
+    var noTimeData = try line("session_meta", ["id": "undated-gap", "creator_account_id": "account-a"], oldGapAt)
+    noTimeData += try line("turn_context", ["model": "gpt-6.1-sol"], oldGapAt)
+    noTimeData += try line("event_msg", tokens(100, last: 100, used: 0, reset: reset), oldGapAt)
+    noTimeData += try line("event_msg", tokens(900, last: 100, used: 30, reset: reset), nil)
+    try noTimeData.write(to: gapSessions.appendingPathComponent("undated-gap.jsonl"))
+    let undatedGap = rebuiltGapReader.read(now: now).records.first { $0.threadID == "undated-gap" && $0.id.hasSuffix(":gap") }
+    check(undatedGap?.counts?.total == 700 && undatedGap?.timestamp == nil && undatedGap?.usageUpperBound == nil,
+        "a cumulative snapshot without an event timestamp never borrows a filesystem or session time bound")
 
     let fork = sessions.appendingPathComponent("fork.jsonl")
     var copied = try line("session_meta", ["id": "thread-fork", "creator_account_id": "account-a", "forked_from_id": "thread-a"], start)
@@ -428,6 +553,49 @@ import SQLite3
     scopedSnapshot.unboundRecords[0].timestamp = nil
     check(TokenUsageHistoryAnalysis(snapshot: scopedSnapshot, now: now, calendar: calendar).fiveHourEstimate.value == nil,
         "undated unknown ownership cannot be treated as unrelated history")
+    for unknownAccount in [false, true] {
+        for (bound, eligible) in [(start.addingTimeInterval(-20 * 86400), true),
+            (pair[0].timestamp!.addingTimeInterval(-1), true), (pair[0].timestamp!, false),
+            (start.addingTimeInterval(5000), false), (now.addingTimeInterval(3600), false), (nil, false)] as [(Date?, Bool)] {
+            var gap = untimed
+            gap.accountID = unknownAccount ? nil : "account-a"
+            gap.model = nil; gap.serviceTier = nil; gap.usageUpperBound = bound
+            let snapshot = TokenUsageHistorySnapshot(accountID: "account-a",
+                records: Array(pair.prefix(2)) + (unknownAccount ? [] : [gap]),
+                unboundTokens: unknownAccount ? 800 : 0, unboundRecords: unknownAccount ? [gap] : [],
+                currentPlan: "plus", capturedAt: now, isLoaded: true)
+            let scoped = TokenUsageHistoryAnalysis(snapshot: snapshot, now: now, calendar: calendar)
+            let reason = unknownAccount ? "部分记录账户未知" : "部分 Token 时间未知"
+            check((scoped.fiveHourEstimate.value != nil) == eligible && (scoped.weeklyEstimate.value != nil) == eligible &&
+                scoped.fiveHourEstimate.reason == (eligible ? "" : reason) && scoped.weeklyEstimate.reason == (eligible ? "" : reason),
+                "gap bounds scope both estimates conservatively: unknownAccount=\(unknownAccount), bound=\(String(describing: bound)), eligible=\(eligible)")
+        }
+    }
+    scopedSnapshot.unboundRecords = []
+    check(TokenUsageHistoryAnalysis(snapshot: scopedSnapshot, now: now, calendar: calendar).fiveHourEstimate.reason == "部分记录账户未知" &&
+        TokenUsageHistoryAnalysis(snapshot: scopedSnapshot, now: now, calendar: calendar).weeklyEstimate.value == nil,
+        "an aggregate unknown-account total without detailed records still blocks both estimates")
+    var previousPair = [priorBase, priorCost]
+    for index in previousPair.indices { previousPair[index].weekly?.resetsAt = previousDay.addingTimeInterval(6 * 86400) }
+    var betweenPeriods = untimed
+    betweenPeriods.usageUpperBound = pair[0].timestamp!.addingTimeInterval(-1)
+    let scopedPeriods = summarize(previousPair + Array(pair.prefix(2)) + [betweenPeriods])
+    check(scopedPeriods.fiveHourEstimate.value != nil && scopedPeriods.fiveHourEstimate.previousValue == nil &&
+        scopedPeriods.weeklyEstimate.value != nil && scopedPeriods.weeklyEstimate.previousValue == nil &&
+        scopedPeriods.fiveHourEstimate.reason.isEmpty && scopedPeriods.weeklyEstimate.reason.isEmpty,
+        "a gap known before current samples may still invalidate previous samples independently")
+    let insufficientCurrent = summarize(previousPair + threshold + [betweenPeriods])
+    check(insufficientCurrent.fiveHourEstimate.value == nil && insufficientCurrent.weeklyEstimate.value == nil &&
+        insufficientCurrent.fiveHourEstimate.reason == "有效样本不足" && insufficientCurrent.weeklyEstimate.reason == "有效样本不足",
+        "previous-period gap failures do not replace the current reason after an old gap is excluded")
+    var currentUnbound = untimed; currentUnbound.timestamp = start.addingTimeInterval(5000)
+    let currentUnboundSnapshot = TokenUsageHistorySnapshot(accountID: "account-a", records: previousPair + Array(pair.prefix(2)),
+        unboundTokens: 800, unboundRecords: [currentUnbound], currentPlan: "plus", capturedAt: now, isLoaded: true)
+    let currentBlocked = TokenUsageHistoryAnalysis(snapshot: currentUnboundSnapshot, now: now, calendar: calendar)
+    check(currentBlocked.fiveHourEstimate.value == nil && currentBlocked.fiveHourEstimate.previousValue != nil &&
+        currentBlocked.weeklyEstimate.value == nil && currentBlocked.weeklyEstimate.previousValue != nil &&
+        currentBlocked.fiveHourEstimate.reason == "部分记录账户未知" && currentBlocked.weeklyEstimate.reason == "部分记录账户未知",
+        "a current unknown-account record does not suppress unrelated previous-period samples")
     let boundaryDay = calendar.date(byAdding: .day, value: -7, to: start)!
     let boundaryReset = boundaryDay.addingTimeInterval(28 * 3600)
     let boundary = record("cross-period", at: boundaryDay.addingTimeInterval(25 * 3600), input: 900,
@@ -525,12 +693,30 @@ import SQLite3
     menuView.menuDidClose()
     check(menuView.visibleMetricHoverText == nil, "closing the menu hides metric hover panels")
 
+    var fiveHourOnlyRecords = pair
+    for index in fiveHourOnlyRecords.indices { fiveHourOnlyRecords[index].weekly = nil }
+    let fiveHourOnly = summarize(fiveHourOnlyRecords)
+    menuView.update(fiveHourOnly)
+    menuView.hoverMetric(at: NSPoint(x: 240, y: 70))
+    check(menuView.visibleMetricHoverText == L10n.text("5小时真实额度估算") + "\n8.8K Token",
+        "a five-hour-only row uses the available width without leaving a hidden weekly hover")
+    menuView.update(weighted)
+    var weeklyOnlyRecords = pair
+    for index in weeklyOnlyRecords.indices { weeklyOnlyRecords[index].fiveHour = nil }
+    let weeklyOnly = summarize(weeklyOnlyRecords)
+    check(weeklyOnly.fiveHourEstimate.value == nil && weeklyOnly.weeklyEstimate.value != nil,
+        "the menu transition fixture has a weekly estimate and no five-hour estimate")
     let nativeMenu = NSMenu()
     let nativeItem = NSMenuItem(); nativeItem.view = menuView; nativeMenu.addItem(nativeItem)
-    let trackingCheck = UsageMenuTrackingCheck(menu: nativeMenu, view: menuView)
+    let followingItem = NSMenuItem()
+    let followingView = NSTextField(labelWithString: L10n.text("设置…"))
+    followingView.frame = NSRect(x: 0, y: 0, width: 304, height: 24)
+    followingItem.view = followingView; nativeMenu.addItem(followingItem)
+    let trackingCheck = UsageMenuTrackingCheck(menu: nativeMenu, view: menuView, followingView: followingView,
+        availableAnalysis: weighted, unavailableAnalysis: summarize(threshold), weeklyOnlyAnalysis: weeklyOnly)
     trackingCheck.run()
     for (value, name) in trackingCheck.results { check(value, name) }
-    check(trackingCheck.results.count == 5 && chart.visibleHoverText == nil,
+    check(trackingCheck.results.count == 16 && chart.visibleHoverText == nil,
         "actual menu tracking executes hover checks and closes its panel on dismissal")
 
     try Data("{\"tokens\":{\"account_id\":\"account-b\"}}".utf8).write(to: home.appendingPathComponent("auth.json"))

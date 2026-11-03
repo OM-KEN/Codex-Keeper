@@ -101,6 +101,8 @@ struct TokenUsageRecord: Codable, Equatable, Identifiable {
     var threadID: String
     var accountID: String?
     var timestamp: Date?
+    // Cumulative usage already existed by this snapshot; this is not its exact usage time.
+    var usageUpperBound: Date? = nil
     var model: String?
     var counts: TokenUsageCounts?
     var requestInput: Int?
@@ -330,14 +332,18 @@ struct TokenUsageHistoryAnalysis {
         guard snapshot.currentPlan == "plus" else { return TokenUsageEstimate(reason: "尚未确认 Plus 套餐") }
         guard let group else { return TokenUsageEstimate(reason: "当前模型或速度档位未知") }
         guard snapshot.unreadableFiles == 0 else { return TokenUsageEstimate(reason: "部分本机记录无法读取") }
-        // Undated unknown ownership cannot be scoped. Dated old records only
-        // disqualify the windows they overlap, not every future estimate.
-        guard snapshot.unboundTokens == 0 || (!snapshot.unboundRecords.isEmpty &&
-            snapshot.unboundRecords.allSatisfy({ $0.timestamp != nil })) else {
+        guard snapshot.unboundTokens == 0 || !snapshot.unboundRecords.isEmpty else {
             return TokenUsageEstimate(reason: "部分记录账户未知")
         }
-        func sample(_ start: Date, _ end: Date) -> (value: Double?, tokens: Int?, count: Int) {
+        func mayAffect(_ record: TokenUsageRecord, first: Date, last: Date) -> Bool {
+            guard (record.counts?.total ?? 0) > 0 else { return false }
+            if let at = record.timestamp { return at >= first && at <= last }
+            // Only a snapshot strictly before the baseline can rule out overlap.
+            return record.usageUpperBound.map { $0 >= first } ?? true
+        }
+        func sample(_ start: Date, _ end: Date) -> (value: Double?, tokens: Int?, count: Int, reason: String) {
             var cost = 0.0, tokens = 0.0, percent = 0.0, samples = 0
+            var unknownAccount = false, unknownTime = false, unpriced = false, incomplete = false
             for window in windows where window.kind == kind {
                 let observations: [TokenUsageRecord]
                 if kind == .fiveHour {
@@ -350,13 +356,17 @@ struct TokenUsageHistoryAnalysis {
                 // The service may omit the plan on individual usage events. Require
                 // positive Plus evidence for this window and reject conflicting plans.
                 let plans = observations.compactMap(\.planType)
-                guard window.complete, observations.count >= 2, !plans.isEmpty,
+                guard observations.count >= 2, !plans.isEmpty,
                       plans.allSatisfy({ $0 == "plus" }),
                       observations.allSatisfy({ $0.accountID == snapshot.accountID }) else { continue }
                 let first = observations.first!.timestamp!, lastAt = observations.last!.timestamp!
-                guard !snapshot.unboundRecords.contains(where: { record in
-                    record.timestamp.map { $0 >= first && $0 <= lastAt } ?? true
-                }) else { continue }
+                if snapshot.unboundRecords.contains(where: { mayAffect($0, first: first, last: lastAt) }) {
+                    unknownAccount = true; continue
+                }
+                if snapshot.records.contains(where: { $0.timestamp == nil && mayAffect($0, first: first, last: lastAt) }) {
+                    unknownTime = true; continue
+                }
+                guard window.complete else { incomplete = true; continue }
                 var pending = 0.0, pairedCost = 0.0, pendingTokens = 0.0, pairedTokens = 0.0, consumed = 0.0
                 var pendingMatches = true
                 var complete = true
@@ -365,7 +375,7 @@ struct TokenUsageHistoryAnalysis {
                 for record in observations.dropFirst() {
                     if let tokens = record.counts, tokens.total > 0 {
                         if let price = record.cost { pending += price; pendingTokens += Double(tokens.total) }
-                        else { complete = false }
+                        else { complete = false; unpriced = true }
                         if record.calibrationGroup != group { pendingMatches = false }
                     }
                     let used = kind == .fiveHour ? record.fiveHour!.usedPercent : record.weekly!.usedPercent
@@ -381,23 +391,17 @@ struct TokenUsageHistoryAnalysis {
                     }
                     last = max(last, used)
                 }
-                // Unknown-time records cannot be assigned to any window; don't use a partial numerator.
-                guard complete, consumed > 25,
-                      !snapshot.records.contains(where: { $0.timestamp == nil && ($0.counts?.total ?? 0) > 0 }),
-                      pairedCost > 0 else { continue }
+                guard complete, consumed > 25, pairedCost > 0 else { continue }
                 cost += pairedCost; tokens += pairedTokens; percent += consumed; samples += 1
             }
+            let reason = unknownAccount ? "部分记录账户未知" : unknownTime ? "部分 Token 时间未知" :
+                unpriced ? "部分 Token 未完整定价" : incomplete ? "窗口记录不完整" : "有效样本不足"
             return (percent > 0 ? cost / (percent / 100) : nil,
-                percent > 0 ? Int((tokens / (percent / 100)).rounded()) : nil, samples)
+                percent > 0 ? Int((tokens / (percent / 100)).rounded()) : nil, samples, reason)
         }
         let current = sample(start, end), previous = sample(previousStart, previousEnd)
-        var reason = "同模型同档位的有效样本不足"
-        if snapshot.records.contains(where: { $0.timestamp == nil && ($0.counts?.total ?? 0) > 0 }) { reason = "部分 Token 时间未知" }
-        else if snapshot.records.contains(where: { $0.timestamp.map { $0 >= start && $0 <= end } == true && ($0.counts?.total ?? 0) > 0 && $0.cost == nil }) {
-            reason = "部分 Token 未完整定价"
-        } else if windows.contains(where: { $0.kind == kind && !$0.complete }) { reason = "窗口记录不完整" }
         return TokenUsageEstimate(value: current.value, previousValue: previous.value, tokens: current.tokens,
-            sampleCount: current.count, previousSampleCount: previous.count, reason: current.value == nil ? reason : "")
+            sampleCount: current.count, previousSampleCount: previous.count, reason: current.value == nil ? current.reason : "")
     }
 }
 

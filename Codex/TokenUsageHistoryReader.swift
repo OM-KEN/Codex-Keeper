@@ -171,7 +171,7 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
                 fiveHour: quotas.0, weekly: quotas.1, planType: plan))
             if let unknown {
                 records.append(TokenUsageRecord(id: id + ":gap", threadID: threadID, accountID: accountID,
-                    timestamp: nil, model: nil, counts: unknown, requestInput: nil,
+                    timestamp: nil, usageUpperBound: at, model: nil, counts: unknown, requestInput: nil,
                     fiveHour: nil, weekly: nil, planType: nil))
             }
         }
@@ -224,7 +224,7 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
         }
     }
     private struct Cache: Codable {
-        var version = 3
+        var version = 4
         var roots: [String]
         var files: [String: Cursor]
     }
@@ -246,7 +246,7 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
         if !loadedCache {
             loadedCache = true
             if let cacheURL, let data = try? Data(contentsOf: cacheURL),
-               let cache = try? JSONDecoder().decode(Cache.self, from: data), cache.version == 3,
+               let cache = try? JSONDecoder().decode(Cache.self, from: data), cache.version == 4,
                cache.roots == homes.map(\.path) { cursors = cache.files }
         }
         let identity = try? AppServerUsageProvider.authenticationIdentity(home: home)

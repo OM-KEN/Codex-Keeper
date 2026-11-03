@@ -260,9 +260,11 @@ private struct TokenUsageMetrics: View {
                     Spacer(minLength: 0)
                 }
             }.help(TokenUsageHints.today(analysis))
-            HStack(spacing: 12) {
-                metric(analysis.fiveHourEstimate, weekly: false)
-                metric(analysis.weeklyEstimate, weekly: true)
+            if analysis.fiveHourEstimate.value != nil || analysis.weeklyEstimate.value != nil {
+                HStack(spacing: 12) {
+                    if analysis.fiveHourEstimate.value != nil { metric(analysis.fiveHourEstimate, weekly: false) }
+                    if analysis.weeklyEstimate.value != nil { metric(analysis.weeklyEstimate, weekly: true) }
+                }
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -307,14 +309,16 @@ private struct TokenUsageMetrics: View {
     override func viewWillMove(toWindow newWindow: NSWindow?) { if newWindow == nil { dismissHover() }; super.viewWillMove(toWindow: newWindow) }
     func dismissHover() { hoverPanel.hide() }
     func hover(at point: NSPoint) {
-        let top = isFlipped ? point.y < bounds.height - 24 : point.y > 24
+        guard bounds.contains(point) else { dismissHover(); return }
         let analysis = rootView.analysis
+        let hasFiveHour = analysis.fiveHourEstimate.value != nil, hasWeekly = analysis.weeklyEstimate.value != nil
+        let estimateRow = (hasFiveHour || hasWeekly) && (isFlipped ? point.y >= bounds.height - 24 : point.y <= 24)
         let text: String
-        if top {
+        if !estimateRow {
             let tpsRect = tpsHoverRect
             text = !tpsRect.isEmpty && tpsRect.insetBy(dx: -3, dy: -5).contains(point) ? TokenUsageHints.tps : TokenUsageHints.today(analysis)
         } else {
-            let weekly = point.x > bounds.midX
+            let weekly = !hasFiveHour || (hasWeekly && point.x > bounds.midX)
             text = TokenUsageHints.estimate(weekly ? analysis.weeklyEstimate : analysis.fiveHourEstimate, weekly: weekly)
         }
         hoverPanel.show(text, at: point, in: self)
@@ -381,6 +385,15 @@ private struct TokenUsageMetrics: View {
     func update(_ analysis: TokenUsageHistoryAnalysis) {
         metrics.update(analysis)
         chart.days = analysis.days
+        let metricsHeight: CGFloat = analysis.fiveHourEstimate.value != nil || analysis.weeklyEstimate.value != nil ? 78 : 52
+        if metrics.frame.height != metricsHeight {
+            metrics.setFrameSize(NSSize(width: 272, height: metricsHeight))
+            chart.setFrameOrigin(NSPoint(x: 16, y: metrics.frame.maxY + 4))
+            setFrameSize(NSSize(width: 304, height: chart.frame.maxY + 14))
+            lastPointer = nil
+            chart.dismissHover()
+            layoutSubtreeIfNeeded()
+        }
     }
 }
 
@@ -418,10 +431,14 @@ struct TokenUsageHistoryView: View {
             metric("今日 Token", analysis.todayTokens.map(TokenUsageFormat.compact) ?? "—",
                 hint: TokenUsageHints.today(analysis))
             metric("今日 tps", TokenUsageFormat.tps(analysis.todaySpeed.value), hint: TokenUsageHints.tps)
-            metric("5小时真实额度估算", analysis.fiveHourEstimate.value.map(TokenUsageFormat.dollars) ?? "—",
-                change: analysis.fiveHourEstimate.change, hint: TokenUsageHints.estimate(analysis.fiveHourEstimate, weekly: false))
-            metric("每周真实额度估算", analysis.weeklyEstimate.value.map(TokenUsageFormat.dollars) ?? "—",
-                change: analysis.weeklyEstimate.change, hint: TokenUsageHints.estimate(analysis.weeklyEstimate, weekly: true))
+            if let value = analysis.fiveHourEstimate.value {
+                metric("5小时真实额度估算", TokenUsageFormat.dollars(value),
+                    change: analysis.fiveHourEstimate.change, hint: TokenUsageHints.estimate(analysis.fiveHourEstimate, weekly: false))
+            }
+            if let value = analysis.weeklyEstimate.value {
+                metric("每周真实额度估算", TokenUsageFormat.dollars(value),
+                    change: analysis.weeklyEstimate.change, hint: TokenUsageHints.estimate(analysis.weeklyEstimate, weekly: true))
+            }
         }
     }
     private var trend: some View {
