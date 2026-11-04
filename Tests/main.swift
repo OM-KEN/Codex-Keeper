@@ -15,6 +15,7 @@ import Darwin
         if CommandLine.arguments.contains("--token-history-only") {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-token-history-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }
+            try await checkTokenHistoryObserverGeneration(check, root: root.appendingPathComponent("observer-generation"))
             try checkTokenUsageHistory(check, root: root)
             print("\(count - failed)/\(count) token history checks passed")
             if failed > 0 { exit(1) }
@@ -23,6 +24,16 @@ import Darwin
         if CommandLine.arguments.contains("--timeline-resume-only") {
             checkTimelineResumeHistory(check)
             print("\(count - failed)/\(count) timeline resume checks passed")
+            if failed > 0 { exit(1) }
+            return
+        }
+        if CommandLine.arguments.contains("--session-incremental-only") {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("keeper-session-incremental-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try checkSessionIncrementalReads(check, root: root)
+            try await checkSessionWatcherLifecycle(check, home: root.appendingPathComponent("watcher-lifecycle"))
+            checkImportantUpdateWindowRelease(check)
+            print("\(count - failed)/\(count) session incremental checks passed")
             if failed > 0 { exit(1) }
             return
         }
@@ -3399,10 +3410,14 @@ import Darwin
         try await checkUsagePollingAndDrift(check, root: temp.appendingPathComponent("polling-regression"))
         try await checkPassiveUsage(check, root: temp.appendingPathComponent("passive-usage-regression"))
         try checkSessionIncrementalReads(check, root: temp.appendingPathComponent("incremental-sessions"))
+        try await checkSessionWatcherLifecycle(check, home: temp.appendingPathComponent("session-watcher-lifecycle"))
         try await checkIgnoredPauseAppState(check, home: temp.appendingPathComponent("ignored-state"))
+        // Complete observer continuations before native menu tracking changes the main run loop.
+        try await checkTokenHistoryObserverGeneration(check, root: temp.appendingPathComponent("token-history-observer"))
         try checkNativeMenuQuotaUpdates(check, root: temp.appendingPathComponent("native-menu-updates"))
         try await checkDisabledMenu(check, root: temp.appendingPathComponent("disabled-menu"))
         try checkTokenUsageHistory(check, root: temp.appendingPathComponent("token-history"))
+        checkImportantUpdateWindowRelease(check)
         print("\(count - failed)/\(count) regression checks passed")
         if failed > 0 { exit(1) }
     }

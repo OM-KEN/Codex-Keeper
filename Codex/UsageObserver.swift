@@ -49,6 +49,7 @@ final class UsageObserver: ObservableObject {
     @Published private(set) var snapshot: UsageSnapshot?
     @Published private(set) var displaySnapshot: UsageSnapshot?
     var onPassiveChange: (() -> Void)?
+    var onRolloutPathsChanged: (([String], Bool) -> Void)?
     private var passiveSnapshot: UsageSnapshot?
     private(set) var passiveRecovery: (before: UsageSnapshot, after: UsageSnapshot)?
     private var passiveMonitor: RolloutUsageMonitor?
@@ -120,7 +121,12 @@ final class UsageObserver: ObservableObject {
     func startPassiveMonitoring() {
         guard !suspended, passiveMonitor == nil else { return }
         let generation = self.generation
-        passiveMonitor = RolloutUsageMonitor(home: codexHome, now: now) { [weak self] readings, changed in
+        passiveMonitor = RolloutUsageMonitor(home: codexHome, now: now, pathsChanged: { [weak self] paths, fullRescan in
+            Task { @MainActor in
+                guard let self, self.generation == generation else { return }
+                self.onRolloutPathsChanged?(paths, fullRescan)
+            }
+        }) { [weak self] readings, changed in
             Task { @MainActor in
                 guard let self, self.generation == generation else { return }
                 self.receivePassive(readings, authenticationChanged: changed)

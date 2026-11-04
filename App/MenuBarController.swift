@@ -3,7 +3,7 @@ import SwiftUI
 import Combine
 import UserNotifications
 
-@MainActor final class MenuBarController: NSObject, NSMenuDelegate, UNUserNotificationCenterDelegate {
+@MainActor final class MenuBarController: NSObject, NSMenuDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let statusQuotaView = MenuBarQuotaView()
     private let menu = NSMenu()
@@ -22,6 +22,11 @@ import UserNotifications
     private var cliPathWindow: NSWindow?
     private var tasksWindow: NSWindow?
     private var tokenHistoryWindow: NSWindow?
+    private var settingsWindowFrame: NSRect?
+    private var aboutWindowFrame: NSRect?
+    private var cliPathWindowFrame: NSRect?
+    private var tasksWindowFrame: NSRect?
+    private var tokenHistoryWindowFrame: NSRect?
     private let appState = AppState()
     private let updateService = AppUpdateService()
     private var updateScheduled = false
@@ -120,6 +125,17 @@ import UserNotifications
         statusQuotaView.setHighlighted(false); quotaHost?.menuDidClose()
         tokenHistoryHost?.menuDidClose()
         scheduleImportantUpdatePrompt()
+    }
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === settingsWindow { settingsWindowFrame = window.frame; settingsWindow = nil }
+        else if window === aboutWindow { aboutWindowFrame = window.frame; aboutWindow = nil }
+        else if window === cliPathWindow { cliPathWindowFrame = window.frame; cliPathWindow = nil }
+        else if window === tasksWindow { tasksWindowFrame = window.frame; tasksWindow = nil }
+        else if window === tokenHistoryWindow { tokenHistoryWindowFrame = window.frame; tokenHistoryWindow = nil }
+        else { return }
+        window.contentView = nil
+        for index in window.titlebarAccessoryViewControllers.indices.reversed() { window.removeTitlebarAccessoryViewController(at: index) }
     }
     func shutdown() { tokenHistoryHost?.menuDidClose(); updateService.stop(); appState.tokenHistory.stop(); appState.execution.stopOwnedTasks() }
     func confirmQuit() -> Bool {
@@ -326,10 +342,12 @@ import UserNotifications
         if tokenHistoryWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 800),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.delegate = self
             window.title = L10n.text("Token 用量历史")
             window.contentView = NSHostingView(rootView: TokenUsageHistoryView(history: appState.tokenHistory))
             window.minSize = NSSize(width: 860, height: 720)
-            window.isReleasedWhenClosed = false; window.center()
+            window.isReleasedWhenClosed = false
+            if let frame = tokenHistoryWindowFrame { window.setFrame(frame, display: false) } else { window.center() }
             tokenHistoryWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -351,8 +369,10 @@ import UserNotifications
     private func openCLIPath() {
         if cliPathWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 200), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.delegate = self
             window.title = L10n.text("设置 Codex 路径")
-            window.center(); window.isReleasedWhenClosed = false
+            window.isReleasedWhenClosed = false
+            if let frame = cliPathWindowFrame { window.setFrame(frame, display: false) } else { window.center() }
             cliPathWindow = window
         }
         let previousPath = UserDefaults.standard.string(forKey: CodexLocator.fallbackPathKey)
@@ -417,13 +437,15 @@ import UserNotifications
         }
         if tasksWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 572, height: 340), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.delegate = self
             window.title = L10n.text("自动继续任务")
             let progress = NSTitlebarAccessoryViewController()
             progress.layoutAttribute = .right
             progress.view = NSHostingView(rootView: ResumeTasksProgressView(state: appState))
             progress.view.setFrameSize(NSSize(width: 140, height: 28))
             window.addTitlebarAccessoryViewController(progress)
-            window.center(); window.isReleasedWhenClosed = false
+            window.isReleasedWhenClosed = false
+            if let frame = tasksWindowFrame { window.setFrame(frame, display: false) } else { window.center() }
             tasksWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -439,9 +461,11 @@ import UserNotifications
     @objc func openKeeperSettings() {
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 540), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.delegate = self
             window.title = L10n.text("Codex Keeper 设置")
             window.contentView = NSHostingView(rootView: SettingsView())
-            window.center(); window.isReleasedWhenClosed = false
+            window.isReleasedWhenClosed = false
+            if let frame = settingsWindowFrame { window.setFrame(frame, display: false) } else { window.center() }
             window.collectionBehavior.insert(.moveToActiveSpace)
             settingsWindow = window
         }
@@ -451,9 +475,11 @@ import UserNotifications
     @objc private func openAbout() {
         if aboutWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 380), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.delegate = self
             window.title = L10n.text("关于 Codex Keeper")
             window.contentView = NSHostingView(rootView: AboutView(updateService: updateService))
-            window.center(); window.isReleasedWhenClosed = false
+            window.isReleasedWhenClosed = false
+            if let frame = aboutWindowFrame { window.setFrame(frame, display: false) } else { window.center() }
             window.collectionBehavior.insert(.moveToActiveSpace)
             aboutWindow = window
         }

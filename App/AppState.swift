@@ -90,9 +90,9 @@ import Network
             self.recompute(source: "usage")
         }
         usage.onPassiveChange = { [weak self] in self?.recompute(allowExecution: false, source: "passive_usage") }
+        usage.onRolloutPathsChanged = { [weak self] paths, fullRescan in self?.sessions.filesChanged(paths: paths, fullRescan: fullRescan) }
         sessions.onRefreshCompleted = { [weak self] in
             self?.usage.rescanPassive()
-            self?.tokenHistory.refresh()
             self?.recompute(source: "sessions")
         }
         self.execution.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
@@ -208,7 +208,7 @@ import Network
         if monitoring { execution.maintainKeepAlive(forceCheck: true) }
         environmentDay = Calendar.current.startOfDay(for: now())
         environmentTimeZone = Calendar.current.timeZone.identifier
-        tokenHistory.refresh()
+        tokenHistory.refreshIfDue()
         previousUsage = nil
         naturalRecoveries.removeAll()
         execution.invalidatePreparations(keepAlive: invalidateKeepAlive)
@@ -285,6 +285,7 @@ import Network
                 }
             }
             authenticationAccountID = currentAccount
+            tokenHistory.authenticationDidChange(to: currentAccount)
         }
         observedAuthentication = authentication
         let previous = Dictionary(observedSessions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })

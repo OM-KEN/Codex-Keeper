@@ -235,6 +235,26 @@ final class RolloutUsageReader {
     }
 }
 
+/// One fixed coalescing window bounds sustained writes without postponing their delivery indefinitely.
+struct RolloutEventBatch {
+    private var paths = Set<String>()
+    private var fullRescan = false
+    private var pending = false
+
+    mutating func add(paths: [String], fullRescan: Bool = false) -> Bool {
+        let schedule = !pending
+        pending = true; self.fullRescan = self.fullRescan || fullRescan
+        if self.fullRescan { self.paths.removeAll() } else { self.paths.formUnion(paths) }
+        return schedule
+    }
+    mutating func take() -> (paths: [String], fullRescan: Bool)? {
+        guard pending else { return nil }
+        let result = (paths.sorted(), fullRescan)
+        self = RolloutEventBatch()
+        return result
+    }
+}
+
 /// One recursive native stream discovers new date directories, new threads and restored rollouts.
 /// The stream is registered before the initial bounded tail read; rescans also cover delayed DB registration.
 final class RolloutUsageMonitor {
@@ -246,11 +266,15 @@ final class RolloutUsageMonitor {
     private var stream: FSEventStreamRef?
     private var running = false
     private var retry: DispatchWorkItem?
+    private var pendingEvents = RolloutEventBatch()
+    private var eventDelivery: DispatchWorkItem?
+    private let pathsChanged: ([String], Bool) -> Void
     private var fileWatches: [String: (source: DispatchSourceFileSystemObject, inode: UInt64)] = [:]
 
-    init(home: URL, now: @escaping () -> Date = Date.init, receive: @escaping ([PassiveUsageReading], Bool) -> Void) {
+    init(home: URL, now: @escaping () -> Date = Date.init, pathsChanged: @escaping ([String], Bool) -> Void = { _, _ in },
+         receive: @escaping ([PassiveUsageReading], Bool) -> Void) {
         self.home = home.resolvingSymlinksInPath().standardizedFileURL
-        self.reader = RolloutUsageReader(home: home, now: now); self.receive = receive
+        self.reader = RolloutUsageReader(home: home, now: now); self.receive = receive; self.pathsChanged = pathsChanged
         queue.setSpecific(key: queueKey, value: true)
     }
     deinit { stop() }
@@ -274,8 +298,8 @@ final class RolloutUsageMonitor {
                     kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagRootChanged)
                 let fullRescan = (0..<count).contains { flags[$0] & dropped != 0 }
                 guard fullRescan || !relevant.isEmpty else { return }
-                monitor.scan(paths: fullRescan ? [monitor.home.path] : relevant)
-            }, &context, [home.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.05,
+                monitor.enqueue(paths: relevant, fullRescan: fullRescan)
+            }, &context, [home.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.2,
                 FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer))
             if let stream { FSEventStreamSetDispatchQueue(stream, queue); FSEventStreamStart(stream) }
             scan()
@@ -285,12 +309,24 @@ final class RolloutUsageMonitor {
     func stop() {
         let close = { [self] in
             running = false; retry?.cancel(); retry = nil
+            eventDelivery?.cancel(); eventDelivery = nil; pendingEvents = RolloutEventBatch()
             for watch in fileWatches.values { watch.source.cancel() }
             fileWatches.removeAll()
             if let stream { FSEventStreamStop(stream); FSEventStreamInvalidate(stream); FSEventStreamRelease(stream) }
             stream = nil
         }
         if DispatchQueue.getSpecific(key: queueKey) == true { close() } else { queue.sync(execute: close) }
+    }
+    private func enqueue(paths: [String], fullRescan: Bool = false) {
+        guard running, pendingEvents.add(paths: paths, fullRescan: fullRescan) else { return }
+        let delivery = DispatchWorkItem { [weak self] in
+            guard let self, self.running, let batch = self.pendingEvents.take() else { return }
+            self.eventDelivery = nil
+            self.pathsChanged(batch.paths, batch.fullRescan)
+            self.scan(paths: batch.fullRescan ? [self.home.path] : batch.paths)
+        }
+        eventDelivery = delivery
+        queue.asyncAfter(deadline: .now() + 0.2, execute: delivery)
     }
     private func scan(paths: [String] = [], retryRegistration: Bool = true) {
         guard running else { return }
@@ -329,7 +365,7 @@ final class RolloutUsageMonitor {
             // FSEvents may wait until a persistent writer closes the rollout.
             let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor,
                 eventMask: [.write, .extend, .rename, .delete, .revoke], queue: queue)
-            source.setEventHandler { [weak self] in self?.scan(paths: [path]) }
+            source.setEventHandler { [weak self] in self?.enqueue(paths: [path]) }
             source.setCancelHandler { Darwin.close(descriptor) }
             fileWatches[path] = (source, UInt64(info.st_ino))
             source.resume(); added.append(path)

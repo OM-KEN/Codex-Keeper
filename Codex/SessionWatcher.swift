@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import SQLite3
 import CryptoKit
+import Darwin
 
 private enum SessionRolloutReadError: Error { case invalidUTF8 }
 
@@ -96,6 +97,7 @@ final class SessionWatcher: ObservableObject {
         self.worker = worker ?? SessionScanWorker(codexHome: codexHome)
     }
     func start(interval: TimeInterval = 20) {
+        worker.invalidateDirectories(paths: [], fullRescan: true)
         suspended = false
         hasScanned = false
         scannedAt = nil
@@ -110,6 +112,7 @@ final class SessionWatcher: ObservableObject {
         suspended = true; generation += 1; refreshing = false
         timer?.invalidate(); timer = nil
     }
+    func filesChanged(paths: [String], fullRescan: Bool) { worker.invalidateDirectories(paths: paths, fullRescan: fullRescan) }
     func refresh() {
         guard !suspended, !refreshing else { return }
         refreshing = true
@@ -121,7 +124,7 @@ final class SessionWatcher: ObservableObject {
         Task {
             guard !suspended, self.generation == generation else { return }
             let result = await Task.detached { () -> ([SessionActivity], String?, AuthenticationObservation, [SessionScanDiagnostic]) in
-                let sessions = worker.read(watchedIDs: ids, watchedPaths: paths, ignoredPauses: ignored, protectedIDs: ids)
+                let sessions = worker.read(watchedIDs: ids, watchedPaths: paths, ignoredPauses: ignored, protectedIDs: ids, forceDirectoryScan: false)
                 let auth: AuthenticationObservation
                 do { auth = .known(try AppServerUsageProvider.authenticationIdentity(home: worker.codexHome)) }
                 catch { auth = .unreadable }
@@ -186,6 +189,113 @@ final class SessionWatcher: ObservableObject {
 
 }
 
+private struct SessionFileStamp: Equatable {
+    let inode: UInt64
+    let size: UInt64
+    let modified: Date
+    let changedSeconds: Int
+    let changedNanoseconds: Int
+    let isDirectory: Bool
+    let isRegularFile: Bool
+
+    init?(_ url: URL, followLinks: Bool = true) {
+        var info = stat()
+        let result = followLinks ? stat(url.path, &info) : lstat(url.path, &info)
+        guard result == 0 else { return nil }
+        inode = UInt64(info.st_ino); size = UInt64(max(0, info.st_size))
+        modified = Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+        changedSeconds = info.st_ctimespec.tv_sec; changedNanoseconds = info.st_ctimespec.tv_nsec
+        isDirectory = info.st_mode & S_IFMT == S_IFDIR; isRegularFile = info.st_mode & S_IFMT == S_IFREG
+    }
+}
+
+/// Cache directory membership, while native invalidations and a one-minute fallback refresh file order.
+/// Directory stamps are checked on every background pass, including already-known deep date folders.
+private final class SessionRolloutDirectoryIndex {
+    private struct Directory {
+        var stamp: SessionFileStamp
+        var children: [URL]
+        var files: Set<URL>
+    }
+    private let root: URL
+    private var directories: [URL: Directory] = [:]
+    private var files: [URL: Date] = [:]
+    private var ranked: [(url: URL, mtime: Date)] = []
+    private var orderChanged = true
+    private var dirtyDirectories: Set<URL> = []
+    private var dirtyFiles: Set<URL> = []
+    private var needsFullScan = true
+    private var lastFullScan: Date?
+    private(set) var listingCount = 0
+    private(set) var fullScanCount = 0
+
+    init(home: URL) { root = home.resolvingSymlinksInPath().appendingPathComponent("sessions").standardizedFileURL }
+
+    func invalidate(paths: [String], fullRescan: Bool) {
+        needsFullScan = needsFullScan || fullRescan
+        for raw in paths {
+            let url = URL(fileURLWithPath: raw).standardizedFileURL
+            guard url == root || url.path.hasPrefix(root.path + "/") else { continue }
+            if Self.isRollout(url) {
+                dirtyFiles.insert(url)
+                if files[url] == nil || SessionFileStamp(url) == nil { dirtyDirectories.insert(url.deletingLastPathComponent()) }
+            } else { dirtyDirectories.insert(url) }
+        }
+    }
+
+    func read(now: Date, force: Bool) -> [(url: URL, mtime: Date)] {
+        let full = force || needsFullScan || (lastFullScan.map { now < $0 || now.timeIntervalSince($0) >= 60 } ?? true)
+        if full {
+            directories.removeAll(); files.removeAll(); orderChanged = true
+            lastFullScan = now; fullScanCount += 1; needsFullScan = false
+        }
+        var visited = Set<URL>()
+        func visit(_ url: URL) {
+            guard let stamp = SessionFileStamp(url, followLinks: false), stamp.isDirectory else { return }
+            visited.insert(url)
+            if directories[url]?.stamp != stamp || dirtyDirectories.contains(url) {
+                let old = directories[url]?.files ?? []
+                let entries = (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+                listingCount += 1
+                var children: [URL] = [], current = Set<URL>()
+                for entry in entries {
+                    guard let info = SessionFileStamp(entry, followLinks: false) else { continue }
+                    if info.isDirectory { children.append(entry) }
+                    else if info.isRegularFile && Self.isRollout(entry) && RolloutFile.resolvedURL(entry) == entry {
+                        current.insert(entry)
+                        if files[entry] != info.modified { files[entry] = info.modified; orderChanged = true }
+                    }
+                }
+                for removed in old.subtracting(current) { files.removeValue(forKey: removed); orderChanged = true }
+                directories[url] = Directory(stamp: stamp, children: children, files: current)
+            }
+            for child in directories[url]?.children ?? [] { visit(child) }
+        }
+        visit(root)
+        for obsolete in directories.keys.filter({ !visited.contains($0) }) {
+            for file in directories[obsolete]?.files ?? [] { files.removeValue(forKey: file); orderChanged = true }
+            directories.removeValue(forKey: obsolete)
+        }
+        // The hot files remain current even when a native write notification is still queued.
+        let recent = ranked.prefix(20).map(\.url)
+        for url in dirtyFiles.union(recent) where files[url] != nil {
+            if let info = SessionFileStamp(url), info.isRegularFile, RolloutFile.resolvedURL(url) == url {
+                if files[url] != info.modified { files[url] = info.modified; orderChanged = true }
+            } else if files.removeValue(forKey: url) != nil { orderChanged = true }
+        }
+        dirtyDirectories.removeAll(); dirtyFiles.removeAll()
+        if orderChanged {
+            ranked = files.map { (url: $0.key, mtime: $0.value) }.sorted { $0.mtime == $1.mtime ? $0.url.path < $1.url.path : $0.mtime > $1.mtime }
+            orderChanged = false
+        }
+        return ranked
+    }
+
+    private static func isRollout(_ url: URL) -> Bool {
+        url.pathExtension == "jsonl" || (url.pathExtension == "zst" && url.deletingPathExtension().pathExtension == "jsonl")
+    }
+}
+
 /// Carries only parsed session facts across appends; no historical message text is retained.
 private struct SessionRolloutState {
     var id = ""
@@ -217,119 +327,117 @@ private struct SessionRolloutState {
     var retryingErrorAt: Date?
     var needsMtimeReplay = false
 
-    mutating func append(_ content: String, mtime: Date) {
-        for line in content.split(separator: "\n") {
-            guard let data = line.data(using: .utf8), let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = entry["payload"] as? [String: Any] else { continue }
-            let validTimestamp = UsageDecoder.timestamp(entry["timestamp"] as? String)
-            if validTimestamp == nil { needsMtimeReplay = true }
-            let timestamp = validTimestamp ?? mtime
-            if entry["type"] as? String == "session_meta" {
-                // A fork embeds its parent's metadata/history after the owner's first record.
-                // Never let those records change file identity or subagent eligibility.
-                guard id.isEmpty, let owner = payload["id"] as? String, UUID(uuidString: owner) != nil else { continue }
-                id = owner
-                cwd = payload["cwd"] as? String ?? ""
-                isSubagent = (payload["source"] as? [String: Any])?["subagent"] != nil
-                createdAt = UsageDecoder.timestamp(payload["timestamp"] as? String) ?? validTimestamp
-                if payload["forked_from_id"] == nil && payload["history_base"] == nil && !isSubagent { tokenTotal = 0 }
-                if payload["forked_from_id"] != nil || payload["history_base"] != nil || isSubagent {
-                    // Copied history may be re-stamped at the fork's first-record time.
-                    // Only subsequent events belong to the new session's execution.
-                    inheritedThrough = timestamp
-                }
-                continue
+    mutating func append(_ data: Data, mtime: Date) {
+        guard let entry = SessionRolloutDecoder.decode(data),
+              let payload = entry["payload"] as? [String: Any] else { return }
+        let validTimestamp = UsageDecoder.timestamp(entry["timestamp"] as? String)
+        if validTimestamp == nil { needsMtimeReplay = true }
+        let timestamp = validTimestamp ?? mtime
+        if entry["type"] as? String == "session_meta" {
+            // A fork embeds its parent's metadata/history after the owner's first record.
+            // Never let those records change file identity or subagent eligibility.
+            guard id.isEmpty, let owner = payload["id"] as? String, UUID(uuidString: owner) != nil else { return }
+            id = owner
+            cwd = payload["cwd"] as? String ?? ""
+            isSubagent = (payload["source"] as? [String: Any])?["subagent"] != nil
+            createdAt = UsageDecoder.timestamp(payload["timestamp"] as? String) ?? validTimestamp
+            if payload["forked_from_id"] == nil && payload["history_base"] == nil && !isSubagent { tokenTotal = 0 }
+            if payload["forked_from_id"] != nil || payload["history_base"] != nil || isSubagent {
+                // Copied history may be re-stamped at the fork's first-record time.
+                // Only subsequent events belong to the new session's execution.
+                inheritedThrough = timestamp
             }
-            if let inheritedThrough, timestamp <= inheritedThrough { continue }
-            if let threadID = (payload["thread_id"] ?? payload["threadId"]) as? String, threadID != id { continue }
-            activity = timestamp; sawActivity = true
-            let type = payload["type"] as? String ?? ""
-            let explicitTurn = (payload["turn_id"] ?? payload["turnId"]) as? String
-            if type == "task_started" { currentTurn = explicitTurn }
-            else if entry["type"] as? String == "turn_context", let explicitTurn { currentTurn = explicitTurn }
-            let eventTurn = explicitTurn ?? currentTurn
-            if let turn = eventTurn, let at = validTimestamp {
-                var evidence = turns[turn] ?? SessionTurnEvidence()
-                if type == "task_started" { evidence.startedAt = at }
-                if ResumeModelActivity.rollout(entry), evidence.startedAt != nil, evidence.responseAt == nil { evidence.responseAt = at }
-                if type == "task_complete" || type == "turn_aborted" {
-                    if type == "turn_aborted" { evidence.endedAt = at; evidence.terminal = .aborted }
-                    else { evidence.endedAt = evidence.endedAt ?? at; evidence.terminal = evidence.terminal ?? .completed }
-                    if let error = payload["error"], !(error is NSNull) {
-                        let text = String(describing: error)
-                        evidence.terminal = ResumeModelActivity.quotaError(text) ? .quotaStopped : .failed
-                    }
-                }
-                if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool != true {
-                    evidence.endedAt = at
-                    evidence.terminal = ResumeModelActivity.quotaError(String(describing: payload)) ? .quotaStopped : .failed
-                }
-                turns[turn] = evidence
-            }
-            if let limits = payload["rate_limits"] as? [String: Any],
-               (limits["limit_id"] as? String ?? limits["limitId"] as? String ?? "codex") == "codex" {
-                (five, weekly) = UsageDecoder.windows(limits)
-                if let reached = (limits["rate_limit_reached_type"] ?? limits["rateLimitReachedType"]) as? String, !reached.isEmpty {
-                    blockedAt = timestamp; quotaTurn = eventTurn; running = false
-                    blockedFive = five?.usedPercent ?? 0 >= 100 ? five?.resetsAt : nil
-                    blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
-                }
-            }
-            if type == "token_count", let promptAt = usagePromptAt, let at = validTimestamp, at >= promptAt,
-               let info = payload["info"] as? [String: Any],
-               let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
-                if let baseline = promptTokenBaseline, total > baseline,
-                   ((info["last_token_usage"] as? [String: Any])?["total_tokens"] as? Int ?? 0) > 0,
-                   let limits = payload["rate_limits"] as? [String: Any],
-                   (limits["limit_id"] as? String ?? limits["limitId"] as? String ?? "codex") == "codex",
-                   (limits["rate_limit_reached_type"] as? String ?? limits["rateLimitReachedType"] as? String ?? "").isEmpty {
-                    let windows = UsageDecoder.windows(limits)
-                    if windows.0 != nil || windows.1 != nil,
-                       (windows.0?.usedPercent ?? 0) < 100, (windows.1?.usedPercent ?? 0) < 100 {
-                        userUsage = UserUsageEvidence(promptAt: promptAt, usageAt: at,
-                            fiveHourResetAt: windows.0?.resetsAt, weeklyResetAt: windows.1?.resetsAt)
-                    }
-                }
-                // An initial token snapshot establishes a baseline; replayed usage is not new activity.
-                promptTokenBaseline = total
-            }
-            if type == "token_count", let info = payload["info"] as? [String: Any],
-               let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
-                tokenTotal = total
-            }
-            if ResumeModelActivity.rollout(entry) { assistantAt = timestamp; blockedAt = nil }
-            if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool == true { retryingErrorAt = timestamp; running = true; blockedAt = nil; quotaTurn = nil }
-            if type == "task_started" { running = true; startedAt = timestamp; blockedAt = nil; quotaTurn = nil }
+            return
+        }
+        if let inheritedThrough, timestamp <= inheritedThrough { return }
+        if let threadID = (payload["thread_id"] ?? payload["threadId"]) as? String, threadID != id { return }
+        activity = timestamp; sawActivity = true
+        let type = payload["type"] as? String ?? ""
+        let explicitTurn = (payload["turn_id"] ?? payload["turnId"]) as? String
+        if type == "task_started" { currentTurn = explicitTurn }
+        else if entry["type"] as? String == "turn_context", let explicitTurn { currentTurn = explicitTurn }
+        let eventTurn = explicitTurn ?? currentTurn
+        if let turn = eventTurn, let at = validTimestamp {
+            var evidence = turns[turn] ?? SessionTurnEvidence()
+            if type == "task_started" { evidence.startedAt = at }
+            if ResumeModelActivity.rollout(entry), evidence.startedAt != nil, evidence.responseAt == nil { evidence.responseAt = at }
             if type == "task_complete" || type == "turn_aborted" {
-                running = false; completedAt = timestamp
-                usagePromptAt = nil
-            }
-            let texts = (payload["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined(separator: "\n") ?? ""
-            if payload["role"] as? String == "user", !isSubagent, let at = validTimestamp,
-               let metadata = payload["internal_chat_message_metadata_passthrough"] as? [String: Any],
-               (metadata["content_item_kinds"] as? [String])?.contains("user.text") == true,
-               !texts.isEmpty, !texts.hasPrefix("<environment_context>"), !texts.hasPrefix("# AGENTS.md") {
-                usagePromptAt = at
-                promptTokenBaseline = tokenTotal
-            }
-            if type == "user_message" || (payload["role"] as? String == "user" && !texts.hasPrefix("<environment_context>") && !texts.hasPrefix("# AGENTS.md")) {
-                userAt = timestamp; blockedAt = nil; sawError = false
-            }
-            if payload["role"] as? String == "assistant", !texts.isEmpty {
-                assistantAt = timestamp; blockedAt = nil
-            }
-            if type == "turn_aborted" { blockedAt = nil; abortedAt = timestamp }
-            if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool != true {
-                sawError = true
-                running = false
-                usagePromptAt = nil
-                let text = String(data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), encoding: .utf8)?.lowercased() ?? ""
-                let quota = ["usage_limit_reached", "usage_limit_exceeded", "quota_exhausted", "insufficient_quota", "you’ve hit your usage limit", "you've hit your usage limit"].contains { text.contains($0) }
-                if quota {
-                    blockedAt = timestamp; quotaTurn = eventTurn
-                    blockedFive = five?.usedPercent ?? 0 >= 100 ? five?.resetsAt : nil
-                    blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
+                if type == "turn_aborted" { evidence.endedAt = at; evidence.terminal = .aborted }
+                else { evidence.endedAt = evidence.endedAt ?? at; evidence.terminal = evidence.terminal ?? .completed }
+                if let error = payload["error"], !(error is NSNull) {
+                    let text = String(describing: error)
+                    evidence.terminal = ResumeModelActivity.quotaError(text) ? .quotaStopped : .failed
                 }
+            }
+            if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool != true {
+                evidence.endedAt = at
+                evidence.terminal = ResumeModelActivity.quotaError(String(describing: payload)) ? .quotaStopped : .failed
+            }
+            turns[turn] = evidence
+        }
+        if let limits = payload["rate_limits"] as? [String: Any],
+           (limits["limit_id"] as? String ?? limits["limitId"] as? String ?? "codex") == "codex" {
+            (five, weekly) = UsageDecoder.windows(limits)
+            if let reached = (limits["rate_limit_reached_type"] ?? limits["rateLimitReachedType"]) as? String, !reached.isEmpty {
+                blockedAt = timestamp; quotaTurn = eventTurn; running = false
+                blockedFive = five?.usedPercent ?? 0 >= 100 ? five?.resetsAt : nil
+                blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
+            }
+        }
+        if type == "token_count", let promptAt = usagePromptAt, let at = validTimestamp, at >= promptAt,
+           let info = payload["info"] as? [String: Any],
+           let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
+            if let baseline = promptTokenBaseline, total > baseline,
+               ((info["last_token_usage"] as? [String: Any])?["total_tokens"] as? Int ?? 0) > 0,
+               let limits = payload["rate_limits"] as? [String: Any],
+               (limits["limit_id"] as? String ?? limits["limitId"] as? String ?? "codex") == "codex",
+               (limits["rate_limit_reached_type"] as? String ?? limits["rateLimitReachedType"] as? String ?? "").isEmpty {
+                let windows = UsageDecoder.windows(limits)
+                if windows.0 != nil || windows.1 != nil,
+                   (windows.0?.usedPercent ?? 0) < 100, (windows.1?.usedPercent ?? 0) < 100 {
+                    userUsage = UserUsageEvidence(promptAt: promptAt, usageAt: at,
+                        fiveHourResetAt: windows.0?.resetsAt, weeklyResetAt: windows.1?.resetsAt)
+                }
+            }
+            // An initial token snapshot establishes a baseline; replayed usage is not new activity.
+            promptTokenBaseline = total
+        }
+        if type == "token_count", let info = payload["info"] as? [String: Any],
+           let total = (info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int {
+            tokenTotal = total
+        }
+        if ResumeModelActivity.rollout(entry) { assistantAt = timestamp; blockedAt = nil }
+        if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool == true { retryingErrorAt = timestamp; running = true; blockedAt = nil; quotaTurn = nil }
+        if type == "task_started" { running = true; startedAt = timestamp; blockedAt = nil; quotaTurn = nil }
+        if type == "task_complete" || type == "turn_aborted" {
+            running = false; completedAt = timestamp
+            usagePromptAt = nil
+        }
+        let texts = (payload["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined(separator: "\n") ?? ""
+        if payload["role"] as? String == "user", !isSubagent, let at = validTimestamp,
+           let metadata = payload["internal_chat_message_metadata_passthrough"] as? [String: Any],
+           (metadata["content_item_kinds"] as? [String])?.contains("user.text") == true,
+           !texts.isEmpty, !texts.hasPrefix("<environment_context>"), !texts.hasPrefix("# AGENTS.md") {
+            usagePromptAt = at
+            promptTokenBaseline = tokenTotal
+        }
+        if type == "user_message" || (payload["role"] as? String == "user" && !texts.hasPrefix("<environment_context>") && !texts.hasPrefix("# AGENTS.md")) {
+            userAt = timestamp; blockedAt = nil; sawError = false
+        }
+        if payload["role"] as? String == "assistant", !texts.isEmpty {
+            assistantAt = timestamp; blockedAt = nil
+        }
+        if type == "turn_aborted" { blockedAt = nil; abortedAt = timestamp }
+        if (type == "error" || type == "turn_failed"), payload["will_retry"] as? Bool != true {
+            sawError = true
+            running = false
+            usagePromptAt = nil
+            let text = String(data: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), encoding: .utf8)?.lowercased() ?? ""
+            let quota = ["usage_limit_reached", "usage_limit_exceeded", "quota_exhausted", "insufficient_quota", "you’ve hit your usage limit", "you've hit your usage limit"].contains { text.contains($0) }
+            if quota {
+                blockedAt = timestamp; quotaTurn = eventTurn
+                blockedFive = five?.usedPercent ?? 0 >= 100 ? five?.resetsAt : nil
+                blockedWeekly = weekly?.usedPercent ?? 0 >= 100 ? weekly?.resetsAt : nil
             }
         }
     }
@@ -360,6 +468,7 @@ final class SessionRolloutReader {
         var inode: UInt64
         var offset: UInt64 = 0
         var mtime: Date
+        var stamp: SessionFileStamp?
         var state = SessionRolloutState()
         var pending = Data()
         var header = Data()
@@ -372,22 +481,24 @@ final class SessionRolloutReader {
     func read(url: URL, mtime: Date) throws -> SessionActivity? {
         let actual = RolloutFile.resolvedURL(url)
         if actual.pathExtension == "zst" {
-            let content = try RolloutFile.read(actual)
-            guard let text = String(data: content, encoding: .utf8) else { throw SessionRolloutReadError.invalidUTF8 }
             var state = SessionRolloutState()
-            state.append(text, mtime: mtime)
+            try RolloutFile.forEachLine(actual) { line in
+                try autoreleasepool {
+                    guard String(data: line, encoding: .utf8) != nil else { throw SessionRolloutReadError.invalidUTF8 }
+                    state.append(line, mtime: mtime)
+                }
+            }
             return state.snapshot(url: actual, mtime: mtime)
         }
         let url = actual
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard let stamp = SessionFileStamp(url), stamp.isRegularFile else { throw CocoaError(.fileReadUnknown) }
+        let inode = stamp.inode, size = stamp.size
         var cursor = cursors[url]
         var restart = cursor == nil || cursor?.inode != inode || size < (cursor?.offset ?? 0)
         if let old = cursor, !restart {
-            restart = old.state.needsMtimeReplay && old.mtime != mtime || (size == old.offset && old.mtime != mtime)
+            restart = old.state.needsMtimeReplay && old.mtime != mtime || (size == old.offset && (old.mtime != mtime || old.stamp != stamp))
             if !restart, !old.header.isEmpty {
                 restart = try handle.read(upToCount: old.header.count) != old.header
             }
@@ -409,9 +520,9 @@ final class SessionRolloutReader {
             while let end = data[start...].firstIndex(of: 10) {
                 next.pending.append(contentsOf: data[start..<end])
                 try autoreleasepool {
-                    guard let text = String(data: next.pending, encoding: .utf8) else { throw SessionRolloutReadError.invalidUTF8 }
+                    guard String(data: next.pending, encoding: .utf8) != nil else { throw SessionRolloutReadError.invalidUTF8 }
                     if next.header.isEmpty { next.header = next.pending; next.header.append(10) }
-                    next.state.append(text, mtime: mtime)
+                    next.state.append(next.pending, mtime: mtime)
                 }
                 next.pending = Data()
                 start = data.index(after: end)
@@ -422,12 +533,12 @@ final class SessionRolloutReader {
         // twice when the writer later appends its newline or the rest of that record.
         var preview = next.state
         if !next.pending.isEmpty {
-            guard let text = String(data: next.pending, encoding: .utf8) else { throw SessionRolloutReadError.invalidUTF8 }
-            preview.append(text, mtime: mtime)
+            guard String(data: next.pending, encoding: .utf8) != nil else { throw SessionRolloutReadError.invalidUTF8 }
+            preview.append(next.pending, mtime: mtime)
         }
         try handle.seek(toOffset: next.offset > 64 ? next.offset - 64 : 0)
         next.anchor = try handle.read(upToCount: Int(min(next.offset, 64))) ?? Data()
-        next.mtime = mtime
+        next.mtime = mtime; next.stamp = stamp
         cursors[url] = next
         return preview.snapshot(url: url, mtime: mtime)
     }
@@ -438,11 +549,19 @@ final class SessionScanWorker: @unchecked Sendable {
     let codexHome: URL
     private let quotaLogs: QuotaErrorLogProvider
     private let lock = NSLock()
+    private let invalidationLock = NSLock()
+    private var invalidatedPaths = Set<String>()
+    private var fullInvalidation = false
     private let parseRollout: (URL, Date) throws -> SessionActivity?
     private let rolloutReader = SessionRolloutReader()
-    private var cache: [URL: (mtime: Date, size: UInt64, inode: UInt64, activity: SessionActivity)] = [:]
-    init(codexHome: URL, parseRollout: ((URL, Date) throws -> SessionActivity?)? = nil) {
+    private var cache: [URL: (stamp: SessionFileStamp, activity: SessionActivity)] = [:]
+    private let directoryIndex: SessionRolloutDirectoryIndex
+    private let now: () -> Date
+    var directoryListingCount: Int { lock.lock(); defer { lock.unlock() }; return directoryIndex.listingCount }
+    var directoryFullScanCount: Int { lock.lock(); defer { lock.unlock() }; return directoryIndex.fullScanCount }
+    init(codexHome: URL, parseRollout: ((URL, Date) throws -> SessionActivity?)? = nil, now: @escaping () -> Date = Date.init) {
         self.codexHome = codexHome
+        self.now = now; directoryIndex = SessionRolloutDirectoryIndex(home: codexHome)
         self.parseRollout = parseRollout ?? rolloutReader.read
         quotaLogs = QuotaErrorLogProvider(codexHome: codexHome)
     }
@@ -450,8 +569,18 @@ final class SessionScanWorker: @unchecked Sendable {
     private var ignoredPauses: [String: BlockedSession] = [:]
     private var protectedIDs: Set<String> = []
     private var protectedPaths: [URL] = []
-    func read(watchedIDs: Set<String>, watchedPaths: [URL]? = nil, ignoredPauses: [String: BlockedSession]? = nil, protectedIDs: Set<String>? = nil) -> ([SessionActivity], String?, [SessionScanDiagnostic]) {
+    func invalidateDirectories(paths: [String], fullRescan: Bool = false) {
+        // The native callback can arrive on the main actor while a full parser/SQL read is running.
+        invalidationLock.lock(); defer { invalidationLock.unlock() }
+        invalidatedPaths.formUnion(paths); fullInvalidation = fullInvalidation || fullRescan
+    }
+    func read(watchedIDs: Set<String>, watchedPaths: [URL]? = nil, ignoredPauses: [String: BlockedSession]? = nil, protectedIDs: Set<String>? = nil, forceDirectoryScan: Bool = true) -> ([SessionActivity], String?, [SessionScanDiagnostic]) {
         lock.lock(); defer { lock.unlock() }
+        invalidationLock.lock()
+        let invalidations = Array(invalidatedPaths), fullRescan = fullInvalidation
+        invalidatedPaths.removeAll(); fullInvalidation = false
+        invalidationLock.unlock()
+        directoryIndex.invalidate(paths: invalidations, fullRescan: fullRescan)
         if let ignoredPauses { self.ignoredPauses = ignoredPauses }
         if let protectedIDs { self.protectedIDs = protectedIDs }
         if let watchedPaths { self.protectedPaths = watchedPaths }
@@ -475,7 +604,7 @@ final class SessionScanWorker: @unchecked Sendable {
         var currentPaths: [String: URL] = [:]
         do { currentPaths = try Self.currentRolloutPaths(codexHome: codexHome) }
         catch { errorMessage = error.localizedDescription; diagnose("state_database", error: error) }
-        var all = SessionWatcher.recentRollouts(codexHome: codexHome, limit: Int.max)
+        var all = directoryIndex.read(now: now(), force: forceDirectoryScan)
         for original in watchedPaths {
             let path = RolloutFile.resolvedURL(original)
             if !all.contains(where: { $0.url.resolvingSymlinksInPath() == path.resolvingSymlinksInPath() }) {
@@ -527,17 +656,14 @@ final class SessionScanWorker: @unchecked Sendable {
         var activities: [SessionActivity] = []
         for file in files {
             var activity: SessionActivity?
-            let attributes = try? FileManager.default.attributesOfItem(atPath: file.url.path)
-            let size = (attributes?[.size] as? NSNumber)?.uint64Value
-            let inode = (attributes?[.systemFileNumber] as? NSNumber)?.uint64Value
-            if let cached = cache[file.url], let size, let inode,
-               cached.mtime == file.mtime, cached.size == size, cached.inode == inode { activity = cached.activity }
+            let stamp = SessionFileStamp(file.url)
+            if let cached = cache[file.url], let stamp, cached.stamp == stamp { activity = cached.activity }
             else {
                 var parseError: Error?
-                do { activity = try parseRollout(file.url, file.mtime) }
+                do { activity = try parseRollout(file.url, stamp?.modified ?? file.mtime) }
                 catch { parseError = error }
-                if let parsed = activity {
-                    cache[file.url] = (file.mtime, size ?? 0, inode ?? 0, parsed)
+                if let parsed = activity, let stamp {
+                    cache[file.url] = (stamp, parsed)
                 } else {
                     if let id = SessionWatcher.rolloutThreadID(file.url), isolated(id) {
                         diagnose("ignored_rollout_parse", error: parseError, file: file.url)

@@ -50,8 +50,10 @@ SOURCES=(
     Codex/UsageObserver.swift
     Codex/RolloutUsageMonitor.swift
     Codex/TokenUsageHistoryReader.swift
+    Codex/TokenUsageHistoryStore.swift
     Codex/RolloutFile.swift
     Codex/SessionWatcher.swift
+    Codex/SessionRolloutDecoder.swift
     Codex/BlockedSessionDetector.swift
     UI/MenuSummaryView.swift
     UI/MenuBarQuotaView.swift

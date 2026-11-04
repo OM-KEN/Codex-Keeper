@@ -184,11 +184,13 @@ import Darwin
             throw error
         }
     }
+    var legacyEvidenceReadCount: Int { events.legacyReadCount }
     func restoreLegacyEvidence(for targets: [BlockedSession], boundAccounts: [String: String]) {
+        let missing = targets.filter { attempts.contains($0.episodeKey) && operations["legacy:" + $0.episodeKey] == nil }
+        guard !missing.isEmpty else { return }
         let metadata = events.legacyResumeAttempts()
-        for target in targets where attempts.contains(target.episodeKey) {
+        for target in missing {
             let id = "legacy:" + target.episodeKey
-            guard operations[id] == nil else { continue }
             let evidence = metadata[target.id]
             let record = ResumeOperation(id: id, batchID: id, accountID: evidence?.accountID ?? boundAccounts[target.id], target: target,
                 actionAt: evidence?.startedAt ?? target.blockedAt, phase: evidence?.confirmedAt == nil ? .checking : .continued,

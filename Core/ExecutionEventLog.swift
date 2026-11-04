@@ -1,9 +1,44 @@
 import Foundation
+import Darwin
 
 private enum ExecutionLogWrite { static let lock = NSLock() }
 
+private struct ExecutionLogStamp: Equatable {
+    var inode: UInt64
+    var size: Int64
+    var modifiedSeconds: Int
+    var modifiedNanoseconds: Int
+    var changedSeconds: Int
+    var changedNanoseconds: Int
+
+    init?(_ url: URL) {
+        var info = stat()
+        guard stat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        inode = UInt64(info.st_ino); size = info.st_size
+        modifiedSeconds = info.st_mtimespec.tv_sec; modifiedNanoseconds = info.st_mtimespec.tv_nsec
+        changedSeconds = info.st_ctimespec.tv_sec; changedNanoseconds = info.st_ctimespec.tv_nsec
+    }
+}
+
+private final class LegacyEvidenceCache {
+    let lock = NSLock()
+    var stamp: ExecutionLogStamp?
+    var records: [String: LegacyResumeAttempt] = [:]
+    var readCount = 0
+}
+
 struct ExecutionEventLog {
     let url: URL
+    private let legacyCache = LegacyEvidenceCache()
+    private let readLegacyData: (URL) throws -> Data
+
+    init(url: URL, readLegacyData: @escaping (URL) throws -> Data = { try Data(contentsOf: $0) }) {
+        self.url = url; self.readLegacyData = readLegacyData
+    }
+    var legacyReadCount: Int {
+        legacyCache.lock.lock(); defer { legacyCache.lock.unlock() }
+        return legacyCache.readCount
+    }
     /// A missing log is empty; unreadable or malformed evidence must not start an inactivity deadline.
     func resumeStarts() -> [String: Date]? {
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
@@ -42,18 +77,33 @@ struct ExecutionEventLog {
     }
 
     func legacyResumeAttempts() -> [String: LegacyResumeAttempt] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
+        legacyCache.lock.lock(); defer { legacyCache.lock.unlock() }
+        guard let stamp = ExecutionLogStamp(url) else {
+            legacyCache.stamp = nil; legacyCache.records = [:]; return [:]
+        }
+        if legacyCache.stamp == stamp { return legacyCache.records }
+        legacyCache.stamp = nil; legacyCache.records = [:]
+        legacyCache.readCount += 1
+        guard let data = try? readLegacyData(url), let text = String(data: data, encoding: .utf8),
+              ExecutionLogStamp(url) == stamp else { return [:] }
+        let fractional = ISO8601DateFormatter(); fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let ordinary = ISO8601DateFormatter()
         var result: [String: LegacyResumeAttempt] = [:]
         for line in text.split(separator: "\n") {
+            // Partial or malformed evidence cannot release a persisted submission guard.
             guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  row["kind"] as? String == "resume", row["operation_id"] == nil,
-                  let thread = row["thread_id"] as? String, let at = UsageDecoder.timestamp(row["at"] as? String) else { continue }
+                  let raw = row["at"] as? String,
+                  let at = fractional.date(from: raw) ?? ordinary.date(from: raw) else { return [:] }
+            guard row["kind"] as? String == "resume", row["operation_id"] == nil,
+                  let thread = row["thread_id"] as? String else { continue }
             if row["event"] as? String == "started" { result[thread] = LegacyResumeAttempt(startedAt: at) }
-            if row["event"] as? String == "confirmed", var record = result[thread] {
+            if row["event"] as? String == "confirmed", var record = result[thread], at >= record.startedAt {
                 record.confirmedAt = at; record.turnID = row["turn_id"] as? String; record.accountID = row["account_id"] as? String
                 result[thread] = record
             }
         }
+        guard ExecutionLogStamp(url) == stamp else { return [:] }
+        legacyCache.stamp = stamp; legacyCache.records = result
         return result
     }
 

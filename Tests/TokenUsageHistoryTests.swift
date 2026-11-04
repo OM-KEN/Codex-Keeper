@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import SQLite3
+import Combine
 
 @MainActor private final class UsageMenuTrackingCheck: NSObject, NSMenuDelegate {
     let menu: NSMenu
@@ -142,11 +143,13 @@ import SQLite3
 }
 
 @MainActor func checkTokenUsageHistory(_ check: (Bool, String) -> Void, root: URL) throws {
+    try checkTokenUsageHistoryStore(check, root: root.appendingPathComponent("sqlite-store"))
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
     let now = calendar.date(from: DateComponents(year: 2026, month: 10, day: 30, hour: 12))!
     let start = calendar.startOfDay(for: now)
+    try checkTokenHistoryCacheCoalescing(check, root: root.appendingPathComponent("cache-coalescing"), now: now)
     try checkCompressedTokenHistory(check, root: root.appendingPathComponent("compressed"), now: now, calendar: calendar)
     check(TokenUsageFormat.compact(999) == "999.0" && TokenUsageFormat.compact(1_234) == "1.2K" &&
         TokenUsageFormat.compact(1_234_567) == "1.2M" && TokenUsageFormat.compact(1_234_567_890) == "1.2B",
@@ -285,6 +288,15 @@ import SQLite3
     _ = reader.read(now: now)
     check(reader.bytesRead == beforeBytes, "unchanged rollouts are not reparsed by the incremental reader")
     let analysis = TokenUsageHistoryAnalysis(snapshot: first, now: now, calendar: calendar)
+    let reuse = reader.readAnalysis(now: now, calendar: calendar)
+    let beforePlanExpiry = reader.summaryBuildCount
+    let expired = reader.readAnalysis(now: start.addingTimeInterval(86462), calendar: calendar)
+    check(reuse.fiveHourEstimate.value != nil && expired.snapshot.currentPlan == nil && expired.fiveHourEstimate.value == nil &&
+        reader.summaryBuildCount == beforePlanExpiry,
+        "Plus plan evidence expires after twenty-four hours without rebuilding unchanged historical windows")
+    let returned = reader.readAnalysis(now: now, calendar: calendar)
+    check(returned.fiveHourEstimate.value == reuse.fiveHourEstimate.value,
+        "clock rollback restores still-current Plus evidence and its original estimate")
     check(analysis.days.suffix(2).map(\.total) == [300, 0] && analysis.todayTokens == nil,
         "all tokens of a cross-midnight window belong to its local start day; missing today is not zero")
     check(analysis.days[5].segments.count == 1 && analysis.days[5].segments.first?.records.count == 2,
@@ -303,6 +315,7 @@ import SQLite3
     let updatedAnalysis = TokenUsageHistoryAnalysis(snapshot: updated, now: now, calendar: calendar)
     check(Set(updatedAnalysis.windows.filter { $0.kind == .fiveHour }.map(\.id)).count == 2,
         "an early reset starts a separate actual quota window")
+    reader.flushCache(now: now)
     let cached = TokenUsageHistoryReader(home: home, cacheURL: root.appendingPathComponent("cache.json"))
     let restored = cached.read(now: now)
     check(restored.records == updated.records && cached.bytesRead == 0,
@@ -447,6 +460,23 @@ import SQLite3
         record("baseline-2", at: start.addingTimeInterval(6 * 3600), input: nil, used: 0, reset: secondReset),
         record("cost-2", at: start.addingTimeInterval(7 * 3600), input: 9000, used: 90, reset: secondReset)
     ]
+    let previousRecords = pair.map { record -> TokenUsageRecord in
+        var old = record
+        old.timestamp = record.timestamp.map { calendar.date(byAdding: .day, value: -7, to: $0)! }
+        old.fiveHour?.resetsAt = calendar.date(byAdding: .day, value: -7, to: record.fiveHour!.resetsAt)!
+        return old
+    }
+    let previousSnapshot = TokenUsageHistorySnapshot(accountID: "account-a", records: previousRecords, currentPlan: "plus", capturedAt: now, isLoaded: true)
+    let previousCache = TokenUsageHistoryAnalysisCache()
+    let beforeCutoff = previousCache.analysis(snapshot: previousSnapshot, revision: 1, recordsRevision: 1,
+        now: start.addingTimeInterval(5400), calendar: calendar)
+    let afterCutoff = previousCache.analysis(snapshot: previousSnapshot, revision: 1, recordsRevision: 1,
+        now: start.addingTimeInterval(7500), calendar: calendar)
+    check(beforeCutoff.fiveHourEstimate.previousValue == nil && afterCutoff.fiveHourEstimate.previousValue != nil &&
+        previousCache.summaryBuildCount == 1 && previousCache.analysisBuildCount == 2,
+        "the previous seven-day intraday sample cutoff refreshes estimates while reusing complete historical windows")
+    check(afterCutoff.days.allSatisfy { $0.total == 0 } && afterCutoff.historicalDays.flatMap(\.records).count == 2,
+        "records older than the seven-day chart remain available in full historical detail")
     let weighted = summarize(pair)
     check(abs((weighted.fiveHourEstimate.value ?? 0) - 0.0175) < 0.0000001 && weighted.fiveHourEstimate.sampleCount == 2,
         "eligible windows are weighted by consumed fraction, not an arithmetic average of window ratios")
@@ -725,6 +755,88 @@ import SQLite3
         "switching accounts never shows another account's token or dollar history")
 }
 
+private func checkTokenHistoryCacheCoalescing(_ check: (Bool, String) -> Void, root: URL, now: Date) throws {
+    let home = root.appendingPathComponent("home")
+    let sessions = home.appendingPathComponent("sessions")
+    try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+    try Data("{\"tokens\":{\"account_id\":\"account-a\"}}".utf8).write(to: home.appendingPathComponent("auth.json"))
+    let file = sessions.appendingPathComponent("usage.jsonl")
+    let cache = root.appendingPathComponent("cache.json")
+    let iso = ISO8601DateFormatter()
+    func row(_ type: String, _ payload: [String: Any], _ at: Date) throws -> Data {
+        var value = try JSONSerialization.data(withJSONObject: ["type": type, "timestamp": iso.string(from: at), "payload": payload])
+        value.append(10); return value
+    }
+    func usage(_ total: Int) throws -> Data {
+        try row("event_msg", ["type": "token_count", "info": ["total_token_usage": ["input_tokens": total, "total_tokens": total],
+            "last_token_usage": ["input_tokens": 10, "total_tokens": 10]]], now.addingTimeInterval(Double(total)))
+    }
+    var trace = try row("session_meta", ["id": "coalesced", "creator_account_id": "account-a"], now)
+    trace += try row("turn_context", ["turn_id": "one", "model": "gpt-6.1-sol"], now)
+    trace += try usage(10)
+    try trace.write(to: file)
+    let reader = TokenUsageHistoryReader(home: home, cacheURL: cache)
+    _ = reader.read(now: now.addingTimeInterval(10))
+    let saved = try Data(contentsOf: cache)
+    let handle = try FileHandle(forWritingTo: file)
+    try handle.seekToEnd(); try handle.write(contentsOf: usage(20)); try handle.close()
+    let latest = reader.read(now: now.addingTimeInterval(30))
+    check(latest.records.reduce(0) { $0 + ($1.counts?.total ?? 0) } == 20,
+        "new token usage reaches the production snapshot while its rebuildable cache is pending")
+    check(try Data(contentsOf: cache) == saved,
+        "small token appends within twenty seconds do not rewrite the full statistics cache")
+    let restarted = TokenUsageHistoryReader(home: home, cacheURL: cache)
+    check(restarted.read(now: now.addingTimeInterval(40)).records == latest.records && restarted.bytesRead > 0,
+        "an unflushed statistics cache recovers the exact missing tail after an abnormal exit")
+    _ = reader.read(now: now.addingTimeInterval(150))
+    check(try Data(contentsOf: cache) != saved,
+        "pending statistics are persisted within the bounded two-minute write interval")
+    check(reader.cacheWriteCount == 2, "several local reads coalesce to one pending statistics write")
+    reader.flushCache(now: now.addingTimeInterval(151)); reader.flushCache(now: now.addingTimeInterval(152))
+    check(reader.cacheWriteCount == 2, "flushing a clean statistics cache performs no encoding or write")
+    var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    let analysis = reader.readAnalysis(now: now.addingTimeInterval(160), calendar: calendar)
+    let builds = reader.analysisBuildCount, summaries = reader.summaryBuildCount
+    _ = reader.readAnalysis(now: now.addingTimeInterval(180), calendar: calendar)
+    check(reader.analysisBuildCount == builds && reader.summaryBuildCount == summaries,
+        "unchanged production history refreshes reuse analysis and every historical day/window")
+    let messages = try FileHandle(forWritingTo: file)
+    try messages.seekToEnd(); try messages.write(contentsOf: row("response_item", ["type": "message", "content": "ordinary output"], now))
+    try messages.close()
+    _ = reader.readAnalysis(now: now.addingTimeInterval(181), calendar: calendar)
+    check(reader.analysisBuildCount == builds && reader.summaryBuildCount == summaries,
+        "new non-token rollout bytes do not rebuild identical history summaries")
+    let tomorrow = calendar.date(byAdding: .day, value: 1, to: now)!
+    let nextDay = reader.readAnalysis(now: tomorrow, calendar: calendar)
+    check(nextDay.days.last?.date == calendar.startOfDay(for: tomorrow) && reader.analysisBuildCount == builds + 1 &&
+        reader.summaryBuildCount == summaries && nextDay.historicalDays.flatMap(\.records).count == analysis.historicalDays.flatMap(\.records).count,
+        "crossing midnight refreshes the seven-day presentation while reusing all historical details")
+    calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+    let changedZone = reader.readAnalysis(now: tomorrow, calendar: calendar)
+    check(changedZone.days.last?.date == calendar.startOfDay(for: tomorrow) && reader.summaryBuildCount == summaries + 1,
+        "a calendar/time-zone change invalidates historical window/day attribution")
+    let rollback = reader.readAnalysis(now: now.addingTimeInterval(15), calendar: calendar)
+    check(rollback.totalTimedTokens == 10 && rollback.snapshot.records.count == latest.records.count,
+        "clock rollback hides future usage in analysis without dropping records from history")
+    let future = reader.readAnalysis(now: now.addingTimeInterval(20), calendar: calendar)
+    check(future.totalTimedTokens == 20 && future.now == now.addingTimeInterval(20),
+        "an already-read future token event enters the analysis at its actual timestamp")
+    try Data("{\"tokens\":{\"account_id\":\"account-b\"}}".utf8).write(to: home.appendingPathComponent("auth.json"))
+    check(reader.readAnalysis(now: tomorrow, calendar: calendar).historicalDays.isEmpty,
+        "a changed account cannot reuse the previous account's history summaries")
+    let original = try String(contentsOf: file, encoding: .utf8)
+    let rewritten = original.replacingOccurrences(of: "\"total_tokens\":20", with: "\"total_tokens\":30")
+        .replacingOccurrences(of: "\"input_tokens\":20", with: "\"input_tokens\":30")
+    check(original != rewritten && original.utf8.count == rewritten.utf8.count, "token rewrite fixture preserves its exact byte size")
+    let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+    let rewrite = try FileHandle(forWritingTo: file)
+    try rewrite.truncate(atOffset: 0); try rewrite.write(contentsOf: Data(rewritten.utf8)); try rewrite.close()
+    try FileManager.default.setAttributes([.modificationDate: attributes[.modificationDate]!], ofItemAtPath: file.path)
+    try Data("{\"tokens\":{\"account_id\":\"account-a\"}}".utf8).write(to: home.appendingPathComponent("auth.json"))
+    check(reader.read(now: now.addingTimeInterval(200)).records.reduce(0) { $0 + ($1.counts?.total ?? 0) } == 30,
+        "same-inode/size/mtime token-history rewrites invalidate persistent cursor facts through ctime")
+}
+
 private func checkCompressedTokenHistory(_ check: (Bool, String) -> Void, root: URL, now: Date, calendar: Calendar) throws {
     let home = root.appendingPathComponent("home")
     let sessions = home.appendingPathComponent("sessions")
@@ -782,9 +894,18 @@ private func checkCompressedTokenHistory(_ check: (Bool, String) -> Void, root: 
     let before = reader.bytesRead
     check(reader.read(now: now).records == baseline.records && reader.bytesRead == before,
         "unchanged compressed history is not decompressed again")
+    reader.flushCache(now: now)
     let restored = TokenUsageHistoryReader(home: home, cacheURL: cache)
     check(restored.read(now: now).records == baseline.records && restored.bytesRead == 0,
         "a new reader reuses persistent compressed history without decompression")
+    var oldCache = try JSONSerialization.jsonObject(with: Data(contentsOf: cache)) as! [String: Any]
+    var oldFiles = oldCache["files"] as! [String: [String: Any]]
+    for path in oldFiles.keys { oldFiles[path]?.removeValue(forKey: "changedSeconds"); oldFiles[path]?.removeValue(forKey: "changedNanoseconds") }
+    oldCache["files"] = oldFiles
+    try JSONSerialization.data(withJSONObject: oldCache).write(to: cache)
+    let migrated = TokenUsageHistoryReader(home: home, cacheURL: cache)
+    check(migrated.read(now: now).records == baseline.records && migrated.bytesRead == 0,
+        "an existing version-four cache without ctime retains warm compressed history without decompression")
     data += try line("event_msg", tokens(150, last: 50, used: 60), 4)
     try data.write(to: plain)
     let materialized = reader.read(now: now)
@@ -825,4 +946,95 @@ private func checkCompressedTokenHistory(_ check: (Bool, String) -> Void, root: 
         "compressed history and its cached state binding remain isolated when accounts change")
     try Data("{\"tokens\":{\"account_id\":\"account-a\"}}".utf8).write(to: auth)
     check(total(combinedReader.read(now: now)) == 300, "returning to the original account restores compressed history without duplication")
+}
+
+@MainActor func checkTokenHistoryObserverGeneration(_ check: (Bool, String) -> Void, root: URL) async throws {
+    let home = root.appendingPathComponent("home"), support = root.appendingPathComponent("support")
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    let auth = home.appendingPathComponent("auth.json")
+    try Data("{\"tokens\":{\"account_id\":\"account-a\"}}".utf8).write(to: auth)
+    let observer = TokenUsageHistoryObserver(home: home, support: support)
+    observer.start(); observer.stop()
+    try Data("{\"tokens\":{\"account_id\":\"account-b\"}}".utf8).write(to: auth)
+    var publication: AnyCancellable?
+    var accounts: [String?] = []
+    let completed: Bool = await withCheckedContinuation { continuation in
+        var resumed = false
+        func finish(_ value: Bool) {
+            guard !resumed else { return }; resumed = true
+            continuation.resume(returning: value)
+        }
+        publication = observer.$analysis.dropFirst().sink { value in
+            accounts.append(value.snapshot.accountID)
+            if value.snapshot.accountID == "account-b" { finish(true) }
+        }
+        observer.start()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(false) }
+    }
+    publication?.cancel(); observer.stop()
+    check(completed && accounts == ["account-b"],
+        "stop/start during a history refresh rejects the old generation and publishes only the new account")
+    try await checkHourlyTokenHistory(check, root: root.appendingPathComponent("hourly"))
+}
+
+@MainActor private func checkHourlyTokenHistory(_ check: (Bool, String) -> Void, root: URL) async throws {
+    let home = root.appendingPathComponent("home"), support = root.appendingPathComponent("support")
+    let sessions = home.appendingPathComponent("sessions")
+    try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+    try Data("{\"tokens\":{\"account_id\":\"account-a\"}}".utf8).write(to: home.appendingPathComponent("auth.json"))
+    let calendar = Calendar.current, today = calendar.startOfDay(for: Date())
+    let start = today.addingTimeInterval(10 * 3600)
+    let old = calendar.date(byAdding: .day, value: -20, to: start)!
+    let iso = ISO8601DateFormatter()
+    func row(_ type: String, _ payload: [String: Any], at: Date) throws -> Data {
+        try JSONSerialization.data(withJSONObject: ["type": type, "payload": payload, "timestamp": iso.string(from: at)],
+            options: .sortedKeys) + Data([10])
+    }
+    func tokens(_ total: Int, at: Date) throws -> Data {
+        try row("event_msg", ["type": "token_count", "info": [
+            "total_token_usage": ["input_tokens": total, "total_tokens": total],
+            "last_token_usage": ["input_tokens": 100, "total_tokens": 100]]], at: at)
+    }
+    func trace(_ id: String, at: Date) throws -> Data {
+        try row("session_meta", ["id": id, "creator_account_id": "account-a"], at: at) +
+            row("turn_context", ["model": "gpt-6.1-sol", "service_tier": "standard"], at: at) +
+            tokens(100, at: at.addingTimeInterval(2))
+    }
+    let current = sessions.appendingPathComponent("current.jsonl")
+    try trace("current", at: start).write(to: current)
+    try trace("past", at: old).write(to: sessions.appendingPathComponent("past.jsonl"))
+    var clock = start.addingTimeInterval(60)
+    let observer = TokenUsageHistoryObserver(home: home, support: support, now: { clock })
+    defer { observer.stop() }
+    func waitFor(_ condition: () -> Bool) async -> Bool {
+        for _ in 0..<150 {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+    observer.start()
+    let initial = await waitFor { observer.analysis.todayTokens == 100 }
+    let menu = observer.analysis
+    check(initial && menu.days.count == 7 && menu.snapshot.records.isEmpty &&
+        menu.days.flatMap(\.segments).allSatisfy { $0.records.isEmpty },
+        "the production menu publishes seven days of totals without retaining usage records")
+    let historical = await observer.page(ending: old)
+    check(historical?.days.map(\.total) == [100] &&
+        historical?.days.flatMap(\.records).map(\.threadID) == ["past"],
+        "historical detail queries its own dated page from disk")
+
+    let handle = try FileHandle(forWritingTo: current)
+    try handle.seekToEnd(); try handle.write(contentsOf: tokens(200, at: clock.addingTimeInterval(1))); try handle.close()
+    let firstRevision = observer.pageRevision
+    clock = clock.addingTimeInterval(3599)
+    observer.refreshIfDue()
+    let pageBeforeHour = await observer.page(ending: today)
+    check(observer.pageRevision == firstRevision && observer.analysis.todayTokens == 100 &&
+        pageBeforeHour?.days.last?.total == 100, "opening details and checking the clock before an hour do not ingest new usage")
+    clock = clock.addingTimeInterval(1)
+    observer.refreshIfDue()
+    let updated = await waitFor { observer.analysis.todayTokens == 200 }
+    check(updated && observer.pageRevision > firstRevision && observer.analysis.snapshot.records.isEmpty,
+        "the hourly batch publishes newly appended usage as a compact menu summary")
 }

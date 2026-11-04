@@ -61,39 +61,43 @@ struct PingReceipt {
     static func read(home: URL, excluding previous: Set<URL>) -> PingReceipt {
         let previousPaths = Set(previous.map(RolloutFile.logicalURL))
         let files = SessionWatcher.recentRollouts(codexHome: home, limit: 20).filter { !previousPaths.contains(RolloutFile.logicalURL($0.url)) }
-        guard files.count == 1, let file = files.first,
-              let data = try? RolloutFile.read(file.url), let content = String(data: data, encoding: .utf8) else { return PingReceipt() }
+        guard files.count == 1, let file = files.first else { return PingReceipt() }
         var receipt = PingReceipt()
-        for line in content.split(separator: "\n") {
-            guard let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let payload = entry["payload"] as? [String: Any] else { continue }
-            if entry["type"] as? String == "session_meta", let id = payload["id"] as? String, UUID(uuidString: id) != nil { receipt.threadID = id }
-            if payload["type"] as? String == "task_started" {
-                receipt.turnID = (payload["turn_id"] as? String).flatMap { UUID(uuidString: $0) == nil ? nil : $0 }
-                receipt.replied = false; receipt.completed = false; receipt.failure = nil; receipt.errorCode = nil
+        do {
+            try RolloutFile.forEachLine(file.url) { line in
+                try autoreleasepool {
+                    guard String(data: line, encoding: .utf8) != nil else { throw CocoaError(.fileReadCorruptFile) }
+                    guard let entry = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                          let payload = entry["payload"] as? [String: Any] else { return }
+                    if entry["type"] as? String == "session_meta", let id = payload["id"] as? String, UUID(uuidString: id) != nil { receipt.threadID = id }
+                    if payload["type"] as? String == "task_started" {
+                        receipt.turnID = (payload["turn_id"] as? String).flatMap { UUID(uuidString: $0) == nil ? nil : $0 }
+                        receipt.replied = false; receipt.completed = false; receipt.failure = nil; receipt.errorCode = nil
+                    }
+                    if payload["role"] as? String == "assistant", receipt.turnID != nil {
+                        let text = (payload["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? ""
+                        receipt.replied = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "OK"
+                    }
+                    if payload["type"] as? String == "task_complete", receipt.turnID != nil,
+                       payload["turn_id"] as? String == receipt.turnID {
+                        receipt.completed = receipt.replied && (payload["error"] == nil || payload["error"] is NSNull)
+                    }
+                    if payload["type"] as? String == "turn_aborted" { receipt.completed = false; receipt.failure = .cancelled }
+                    let type = payload["type"] as? String
+                    if ((type == "error" || type == "turn_failed") && payload["will_retry"] as? Bool != true) ||
+                        (type == "task_complete" && payload["error"] != nil && !(payload["error"] is NSNull)) {
+                        let detail = String(describing: payload["error"] ?? payload["message"] ?? payload).lowercased()
+                        receipt.failure = ResumeModelActivity.quotaError(detail) ? .quotaExhausted :
+                            ["model_not_found", "unsupported_model", "invalid_model", "model_not_available"].contains(where: detail.contains) ? .model : .request
+                        let error = payload["error"] as? [String: Any]
+                        let code = error?["code"] as? String ?? error?["codex_error_info"] as? String ??
+                            payload["code"] as? String ?? payload["codex_error_info"] as? String
+                        if let code, ["model_not_found", "unsupported_model", "invalid_model", "model_not_available", "usage_limit_reached", "usage_limit_exceeded", "quota_exhausted", "insufficient_quota", "request_timeout", "server_error"].contains(code) { receipt.errorCode = code }
+                        receipt.completed = false
+                    }
+                }
             }
-            if payload["role"] as? String == "assistant", receipt.turnID != nil {
-                let text = (payload["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? ""
-                receipt.replied = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "OK"
-            }
-            if payload["type"] as? String == "task_complete", receipt.turnID != nil,
-               payload["turn_id"] as? String == receipt.turnID {
-                receipt.completed = receipt.replied && (payload["error"] == nil || payload["error"] is NSNull)
-            }
-            if payload["type"] as? String == "turn_aborted" { receipt.completed = false; receipt.failure = .cancelled }
-            let type = payload["type"] as? String
-            if ((type == "error" || type == "turn_failed") && payload["will_retry"] as? Bool != true) ||
-                (type == "task_complete" && payload["error"] != nil && !(payload["error"] is NSNull)) {
-                let detail = String(describing: payload["error"] ?? payload["message"] ?? payload).lowercased()
-                receipt.failure = ResumeModelActivity.quotaError(detail) ? .quotaExhausted :
-                    ["model_not_found", "unsupported_model", "invalid_model", "model_not_available"].contains(where: detail.contains) ? .model : .request
-                let error = payload["error"] as? [String: Any]
-                let code = error?["code"] as? String ?? error?["codex_error_info"] as? String ??
-                    payload["code"] as? String ?? payload["codex_error_info"] as? String
-                if let code, ["model_not_found", "unsupported_model", "invalid_model", "model_not_available", "usage_limit_reached", "usage_limit_exceeded", "quota_exhausted", "insufficient_quota", "request_timeout", "server_error"].contains(code) { receipt.errorCode = code }
-                receipt.completed = false
-            }
-        }
+        } catch { return PingReceipt() }
         return receipt
     }
     static func completed(home: URL, excluding previous: Set<URL>) -> Bool {

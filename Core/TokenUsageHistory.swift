@@ -198,12 +198,12 @@ struct TokenUsageEstimate {
 }
 
 struct TokenUsageHistoryAnalysis {
-    let snapshot: TokenUsageHistorySnapshot
-    let now: Date
+    var snapshot: TokenUsageHistorySnapshot
+    var now: Date
     let calendar: Calendar
     let periodStart: Date
     let previousStart: Date
-    let previousEnd: Date
+    var previousEnd: Date
     let windows: [TokenUsageWindow]
     let days: [TokenUsageDay]
     let historicalDays: [TokenUsageDay]
@@ -215,54 +215,86 @@ struct TokenUsageHistoryAnalysis {
     let pricedTokens: Int
     let totalTimedTokens: Int
 
-    init(snapshot: TokenUsageHistorySnapshot, now: Date = Date(), calendar: Calendar = .current) {
+    fileprivate struct Summaries {
+        var windows: [TokenUsageWindow]
+        var days: [Date: TokenUsageDay]
+        var historicalDays: [TokenUsageDay]
+        var totals: [Date: Int]
+        var priced: [Date: Int]
+        var unknownWindow: [Date: Int]
+        var unknownTimeTokens: Int
+        var calibrationGroup: TokenUsageCalibrationGroup?
+    }
+
+    init(snapshot: TokenUsageHistorySnapshot, now: Date = Date(), calendar: Calendar = .current,
+         calibrationGroup: TokenUsageCalibrationGroup? = nil) {
+        let valid = snapshot.records.filter { $0.timestamp.map { $0 <= now } ?? false }
+            .sorted { $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp! < $1.timestamp! }
+        var summaries = Self.summarize(snapshot: snapshot, valid: valid, calendar: calendar)
+        if let calibrationGroup { summaries.calibrationGroup = calibrationGroup }
+        self.init(snapshot: snapshot, summaries: summaries, now: now, calendar: calendar)
+    }
+
+    fileprivate init(snapshot: TokenUsageHistorySnapshot, summaries: Summaries, now: Date, calendar: Calendar) {
         self.snapshot = snapshot; self.now = now; self.calendar = calendar
         let today = calendar.startOfDay(for: now)
         let periodStart = calendar.date(byAdding: .day, value: -6, to: today)!
         let previousStart = calendar.date(byAdding: .day, value: -7, to: periodStart)!
         let previousEnd = calendar.date(byAdding: .day, value: -7, to: now)!
         self.periodStart = periodStart; self.previousStart = previousStart; self.previousEnd = previousEnd
-        let valid = snapshot.records.filter { $0.timestamp.map { $0 <= now } ?? false }
-            .sorted { $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp! < $1.timestamp! }
-        let calibrationGroup = valid.last(where: {
-            !$0.isAuxiliary && $0.accountID == snapshot.accountID && ($0.counts?.total ?? 0) > 0
-        })?.calibrationGroup
+        let windows = summaries.windows, calibrationGroup = summaries.calibrationGroup
+        self.windows = windows; historicalDays = summaries.historicalDays
         self.calibrationGroup = calibrationGroup
-        windows = Self.makeWindows(valid, kind: .fiveHour, calendar: calendar) + Self.makeWindows(valid, kind: .weekly, calendar: calendar)
-        let byRecord = Dictionary(windows.filter { $0.kind == .fiveHour }.flatMap { window in
-            window.observations.map { ($0.id, window) }
-        }, uniquingKeysWith: { first, _ in first })
-        let attributionDays = Dictionary(uniqueKeysWithValues: valid.map { record in
-            (record.id, calendar.startOfDay(for: byRecord[record.id]?.start ?? record.timestamp!))
-        })
-        var daily: [Date: [String: [TokenUsageRecord]]] = [:]
-        for record in valid where (record.counts?.total ?? 0) > 0 {
-            let day = attributionDays[record.id]!
-            daily[day, default: [:]][byRecord[record.id]?.id ?? "unknown", default: []].append(record)
-        }
-        // Keep seven natural-day columns even when a day has no local observations.
         days = (0..<7).map { offset in
             let date = calendar.date(byAdding: .day, value: offset, to: periodStart)!
-            return Self.day(date, groups: daily[date] ?? [:], windows: byRecord)
+            return summaries.days[date] ?? TokenUsageDay(date: date, segments: [])
         }
-        historicalDays = daily.keys.sorted(by: >).map { Self.day($0, groups: daily[$0]!, windows: byRecord) }
-        unknownTimeTokens = snapshot.records.filter { $0.timestamp == nil }.reduce(0) { $0 + ($1.counts?.total ?? 0) }
-        unknownWindowTokens = valid.filter { attributionDays[$0.id]! >= periodStart && byRecord[$0.id] == nil }
-            .reduce(0) { $0 + ($1.counts?.total ?? 0) }
-        let period = valid.filter { attributionDays[$0.id]! >= periodStart }
-        totalTimedTokens = period.reduce(0) { $0 + ($1.counts?.total ?? 0) }
-        pricedTokens = period.filter { $0.cost != nil }.reduce(0) { $0 + ($1.counts?.total ?? 0) }
+        unknownTimeTokens = summaries.unknownTimeTokens
+        unknownWindowTokens = summaries.unknownWindow.reduce(0) { $0 + ($1.key >= periodStart ? $1.value : 0) }
+        totalTimedTokens = summaries.totals.reduce(0) { $0 + ($1.key >= periodStart ? $1.value : 0) }
+        pricedTokens = summaries.priced.reduce(0) { $0 + ($1.key >= periodStart ? $1.value : 0) }
         fiveHourEstimate = Self.estimate(windows: windows, kind: .fiveHour, snapshot: snapshot, group: calibrationGroup,
             start: periodStart, end: now, previousStart: previousStart, previousEnd: previousEnd, calendar: calendar)
         weeklyEstimate = Self.estimate(windows: windows, kind: .weekly, snapshot: snapshot, group: calibrationGroup,
             start: periodStart, end: now, previousStart: previousStart, previousEnd: previousEnd, calendar: calendar)
     }
 
+    fileprivate static func summarize(snapshot: TokenUsageHistorySnapshot, valid: [TokenUsageRecord],
+                                      calendar: Calendar, includeWeekly: Bool = true) -> Summaries {
+        var windows = makeWindows(valid, kind: .fiveHour, calendar: calendar)
+        if includeWeekly { windows += makeWindows(valid, kind: .weekly, calendar: calendar) }
+        // Store window indices, not a value copy of a window for every observation.
+        var byRecord: [String: Int] = [:]
+        for index in windows.indices where windows[index].kind == .fiveHour {
+            for record in windows[index].observations where byRecord[record.id] == nil { byRecord[record.id] = index }
+        }
+        var daily: [Date: [String: [TokenUsageRecord]]] = [:]
+        var totals: [Date: Int] = [:], priced: [Date: Int] = [:], unknownWindow: [Date: Int] = [:]
+        for record in valid {
+            let window = byRecord[record.id].map { windows[$0] }
+            let date = calendar.startOfDay(for: window?.start ?? record.timestamp!)
+            let total = record.counts?.total ?? 0
+            totals[date, default: 0] += total
+            if record.cost != nil { priced[date, default: 0] += total }
+            if window == nil { unknownWindow[date, default: 0] += total }
+            if total > 0 { daily[date, default: [:]][window?.id ?? "unknown", default: []].append(record) }
+        }
+        var summaries: [Date: TokenUsageDay] = [:]
+        for (date, groups) in daily { summaries[date] = day(date, groups: groups, windows: windows, byRecord: byRecord) }
+        return Summaries(windows: windows, days: summaries,
+            historicalDays: summaries.keys.sorted(by: >).map { summaries[$0]! }, totals: totals, priced: priced,
+            unknownWindow: unknownWindow,
+            unknownTimeTokens: snapshot.records.reduce(0) { $0 + ($1.timestamp == nil ? ($1.counts?.total ?? 0) : 0) },
+            calibrationGroup: valid.last(where: {
+                !$0.isAuxiliary && $0.accountID == snapshot.accountID && ($0.counts?.total ?? 0) > 0
+            })?.calibrationGroup)
+    }
+
     var todayTokens: Int? { days.last.flatMap { $0.hasRecords ? $0.total : nil } }
     var todaySpeed: TokenUsageSpeed { TokenUsageSpeed(days.last?.records ?? []) }
-    private static func day(_ date: Date, groups: [String: [TokenUsageRecord]], windows: [String: TokenUsageWindow]) -> TokenUsageDay {
+    private static func day(_ date: Date, groups: [String: [TokenUsageRecord]], windows: [TokenUsageWindow], byRecord: [String: Int]) -> TokenUsageDay {
         let segments = groups.map { id, records in
-            let window = records.first.flatMap { windows[$0.id] }
+            let window = records.first.flatMap { byRecord[$0.id] }.map { windows[$0] }
             return TokenUsageSegment(windowID: id == "unknown" ? nil : id, start: window?.start, reset: window?.reset,
                 total: records.reduce(0) { $0 + ($1.counts?.total ?? 0) },
                 windowPercent: window?.observedPercent, records: records, colorIndex: window?.colorIndex ?? -1)
@@ -273,42 +305,53 @@ struct TokenUsageHistoryAnalysis {
     private static func makeWindows(_ records: [TokenUsageRecord], kind: TokenUsageWindowKind, calendar: Calendar) -> [TokenUsageWindow] {
         var result: [TokenUsageWindow] = []
         var highWater: Double = 0
+        var includedPositive: [Int] = []
+        var positivePrefix = [0]
+        positivePrefix.reserveCapacity(records.count + 1)
+        for record in records { positivePrefix.append(positivePrefix.last! + ((record.counts?.total ?? 0) > 0 ? 1 : 0)) }
         for record in records {
             guard let at = record.timestamp, let quota = kind == .fiveHour ? record.fiveHour : record.weekly,
                   quota.usedPercent >= 0, quota.usedPercent <= 100, quota.resetsAt > at,
                   quota.resetsAt.timeIntervalSince(at) <= Double(quota.windowMinutes * 60) + 180 else { continue }
-            let previous = result.last
-            let drift = previous.map { abs($0.reset.timeIntervalSince(quota.resetsAt)) } ?? .infinity
+            // Copy only the scalar reset. Copying the last window here shares its growing
+            // observations array and forces a full copy on every append.
+            let previousReset = result.last?.reset
+            let drift = previousReset.map { abs($0.timeIntervalSince(quota.resetsAt)) } ?? .infinity
             let decreased = quota.usedPercent < highWater
-            // Parallel requests can carry an older quota reading. Within the same reset,
-            // retain their real token usage while measuring only the percent high-water mark.
-            let continues = previous != nil && drift <= 180 && at < previous!.reset.addingTimeInterval(180)
+            let continues = previousReset.map { drift <= 180 && at < $0.addingTimeInterval(180) } ?? false
             if continues {
                 let index = result.count - 1
                 result[index].observations.append(record)
                 result[index].observedPercent += max(0, quota.usedPercent - highWater)
+                includedPositive[index] += (record.counts?.total ?? 0) > 0 ? 1 : 0
                 highWater = max(highWater, quota.usedPercent)
             } else {
-                // A large reset movement with no rollover or falling usage cannot establish
-                // a new actual window. Keep that event's window unknown.
-                if let previous, highWater > 0, at < previous.reset.addingTimeInterval(-180), !decreased {
+                if let previousReset, highWater > 0, at < previousReset.addingTimeInterval(-180), !decreased {
                     result[result.count - 1].complete = false
                     continue
                 }
                 let start = min(at, quota.resetsAt.addingTimeInterval(-Double(quota.windowMinutes * 60)))
                 let id = kind.rawValue + ":" + String(Int64(quota.resetsAt.timeIntervalSince1970)) + ":" + record.id
                 result.append(TokenUsageWindow(id: id, kind: kind, start: start, reset: quota.resetsAt,
-                    observations: [record], earlyReset: decreased && previous.map { at < $0.reset.addingTimeInterval(-180) } == true))
+                    observations: [record], earlyReset: decreased && previousReset.map { at < $0.addingTimeInterval(-180) } == true))
+                includedPositive.append((record.counts?.total ?? 0) > 0 ? 1 : 0)
                 highWater = quota.usedPercent
             }
         }
+        func boundary(_ date: Date, inclusive: Bool) -> Int {
+            var low = 0, high = records.count
+            while low < high {
+                let middle = (low + high) / 2
+                if records[middle].timestamp! < date || (inclusive && records[middle].timestamp! == date) { low = middle + 1 }
+                else { high = middle }
+            }
+            return low
+        }
         for index in result.indices {
             let first = result[index].observations.first!.timestamp!, last = result[index].observations.last!.timestamp!
-            let included = Set(result[index].observations.map(\.id))
-            if records.contains(where: { record in
-                guard let at = record.timestamp, at >= first, at <= last, (record.counts?.total ?? 0) > 0 else { return false }
-                return !included.contains(record.id)
-            }) { result[index].complete = false }
+            // Include timestamp ties on both edges, matching the original completeness rule.
+            let positive = positivePrefix[boundary(last, inclusive: true)] - positivePrefix[boundary(first, inclusive: false)]
+            if positive != includedPositive[index] { result[index].complete = false }
         }
         result = result.filter { window in window.observations.contains {
             ((kind == .fiveHour ? $0.fiveHour : $0.weekly)?.usedPercent ?? 0) > 0 || ($0.counts?.total ?? 0) > 0
@@ -402,6 +445,112 @@ struct TokenUsageHistoryAnalysis {
         let current = sample(start, end), previous = sample(previousStart, previousEnd)
         return TokenUsageEstimate(value: current.value, previousValue: previous.value, tokens: current.tokens,
             sampleCount: current.count, previousSampleCount: previous.count, reason: current.value == nil ? current.reason : "")
+    }
+}
+
+
+/// The only usage data retained by the menu. Chart segments carry totals, not records.
+struct TokenUsageMenuSummary {
+    let snapshot: TokenUsageHistorySnapshot
+    let now: Date
+    let calendar: Calendar
+    let days: [TokenUsageDay]
+    let todayTokens: Int?
+    let todaySpeed: TokenUsageSpeed
+    let fiveHourEstimate: TokenUsageEstimate
+    let weeklyEstimate: TokenUsageEstimate
+    let calibrationGroup: TokenUsageCalibrationGroup?
+    let unknownTimeTokens: Int
+    let pricedTokens: Int
+    let totalTimedTokens: Int
+
+    init(_ analysis: TokenUsageHistoryAnalysis, unboundTokens: Int? = nil) {
+        var status = analysis.snapshot
+        status.records = []
+        status.unboundRecords = []
+        if let unboundTokens { status.unboundTokens = unboundTokens }
+        snapshot = status
+        now = analysis.now; calendar = analysis.calendar
+        days = analysis.days.map { day in
+            TokenUsageDay(date: day.date, segments: day.segments.map { segment in
+                var segment = segment
+                segment.records = []
+                return segment
+            })
+        }
+        todayTokens = analysis.todayTokens; todaySpeed = analysis.todaySpeed
+        fiveHourEstimate = analysis.fiveHourEstimate; weeklyEstimate = analysis.weeklyEstimate
+        calibrationGroup = analysis.calibrationGroup; unknownTimeTokens = analysis.unknownTimeTokens
+        pricedTokens = analysis.pricedTokens; totalTimedTokens = analysis.totalTimedTokens
+    }
+}
+
+struct TokenUsageHistoryPage {
+    var days: [TokenUsageDay]
+    var untimed: [TokenUsageRecord]
+
+    init(days: [TokenUsageDay] = [], untimed: [TokenUsageRecord] = []) {
+        self.days = days; self.untimed = untimed
+    }
+
+    init(snapshot: TokenUsageHistorySnapshot, start: Date, end: Date, calendar: Calendar) {
+        let visible = snapshot.records.filter { $0.timestamp != nil }
+        let summaries = TokenUsageHistoryAnalysis.summarize(snapshot: snapshot, valid: visible, calendar: calendar,
+            includeWeekly: false)
+        days = summaries.historicalDays.filter { $0.date >= start && $0.date <= end }
+        untimed = snapshot.records.filter { $0.timestamp == nil }
+    }
+}
+
+/// Reuses all historical windows/days until their actual records, visibility or calendar change.
+final class TokenUsageHistoryAnalysisCache {
+    private var recordRevision: UInt64?
+    private var sorted: [TokenUsageRecord] = []
+    private var summaryCalendar: Calendar?
+    private var summaryAccount: String?
+    private var visibleCount = -1
+    private var summaries: TokenUsageHistoryAnalysis.Summaries?
+    private var snapshotRevision: UInt64?
+    private var previousCount = -1
+    private var cached: TokenUsageHistoryAnalysis?
+    private(set) var analysisBuildCount = 0
+    private(set) var summaryBuildCount = 0
+
+    func analysis(snapshot: TokenUsageHistorySnapshot, revision: UInt64, recordsRevision: UInt64,
+                  now: Date, calendar: Calendar) -> TokenUsageHistoryAnalysis {
+        let recordsChanged = recordRevision != recordsRevision
+        if recordsChanged {
+            sorted = snapshot.records.filter { $0.timestamp != nil }
+                .sorted { $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp! < $1.timestamp! }
+            recordRevision = recordsRevision
+        }
+        func count(through date: Date) -> Int {
+            var low = 0, high = sorted.count
+            while low < high {
+                let middle = (low + high) / 2
+                if sorted[middle].timestamp! <= date { low = middle + 1 } else { high = middle }
+            }
+            return low
+        }
+        let visible = count(through: now)
+        let previousEnd = calendar.date(byAdding: .day, value: -7, to: now)!
+        let previous = count(through: previousEnd)
+        let summaryChanged = recordsChanged || summaries == nil || summaryCalendar != calendar ||
+            summaryAccount != snapshot.accountID || visibleCount != visible
+        if summaryChanged {
+            summaries = TokenUsageHistoryAnalysis.summarize(snapshot: snapshot, valid: Array(sorted.prefix(visible)), calendar: calendar)
+            summaryCalendar = calendar; summaryAccount = snapshot.accountID; visibleCount = visible
+            summaryBuildCount += 1
+        }
+        if !summaryChanged, snapshotRevision == revision, previousCount == previous, var cached,
+           calendar.startOfDay(for: cached.now) == calendar.startOfDay(for: now) {
+            cached.snapshot = snapshot; cached.now = now; cached.previousEnd = previousEnd
+            self.cached = cached
+            return cached
+        }
+        let result = TokenUsageHistoryAnalysis(snapshot: snapshot, summaries: summaries!, now: now, calendar: calendar)
+        cached = result; snapshotRevision = revision; previousCount = previous; analysisBuildCount += 1
+        return result
     }
 }
 

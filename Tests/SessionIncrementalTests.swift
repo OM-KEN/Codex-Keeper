@@ -1,8 +1,13 @@
 import Foundation
 import SQLite3
 
-func checkSessionIncrementalReads(_ check: (Bool, String) -> Void, root: URL) throws {
+@MainActor func checkSessionIncrementalReads(_ check: (Bool, String) -> Void, root: URL) throws {
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try checkRolloutStreaming(check, root: root.appendingPathComponent("rollout-streaming"))
+    try checkLegacyEvidenceCorruption(check, root: root.appendingPathComponent("legacy-evidence"))
+    try checkLegacyEvidenceRecovery(check, home: root.appendingPathComponent("legacy-recovery"))
+    try checkSessionDirectoryReuse(check, home: root.appendingPathComponent("directory-cache"))
+    checkRolloutEventCoalescing(check)
     try checkCompressedSessions(check, home: root.appendingPathComponent("compressed"))
     try checkCompressedPingReceipts(check, home: root.appendingPathComponent("ping-receipts"))
     try checkCLICompatibilityBuild(check, root: root.appendingPathComponent("cli-probe"))
@@ -84,6 +89,201 @@ func checkSessionIncrementalReads(_ check: (Bool, String) -> Void, root: URL) th
     var legacy = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "payload": ["id": id, "cwd": root.path]])
     legacy.append(10); try legacy.write(to: file); try compare("legacy missing timestamp")
     try append(event("task_started", turn: "legacy")); try compare("legacy fallback after append")
+}
+
+private func checkLegacyEvidenceCorruption(_ check: (Bool, String) -> Void, root: URL) throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let url = root.appendingPathComponent("execution-events.jsonl")
+    let log = ExecutionEventLog(url: url)
+    let started = Date(timeIntervalSince1970: 1_792_800_000)
+    try log.record("started", kind: "resume", node: nil, threadID: "legacy", at: started)
+    try log.record("confirmed", kind: "resume", node: nil, threadID: "legacy", turnID: "one", accountID: "account-a", at: started.addingTimeInterval(10))
+    check(log.legacyResumeAttempts()["legacy"]?.confirmedAt == started.addingTimeInterval(10),
+        "intact legacy execution evidence still restores its exact response")
+    _ = log.legacyResumeAttempts(); _ = log.legacyResumeAttempts()
+    check(log.legacyReadCount == 1, "unchanged legacy evidence reuses its parsed result without rereading the log")
+    let intact = try Data(contentsOf: url)
+    let handle = try FileHandle(forWritingTo: url)
+    try handle.seekToEnd(); try handle.write(contentsOf: Data("{broken\n".utf8)); try handle.close()
+    check(log.legacyResumeAttempts().isEmpty,
+        "malformed legacy execution evidence cannot restore a confirmed operation")
+    try intact.write(to: url, options: .atomic)
+    check(log.legacyResumeAttempts()["legacy"]?.confirmedAt == started.addingTimeInterval(10),
+        "replacing a damaged execution log invalidates and restores only intact legacy evidence")
+    let truncate = try FileHandle(forWritingTo: url); try truncate.truncate(atOffset: 0); try truncate.close()
+    check(log.legacyResumeAttempts().isEmpty, "truncation cannot reuse a previous legacy confirmation")
+    try intact.write(to: url)
+    var failRead = false
+    let failing = ExecutionEventLog(url: url, readLegacyData: { url in
+        if failRead { throw CocoaError(.fileReadNoPermission) }
+        return try Data(contentsOf: url)
+    })
+    check(failing.legacyResumeAttempts()["legacy"]?.confirmedAt != nil, "legacy read-failure fixture begins with valid evidence")
+    failRead = true
+    try intact.write(to: url, options: .atomic)
+    check(failing.legacyResumeAttempts().isEmpty, "a failed legacy log read never returns an earlier cached confirmation")
+    failRead = false
+    check(failing.legacyResumeAttempts()["legacy"]?.confirmedAt != nil, "legacy evidence can recover after a transient read failure")
+}
+
+
+@MainActor private func checkLegacyEvidenceRecovery(_ check: (Bool, String) -> Void, home: URL) throws {
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    let at = Date(timeIntervalSince1970: 1_792_800_000)
+    func target() -> BlockedSession {
+        let id = UUID().uuidString
+        return BlockedSession(id: id, project: "fixture", cwd: home.path, blockedAt: at,
+            fiveHourResetAt: nil, weeklyResetAt: nil, fileURL: home.appendingPathComponent("rollout-\(id).jsonl"))
+    }
+    let first = target(), second = target(), unattempted = target()
+    let ledger = home.appendingPathComponent("resume-attempts.json")
+    try JSONEncoder().encode([first.episodeKey, second.episodeKey]).write(to: ledger)
+    let events = ExecutionEventLog(url: home.appendingPathComponent("execution-events.jsonl"))
+    for target in [first, second] {
+        try events.record("started", kind: "resume", node: nil, threadID: target.id, at: at)
+        try events.record("confirmed", kind: "resume", node: nil, threadID: target.id, turnID: "legacy", accountID: "account-a", at: at.addingTimeInterval(1))
+    }
+    let suite = "keeper.legacy-performance." + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set(false, forKey: "enabled")
+    let coordinator = ExecutionCoordinator(defaults: defaults, ledgerURL: ledger, codexHome: home)
+    coordinator.restoreLegacyEvidence(for: [], boundAccounts: [:])
+    coordinator.restoreLegacyEvidence(for: [unattempted], boundAccounts: [:])
+    check(coordinator.legacyEvidenceReadCount == 0, "ordinary recomputation with no missing legacy operation never reads legacy evidence")
+    coordinator.restoreLegacyEvidence(for: [first], boundAccounts: [:])
+    let restored = coordinator.operations["legacy:" + first.episodeKey]
+    check(coordinator.legacyEvidenceReadCount == 1 && restored?.phase == .continued && restored?.accountID == "account-a" &&
+        restored?.respondedAt == at.addingTimeInterval(1) && restored?.protectsThread == false,
+        "the production coordinator restores a missing intact legacy operation exactly once")
+    let handle = try FileHandle(forWritingTo: events.url)
+    try handle.seekToEnd(); try handle.write(contentsOf: Data("{broken\n".utf8)); try handle.close()
+    coordinator.restoreLegacyEvidence(for: [first], boundAccounts: [:])
+    check(coordinator.legacyEvidenceReadCount == 1 && coordinator.operations[restored!.id] == restored,
+        "an already-restored operation is not reinterpreted when later execution log bytes change")
+    coordinator.restoreLegacyEvidence(for: [second], boundAccounts: [second.id: "account-a"])
+    let guarded = coordinator.operations["legacy:" + second.episodeKey]
+    check(coordinator.legacyEvidenceReadCount == 2 && guarded?.phase == .checking && guarded?.respondedAt == nil && guarded?.protectsThread == true,
+        "damaged legacy evidence preserves submission protection instead of authorizing a confirmation")
+}
+
+private func checkRolloutEventCoalescing(_ check: (Bool, String) -> Void) {
+    var batch = RolloutEventBatch(), scheduled = 0
+    for index in 0..<1_000 { if batch.add(paths: ["/fixture/\(index % 3).jsonl"]) { scheduled += 1 } }
+    let writes = batch.take()
+    check(scheduled == 1 && writes?.paths.count == 3 && writes?.fullRescan == false && batch.take() == nil,
+        "dense vnode and recursive-stream writes schedule one batch and retain every changed path")
+    _ = batch.add(paths: ["/fixture/old.jsonl"])
+    _ = batch.add(paths: [], fullRescan: true)
+    _ = batch.add(paths: ["/fixture/new.jsonl"])
+    let dropped = batch.take()
+    check(dropped?.fullRescan == true && dropped?.paths.isEmpty == true,
+        "dropped/root-changed native events supersede partial paths with one full rescan")
+    check(batch.add(paths: ["/fixture/next.jsonl"]), "a completed coalescing window immediately admits the next sustained-write batch")
+}
+
+@MainActor private func checkSessionDirectoryReuse(_ check: (Bool, String) -> Void, home: URL) throws {
+    let directory = home.appendingPathComponent("sessions/2026/11/02")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    var database: OpaquePointer?
+    guard sqlite3_open(home.appendingPathComponent("logs.sqlite").path, &database) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    defer { sqlite3_close(database) }
+    guard sqlite3_exec(database, "CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    let base = Date(timeIntervalSince1970: 1_792_800_000)
+    var clock = Date(), parsed = 0
+    func row(_ type: String, _ payload: [String: Any], _ seconds: Double) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: ["type": type,
+            "timestamp": ISO8601DateFormatter().string(from: base.addingTimeInterval(seconds)), "payload": payload])
+        data.append(10); return data
+    }
+    func trace(_ id: String, event: String = "task_started", seconds: Double = 1) throws -> Data {
+        var data = try row("session_meta", ["id": id, "cwd": home.path], 0)
+        data += try row("event_msg", ["type": event, "turn_id": "one"], seconds)
+        return data
+    }
+    let firstID = UUID().uuidString, secondID = UUID().uuidString
+    let first = directory.appendingPathComponent("rollout-\(firstID).jsonl")
+    try trace(firstID).write(to: first)
+    try FileManager.default.setAttributes([.modificationDate: base], ofItemAtPath: first.path)
+    let worker = SessionScanWorker(codexHome: home, parseRollout: { url, mtime in
+        parsed += 1; return SessionWatcher.parse(url: url, mtime: mtime)
+    }, now: { clock })
+    func background() -> ([SessionActivity], String?, [SessionScanDiagnostic]) { worker.read(watchedIDs: [], forceDirectoryScan: false) }
+    check(background().0.first?.taskRunning == true, "directory-cache fixture follows a real running rollout")
+    let listings = worker.directoryListingCount, parses = parsed
+    for _ in 0..<3 { clock.addTimeInterval(5); _ = background() }
+    check(worker.directoryListingCount == listings && parsed == parses,
+        "unchanged background passes reuse directory membership and parsed tasks without enumerating history")
+    let oldAttributes = try FileManager.default.attributesOfItem(atPath: first.path)
+    let oldDate = oldAttributes[.modificationDate] as! Date
+    let actualWorker = SessionScanWorker(codexHome: home, now: { clock })
+    _ = actualWorker.read(watchedIDs: [], forceDirectoryScan: false)
+    // Equal-length event types exercise a rewrite whose size and mtime are explicitly preserved.
+    let equal = try trace(firstID, event: "turn_aborted", seconds: 2)
+    let rewrite = try FileHandle(forWritingTo: first)
+    try rewrite.truncate(atOffset: 0); try rewrite.write(contentsOf: equal); try rewrite.close()
+    try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: first.path)
+    let rewritten = try FileManager.default.attributesOfItem(atPath: first.path)
+    check(rewritten[.size] as? UInt64 == oldAttributes[.size] as? UInt64 &&
+        rewritten[.systemFileNumber] as? UInt64 == oldAttributes[.systemFileNumber] as? UInt64 && rewritten[.modificationDate] as? Date == oldDate,
+        "the rewrite fixture preserves inode, size and modification time")
+    check(background().0.first?.taskRunning == false && actualWorker.read(watchedIDs: [], forceDirectoryScan: false).0.first?.taskRunning == false,
+        "same-size/mtime rollout rewrites invalidate cached facts through the file change stamp")
+    let second = directory.appendingPathComponent("rollout-\(secondID).jsonl")
+    try trace(secondID, event: "task_complete").write(to: second)
+    check(background().0.contains(where: { $0.id == secondID }), "a new file in an already-cached deep date folder is discovered before the fallback")
+    let sibling = home.appendingPathComponent("sessions/2026/11/03")
+    try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+    let thirdID = UUID().uuidString
+    let third = sibling.appendingPathComponent("rollout-\(thirdID).jsonl")
+    try trace(thirdID, event: "task_complete").write(to: third)
+    check(background().0.contains(where: { $0.id == thirdID }), "a new sibling date directory is discovered through its parent's changed membership")
+    let zipped = second.appendingPathExtension("zst")
+    try compressedRolloutFixture(trace(secondID, event: "task_complete")).write(to: zipped)
+    try FileManager.default.removeItem(at: second)
+    worker.invalidateDirectories(paths: [second.path, zipped.path])
+    check(background().0.filter { $0.id == secondID }.map { $0.fileURL.resolvingSymlinksInPath() } == [zipped.resolvingSymlinksInPath()],
+        "native rename/compression invalidation follows one compressed representation without duplication")
+    try trace(secondID, event: "task_complete").write(to: second)
+    worker.invalidateDirectories(paths: [second.path])
+    check(background().0.filter { $0.id == secondID }.map { $0.fileURL.resolvingSymlinksInPath() } == [second.resolvingSymlinksInPath()],
+        "restoring the ordinary representation retires the cached compressed sibling")
+    try FileManager.default.removeItem(at: third)
+    worker.invalidateDirectories(paths: [third.path])
+    check(!background().0.contains(where: { $0.id == thirdID }), "native deletion invalidates a completed rollout without retaining a phantom task")
+    let beforeDropped = worker.directoryFullScanCount
+    worker.invalidateDirectories(paths: [], fullRescan: true); _ = background()
+    check(worker.directoryFullScanCount == beforeDropped + 1, "dropped native events force the next background directory scan to be complete")
+    let beforeFallback = worker.directoryFullScanCount
+    clock.addTimeInterval(61); _ = background()
+    check(worker.directoryFullScanCount == beforeFallback + 1, "a one-minute fallback recovers directory facts when native delivery is unavailable")
+    try FileManager.default.createSymbolicLink(at: directory.appendingPathComponent("self"), withDestinationURL: directory)
+    try FileManager.default.createSymbolicLink(at: directory.appendingPathComponent("parent"), withDestinationURL: home.appendingPathComponent("sessions"))
+    try FileManager.default.createSymbolicLink(at: sibling.appendingPathComponent("duplicate"), withDestinationURL: directory)
+    let loops = background()
+    check(loops.1 == nil && loops.0.filter { $0.id == firstID }.count == 1 && loops.0.filter { $0.id == secondID }.count == 1,
+        "directory symbolic-link loops and aliases are skipped without recursion or duplicate tasks")
+    let freshID = UUID().uuidString, fresh = sibling.appendingPathComponent("rollout-\(freshID).jsonl")
+    var freshTrace = try trace(freshID)
+    freshTrace += try row("event_msg", ["type": "error", "message": "usage_limit_reached", "turn_id": "one"], 2)
+    try freshTrace.write(to: fresh)
+    let beforeFresh = worker.directoryFullScanCount
+    let freshBlocked = try SessionWatcher.freshBlockedSessions(codexHome: home, watchedIDs: [freshID], worker: worker)
+    check(worker.directoryFullScanCount == beforeFresh + 1 && freshBlocked.contains(where: { $0.id == freshID }),
+        "sending preflight forces a fresh directory scan even before native invalidations are delivered")
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    let readFinished = DispatchSemaphore(value: 0), invalidated = DispatchSemaphore(value: 0)
+    let busyWorker = SessionScanWorker(codexHome: home, parseRollout: { _, _ in
+        entered.signal(); release.wait(); return nil
+    })
+    DispatchQueue.global().async { _ = busyWorker.read(watchedIDs: [], forceDirectoryScan: false); readFinished.signal() }
+    let didEnter = entered.wait(timeout: .now() + 2) == .success
+    DispatchQueue.global().async { busyWorker.invalidateDirectories(paths: [fresh.path]); invalidated.signal() }
+    check(didEnter && invalidated.wait(timeout: .now() + 1) == .success,
+        "native directory invalidation does not wait for an in-progress parser/SQL scan lock")
+    // Release every candidate parse so the isolated worker cannot outlive this fixture.
+    for _ in 0..<20 { release.signal() }
+    check(readFinished.wait(timeout: .now() + 2) == .success, "the isolated concurrent directory reader finishes after its parser is released")
 }
 
 private func checkCanonicalIncrementalReplacement(_ check: (Bool, String) -> Void, home: URL) throws {
@@ -320,6 +520,10 @@ private func checkCompressedPingReceipts(_ check: (Bool, String) -> Void, home: 
     let compressedReceipt = PingReceipt.read(home: home, excluding: previous)
     check(compressedReceipt.threadID == id && compressedReceipt.turnID == turn && compressedReceipt.completed,
         "a compressed new ping retains exact thread and turn completion evidence")
+    try (compressedRolloutFixture(completed) + Data([0xff])).write(to: zipped)
+    check(!PingReceipt.completed(home: home, excluding: previous),
+        "a corrupt later compressed frame cannot publish an earlier completed ping")
+    try compressedRolloutFixture(completed).write(to: zipped)
     let alias = home.appendingPathComponent("sessions-alias")
     try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: directory)
     let compressedPrevious: Set<URL> = [alias.appendingPathComponent(old.lastPathComponent).appendingPathExtension("zst")]
@@ -447,4 +651,54 @@ private func checkCLICompatibilityBuild(_ check: (Bool, String) -> Void, root: U
         }
         state.sessions.stop(); state.usage.stop()
     }
+}
+
+@MainActor func checkSessionWatcherLifecycle(_ check: (Bool, String) -> Void, home: URL) async throws {
+    let sessions = home.appendingPathComponent("sessions")
+    try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+    var database: OpaquePointer?
+    guard sqlite3_open(home.appendingPathComponent("logs.sqlite").path, &database) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    defer { sqlite3_close(database) }
+    guard sqlite3_exec(database, "CREATE TABLE logs(id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, target TEXT, thread_id TEXT, feedback_log_body TEXT)", nil, nil, nil) == SQLITE_OK else { throw CodexConnectionError.invalidResponse }
+    let base = Date(timeIntervalSince1970: 1_792_800_000)
+    let clock = Date()
+    func trace(_ id: String, event: String) throws -> Data {
+        let rows: [[String: Any]] = [
+            ["type": "session_meta", "timestamp": ISO8601DateFormatter().string(from: base), "payload": ["id": id, "cwd": home.path]],
+            ["type": "event_msg", "timestamp": ISO8601DateFormatter().string(from: base.addingTimeInterval(1)),
+                "payload": ["type": event, "turn_id": "one"]]
+        ]
+        return try rows.reduce(into: Data()) { data, row in data.append(try JSONSerialization.data(withJSONObject: row)); data.append(10) }
+    }
+    let id = UUID().uuidString
+    let target = sessions.appendingPathComponent("rollout-\(id).jsonl")
+    try trace(id, event: "task_complete").write(to: target)
+    try FileManager.default.setAttributes([.modificationDate: base], ofItemAtPath: target.path)
+    for offset in 1...25 {
+        let newerID = UUID().uuidString
+        let newer = sessions.appendingPathComponent("rollout-\(newerID).jsonl")
+        try trace(newerID, event: "task_complete").write(to: newer)
+        try FileManager.default.setAttributes([.modificationDate: base.addingTimeInterval(Double(offset))], ofItemAtPath: newer.path)
+    }
+    let worker = SessionScanWorker(codexHome: home, now: { clock })
+    let watcher = SessionWatcher(codexHome: home, worker: worker)
+    defer { watcher.stop() }
+    func refreshed(_ action: () -> Void) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            var completed = false
+            func finish(_ value: Bool) { guard !completed else { return }; completed = true; continuation.resume(returning: value) }
+            watcher.onRefreshCompleted = { finish(true) }
+            action()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(false) }
+        }
+    }
+    let initial = await refreshed { watcher.start(interval: 3600) }
+    check(initial && !watcher.sessions.contains(where: { $0.id == id }), "the lifecycle fixture begins with an unwatched rollout outside the twenty recent files")
+    watcher.stop()
+    let handle = try FileHandle(forWritingTo: target)
+    try handle.truncate(atOffset: 0); try handle.write(contentsOf: trace(id, event: "task_started")); try handle.close()
+    let scans = worker.directoryFullScanCount
+    let restarted = await refreshed { watcher.start(interval: 3600) }
+    check(restarted && worker.directoryFullScanCount == scans + 1 && watcher.sessions.contains(where: { $0.id == id && $0.taskRunning }),
+        "reenabling monitoring performs a full first scan and finds an old rollout changed while native monitoring was stopped")
 }

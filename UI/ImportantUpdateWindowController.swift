@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-@MainActor final class ImportantUpdateWindowController: NSWindowController {
+@MainActor final class ImportantUpdateWindowController: NSWindowController, NSWindowDelegate {
     private let openReleasePage: (URL) -> Void
 
     init(openReleasePage: @escaping (URL) -> Void = { _ = NSWorkspace.shared.open($0) }) {
@@ -14,6 +14,12 @@ import SwiftUI
         fatalError("init(coder:) is unavailable")
     }
 
+    func windowWillClose(_ notification: Notification) {
+        guard let closed = notification.object as? NSWindow else { return }
+        closed.contentView = nil
+        if closed === window { window = nil }
+    }
+
     @discardableResult
     func show(_ release: AppRelease) -> Bool {
         guard let trusted = AppRelease(pageURL: release.pageURL), trusted.version == release.version else { return false }
@@ -24,6 +30,7 @@ import SwiftUI
             backing: .buffered,
             defer: false
         )
+        promptWindow.delegate = self
         promptWindow.title = "Codex Keeper"
         promptWindow.isReleasedWhenClosed = false
         let notes = ImportantUpdateNotes.paragraphs(

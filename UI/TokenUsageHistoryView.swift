@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 private enum TokenUsageHints {
-    static func today(_ analysis: TokenUsageHistoryAnalysis) -> String {
+    static func today(_ analysis: TokenUsageMenuSummary) -> String {
         L10n.text("今日 Token") + "\n" + (analysis.todayTokens.map(TokenUsageFormat.compact) ?? "—") + " Token"
     }
     static func estimate(_ estimate: TokenUsageEstimate, weekly: Bool) -> String {
@@ -10,7 +10,7 @@ private enum TokenUsageHints {
             (estimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token"
     }
     static var tps: String { L10n.text("tps 表示平均每秒生成的 Token 数，用来衡量输出速度。") }
-    static func info(_ analysis: TokenUsageHistoryAnalysis) -> String {
+    static func info(_ analysis: TokenUsageMenuSummary) -> String {
         var lines = [
             L10n.text("本机记录 · 输入含缓存，输出含推理"),
             L10n.text("近7日较前7日同期；今日尚未结束。空白表示没有记录，不代表零消耗。"),
@@ -242,7 +242,7 @@ private struct TokenUsageTPSAnchor: NSViewRepresentable {
 }
 
 private struct TokenUsageMetrics: View {
-    let analysis: TokenUsageHistoryAnalysis
+    let analysis: TokenUsageMenuSummary
     var tpsViewChanged: (NSView) -> Void = { _ in }
 
     var body: some View {
@@ -291,7 +291,7 @@ private struct TokenUsageMetrics: View {
         return convert(tpsView.bounds, from: tpsView)
     }
     var visibleHoverText: String? { hoverPanel.visibleText }
-    func update(_ analysis: TokenUsageHistoryAnalysis) {
+    func update(_ analysis: TokenUsageMenuSummary) {
         dismissHover()
         rootView = TokenUsageMetrics(analysis: analysis, tpsViewChanged: { [weak self] in self?.tpsView = $0 })
     }
@@ -334,7 +334,7 @@ private struct TokenUsageMetrics: View {
     private var hoverTimer: Timer?
     private var lastPointer: NSPoint?
 
-    init(analysis: TokenUsageHistoryAnalysis) {
+    init(analysis: TokenUsageMenuSummary) {
         metrics = TokenUsageMetricsHost(rootView: TokenUsageMetrics(analysis: analysis))
         super.init(frame: NSRect(x: 0, y: 0, width: 304, height: 234))
         metrics.frame = NSRect(x: 16, y: 14, width: 272, height: 78)
@@ -344,6 +344,10 @@ private struct TokenUsageMetrics: View {
         addSubview(chart)
         update(analysis)
     }
+    convenience init(analysis: TokenUsageHistoryAnalysis) {
+        self.init(analysis: TokenUsageMenuSummary(analysis))
+    }
+    func update(_ analysis: TokenUsageHistoryAnalysis) { update(TokenUsageMenuSummary(analysis)) }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func mouseDown(with event: NSEvent) { openHistory?() }
     func menuWillOpen() {
@@ -382,7 +386,7 @@ private struct TokenUsageMetrics: View {
     var visibleMetricHoverText: String? { metrics.visibleHoverText }
     var metricTPSFrame: NSRect { metrics.tpsHoverRect }
     func hoverMetric(at point: NSPoint) { metrics.hover(at: point) }
-    func update(_ analysis: TokenUsageHistoryAnalysis) {
+    func update(_ analysis: TokenUsageMenuSummary) {
         metrics.update(analysis)
         chart.days = analysis.days
         let metricsHeight: CGFloat = analysis.fiveHourEstimate.value != nil || analysis.weeklyEstimate.value != nil ? 78 : 52
@@ -408,11 +412,18 @@ struct TokenUsageHistoryView: View {
     @State private var pageEnd = Calendar.current.startOfDay(for: Date())
     @State private var expanded: Set<Date> = [Calendar.current.startOfDay(for: Date())]
     @State private var expandedWindows: Set<String> = []
-    private var analysis: TokenUsageHistoryAnalysis { history.analysis }
+    @State private var loadedPage: (Query, TokenUsageHistoryPage?)?
+    private struct Query: Equatable {
+        var end: Date
+        var revision: UInt64
+    }
+    private var query: Query { Query(end: pageEnd, revision: history.pageRevision) }
+    private var page: TokenUsageHistoryPage? { loadedPage?.0 == query ? loadedPage?.1 : nil }
+    private var analysis: TokenUsageMenuSummary { history.analysis }
     private var pageDays: [TokenUsageDay] {
         let calendar = analysis.calendar
         let end = calendar.startOfDay(for: pageEnd)
-        let byDate = Dictionary(uniqueKeysWithValues: analysis.historicalDays.map { ($0.date, $0) })
+        let byDate = Dictionary(uniqueKeysWithValues: (page?.days ?? []).map { ($0.date, $0) })
         return (-6...0).map { value in
             let date = calendar.date(byAdding: .day, value: value, to: end)!
             return byDate[date] ?? TokenUsageDay(date: date, segments: [])
@@ -425,6 +436,13 @@ struct TokenUsageHistoryView: View {
             details
         }.padding(24).frame(minWidth: 820, minHeight: 680)
             .background(Color(nsColor: .windowBackgroundColor))
+            .task(id: query) {
+                let requested = query
+                loadedPage = nil
+                let result = await history.page(ending: requested.end)
+                if !Task.isCancelled, requested == query { loadedPage = (requested, result) }
+            }
+            .onDisappear { loadedPage = nil }
     }
     private var overview: some View {
         HStack(alignment: .top, spacing: 14) {
@@ -475,7 +493,14 @@ struct TokenUsageHistoryView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text(L10n.text("每日用量")).font(.system(size: 13, weight: .semibold))
                     .padding(.horizontal, 12).padding(.top, 12)
-                historyList
+                if page != nil {
+                    historyList
+                } else if analysis.snapshot.isLoaded, loadedPage?.0 == query {
+                    Text(L10n.text("部分本机记录无法读取")).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
     }
@@ -519,9 +544,9 @@ struct TokenUsageHistoryView: View {
                             }
                         }.padding(.vertical, 10)
                     }
-                    if analysis.unknownTimeTokens > 0 {
+                    if page != nil && analysis.unknownTimeTokens > 0 {
                         DisclosureGroup {
-                            modelRows(analysis.snapshot.records.filter { $0.timestamp == nil }).padding(10)
+                            modelRows(page?.untimed ?? []).padding(10)
                         } label: {
                             HStack {
                                 Text(L10n.text("时间未知"))
