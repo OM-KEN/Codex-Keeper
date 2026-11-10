@@ -4,6 +4,8 @@
 
 **定时启动额度窗口，额度恢复后自动续跑。**
 
+<img width="4080" height="1593" alt="Frame 4-Lithed" src="https://github.com/user-attachments/assets/a47cde69-dc6e-4716-8d40-08396236a35e" />
+
 一个运行在 macOS 菜单栏里的 Codex 小工具：
 
 - **提前启动额度计时**：按你设置的每日计划，在用 Codex 前启动 5 小时额度窗口，方便按自己的作息安排使用。
