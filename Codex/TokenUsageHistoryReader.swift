@@ -791,6 +791,7 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
     private var timer: Timer?
     private var nextRefreshAt: Date?
     private var refreshing = false
+    private var pendingManualRefresh = false
     private var active = false
     private var observedAccount: String?
     private var hasObservedAccount = false
@@ -814,6 +815,7 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
 
     func stop() {
         active = false; generation += 1
+        pendingManualRefresh = false
         timer?.invalidate(); timer = nil; nextRefreshAt = nil
         if state != nil { clearPublished() }
     }
@@ -821,9 +823,16 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
     func refreshIfDue() {
         guard active else { return }
         let date = now()
-        let clockChanged = state.map { date < $0.capturedAt } ?? false
+        let capturedAt = state?.capturedAt ?? (analysis.snapshot.isLoaded ? analysis.snapshot.capturedAt : nil)
+        let clockChanged = capturedAt.map { date < $0 } ?? false
         if clockChanged || analysis.calendar.timeZone != Calendar.current.timeZone ||
             nextRefreshAt.map({ date >= $0 }) == true { refresh() }
+    }
+
+    func refreshNow() {
+        guard active else { return }
+        if refreshing { pendingManualRefresh = true; return }
+        refresh()
     }
 
     func authenticationDidChange(to accountID: String?) {
@@ -841,18 +850,22 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
         analysis = TokenUsageMenuSummary(TokenUsageHistoryAnalysis(snapshot: TokenUsageHistorySnapshot(accountID: nil), now: now()))
     }
 
-    private func refresh() {
-        guard active, !refreshing else { return }
-        refreshing = true
-        let date = now(), calendar = Calendar.current, previous = state
-        let priorCalendar = analysis.calendar, generation = self.generation
-        let deadline = date.addingTimeInterval(3600)
+    private func scheduleRefresh(at deadline: Date) {
         nextRefreshAt = deadline
         timer?.invalidate()
-        let timer = Timer(timeInterval: 3600, repeats: false) { [weak self] _ in
+        let timer = Timer(timeInterval: max(0, deadline.timeIntervalSince(now())), repeats: false) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         self.timer = timer; RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func refresh() {
+        guard active, !refreshing else { return }
+        refreshing = true; pendingManualRefresh = false
+        let date = now(), calendar = Calendar.current, previous = state
+        let priorCalendar = analysis.calendar, generation = self.generation
+        let deadline = date.addingTimeInterval(3600)
+        scheduleRefresh(at: deadline)
         queue.async { [weak self, reader] in
             let result = Result {
                 try autoreleasepool {
@@ -880,6 +893,8 @@ final class TokenUsageHistoryReader: @unchecked Sendable {
                     self.analysis = TokenUsageMenuSummary(TokenUsageHistoryAnalysis(snapshot: failed, now: date, calendar: calendar))
                 case .failure: break
                 }
+                if self.pendingManualRefresh || self.now() >= deadline { self.refresh() }
+                else { self.scheduleRefresh(at: deadline) }
             }
         }
     }

@@ -28,9 +28,9 @@ import SwiftUI
                     let five = QuotaWindow(usedPercent: Double(5 + index * 30), windowMinutes: 300,
                         resetsAt: start.addingTimeInterval(18000))
                     let weekly = QuotaWindow(usedPercent: Double((day + 14) * 5 + index), windowMinutes: 10080,
-                        resetsAt: today.addingTimeInterval(3 * 86400))
+                        resetsAt: today.addingTimeInterval(86400))
                     records.append(TokenUsageRecord(id: "\(day)-\(hour)-\(index)", threadID: "preview", accountID: "preview",
-                        timestamp: at, model: index == 2 ? "gpt-6-astra" : "gpt-6.1-sol", counts: counts,
+                        timestamp: at, model: "gpt-6.1-sol", counts: counts,
                         requestInput: input, serviceTier: "standard", samplingSeconds: Double(650 + index * 100),
                         fiveHour: five, weekly: weekly, planType: "plus"))
                 }
@@ -38,11 +38,13 @@ import SwiftUI
         }
         let snapshot = TokenUsageHistorySnapshot(accountID: "preview", records: records, currentPlan: "plus", capturedAt: now, isLoaded: true)
         let analysis = TokenUsageHistoryAnalysis(snapshot: snapshot, now: now)
+        precondition(analysis.fiveHourEstimate.value != nil && analysis.weeklyEstimate.value != nil,
+            "Preview fixtures must exercise the UI with both allowance estimates available")
         let outputIndex = CommandLine.arguments.firstIndex(of: "--output")
         let folder = URL(fileURLWithPath: outputIndex.flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil } ?? ".build/token-preview")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         func capture(_ view: NSView, _ size: NSSize, _ name: String, dark: Bool,
-                     hover: Bool = false, expandModels: Bool = false, hoverEstimate: Bool = false, hoverTPS: Bool = false) throws {
+                     hover: Bool = false, expandModels: Bool = false, hoverTPS: Bool = false) throws {
             let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
             let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: .borderless, backing: .buffered, defer: false)
             window.appearance = appearance
@@ -68,8 +70,7 @@ import SwiftUI
                 RunLoop.main.run(until: Date().addingTimeInterval(0.05))
                 let point = NSPoint(x: menu.chart.plotRect.minX + menu.chart.plotRect.width * 6.5 / 7,
                     y: menu.chart.plotRect.minY + 4)
-                if hoverEstimate { menu.hoverMetric(at: NSPoint(x: 20, y: 70)) }
-                else if hoverTPS { menu.hoverMetric(at: NSPoint(x: menu.metricTPSFrame.midX, y: menu.metricTPSFrame.midY)) }
+                if hoverTPS { menu.hoverMetric(at: NSPoint(x: menu.metricTPSFrame.midX, y: menu.metricTPSFrame.midY)) }
                 else { menu.chart.hover(at: point); menu.chart.displayIfNeeded() }
             }
             let bitmap = canvas.bitmapImageRepForCachingDisplay(in: canvas.bounds)!
@@ -81,7 +82,7 @@ import SwiftUI
                 let tooltip = content.bitmapImageRepForCachingDisplay(in: content.bounds)!
                 content.cacheDisplay(in: content.bounds, to: tooltip)
                 try tooltip.representation(using: .png, properties: [:])!.write(to: target.appendingPathComponent(
-                    hoverEstimate ? "estimate-tooltip.png" : hoverTPS ? "tps-tooltip.png" : "tooltip.png"))
+                    hoverTPS ? "tps-tooltip.png" : "tooltip.png"))
                 (view as? TokenUsageMenuView)?.menuDidClose()
             }
             window.orderOut(nil)
@@ -92,7 +93,6 @@ import SwiftUI
         for dark in [false, true] {
             try capture(menuView, menuView.frame.size, "menu", dark: dark)
             try capture(menuView, menuView.frame.size, "menu-hover", dark: dark, hover: true)
-            try capture(menuView, menuView.frame.size, "menu-estimate-hover", dark: dark, hover: true, hoverEstimate: true)
             try capture(menuView, menuView.frame.size, "menu-tps-hover", dark: dark, hover: true, hoverTPS: true)
             try capture(host, NSSize(width: 900, height: 800), "history", dark: dark)
             try capture(host, NSSize(width: 900, height: 800), "history-details", dark: dark, expandModels: true)

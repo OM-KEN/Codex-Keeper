@@ -571,15 +571,10 @@
 "Token 用量历史" = "Token Usage History";
 "仅采用 Plus 下同段完整定价、实测消耗超过25%的窗口，按消耗比例加权。" = "Uses Plus windows with fully priced, matched observations exceeding 25% usage, weighted by observed consumption.";
 "今日 Token" = "Today's tokens";
-"仅采用同模型同档位、可完整配对的 Plus 用量；每个窗口累计匹配消耗超过25%后按消耗比例加权。" = "Uses matched Plus usage for the same model and speed tier, weighted by consumption after each window exceeds 25% matched usage.";
-"未记录速度档位的历史按标准 API 价显示，不参与额度校准。" = "History without a recorded speed tier uses Standard API prices for display and is excluded from allowance calibration.";
-"额度估算基准：%@ · %@" = "Allowance calibration: %@ · %@";
-"标准" = "Standard";
+"未记录速度档位的历史按标准 API 价显示。" = "History without a recorded speed tier uses Standard API prices for display.";
 "当前模型或速度档位未知" = "Current model or speed tier is unknown";
 "同模型同档位的有效样本不足" = "Not enough eligible samples for the same model and speed tier";
 "今日 tps" = "Today's tps";
-"5小时真实额度估算" = "5-hour allowance estimate";
-"每周真实额度估算" = "Weekly allowance estimate";
 "tps 表示平均每秒生成的 Token 数，用来衡量输出速度。" = "tps is the average number of tokens generated per second, indicating output speed.";
 "用量趋势" = "Usage trend";
 "每日用量" = "Daily usage";
@@ -612,7 +607,7 @@
 "输入（含缓存）" = "Input (incl. cache)";
 "输出（含推理）" = "Output (incl. reasoning)";
 "近7日较前7日同期" = "Last 7 days vs. prior matched period";
-"近7日较前7日同期；今日尚未结束。空白表示没有记录，不代表零消耗。" = "Last 7 days vs. the prior matched period; today is partial. Blank days mean no records, not zero usage.";
+"今日尚未结束。空白表示没有记录，不代表零消耗。" = "Today is partial. Blank days mean no records, not zero usage.";
 "近七日 Token 用量，点击查看历史" = "Seven-day token usage; click for history";
 "部分记录缺失，点击查看历史" = "Some records are missing; click for history";
 "首次旧累计仅建立基线，未将继承历史重复计入。" = "Older initial totals establish a baseline; inherited history is not counted again.";

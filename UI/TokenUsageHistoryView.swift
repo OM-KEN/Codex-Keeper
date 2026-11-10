@@ -5,27 +5,18 @@ private enum TokenUsageHints {
     static func today(_ analysis: TokenUsageMenuSummary) -> String {
         L10n.text("今日 Token") + "\n" + (analysis.todayTokens.map(TokenUsageFormat.compact) ?? "—") + " Token"
     }
-    static func estimate(_ estimate: TokenUsageEstimate, weekly: Bool) -> String {
-        L10n.text(weekly ? "每周真实额度估算" : "5小时真实额度估算") + "\n" +
-            (estimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token"
-    }
     static var tps: String { L10n.text("tps 表示平均每秒生成的 Token 数，用来衡量输出速度。") }
     static func info(_ analysis: TokenUsageMenuSummary) -> String {
         var lines = [
             L10n.text("本机记录 · 输入含缓存，输出含推理"),
-            L10n.text("近7日较前7日同期；今日尚未结束。空白表示没有记录，不代表零消耗。"),
+            L10n.text("今日尚未结束。空白表示没有记录，不代表零消耗。"),
             L10n.text("跨午夜的5小时窗口全部计入开始日；未知窗口按记录时间显示。"),
             L10n.format("价格覆盖 %@ / %@ Token；时间未知 %@，账户未知 %@。",
                 TokenUsageFormat.compact(analysis.pricedTokens), TokenUsageFormat.compact(analysis.totalTimedTokens),
                 TokenUsageFormat.compact(analysis.unknownTimeTokens), TokenUsageFormat.compact(analysis.snapshot.unboundTokens)),
             L10n.text("API 等值按当前价格折算，非官方余额或账单；不含工具及未记录的速度费用。"),
-            L10n.text("仅采用同模型同档位、可完整配对的 Plus 用量；每个窗口累计匹配消耗超过25%后按消耗比例加权。"),
-            L10n.text("未记录速度档位的历史按标准 API 价显示，不参与额度校准。")
+            L10n.text("未记录速度档位的历史按标准 API 价显示。")
         ]
-        if let group = analysis.calibrationGroup {
-            let tier = group.serviceTier == "standard" ? L10n.text("标准") : group.serviceTier.capitalized
-            lines.insert(L10n.format("额度估算基准：%@ · %@", group.model, tier), at: 0)
-        } else if analysis.snapshot.isLoaded { lines.append(L10n.text("当前模型或速度档位未知")) }
         if !analysis.snapshot.isLoaded { lines.append(L10n.text("正在读取本机历史…")) }
         if analysis.snapshot.accountID == nil { lines.append(L10n.text("尚未确认当前账户")) }
         if analysis.snapshot.unreadableFiles > 0 { lines.append(L10n.text("部分本机记录无法读取")) }
@@ -246,39 +237,20 @@ private struct TokenUsageMetrics: View {
     var tpsViewChanged: (NSView) -> Void = { _ in }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(L10n.text("今日 Token")).font(.system(size: 11)).foregroundStyle(.secondary)
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text(analysis.todayTokens.map(TokenUsageFormat.compact) ?? "—")
-                        .font(.system(size: 22, weight: .semibold, design: .rounded))
-                    Text(TokenUsageFormat.tps(analysis.todaySpeed.value) + " tps")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
-                        .fixedSize()
-                        .background(TokenUsageTPSAnchor(changed: tpsViewChanged).allowsHitTesting(false))
-                        .help(TokenUsageHints.tps)
-                    Spacer(minLength: 0)
-                }
-            }.help(TokenUsageHints.today(analysis))
-            if analysis.fiveHourEstimate.value != nil || analysis.weeklyEstimate.value != nil {
-                HStack(spacing: 12) {
-                    if analysis.fiveHourEstimate.value != nil { metric(analysis.fiveHourEstimate, weekly: false) }
-                    if analysis.weeklyEstimate.value != nil { metric(analysis.weeklyEstimate, weekly: true) }
-                }
+        VStack(alignment: .leading, spacing: 4) {
+            Text(L10n.text("今日 Token")).font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(analysis.todayTokens.map(TokenUsageFormat.compact) ?? "—")
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                Text(TokenUsageFormat.tps(analysis.todaySpeed.value) + " tps")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                    .fixedSize()
+                    .background(TokenUsageTPSAnchor(changed: tpsViewChanged).allowsHitTesting(false))
+                    .help(TokenUsageHints.tps)
+                Spacer(minLength: 0)
             }
-        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    private func metric(_ estimate: TokenUsageEstimate, weekly: Bool) -> some View {
-        HStack(spacing: 4) {
-            Text(L10n.text(weekly ? "1周" : "5小时")).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize()
-            Text(estimate.value.map(TokenUsageFormat.dollars) ?? "—").font(.system(size: 13, weight: .medium)).fixedSize()
-            if let change = estimate.change {
-                Text(TokenUsageFormat.change(change)).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize()
-            }
-            Spacer(minLength: 0)
-        }.frame(maxWidth: .infinity, alignment: .leading)
-            .help(TokenUsageHints.estimate(estimate, weekly: weekly))
+        }.help(TokenUsageHints.today(analysis))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
@@ -311,16 +283,8 @@ private struct TokenUsageMetrics: View {
     func hover(at point: NSPoint) {
         guard bounds.contains(point) else { dismissHover(); return }
         let analysis = rootView.analysis
-        let hasFiveHour = analysis.fiveHourEstimate.value != nil, hasWeekly = analysis.weeklyEstimate.value != nil
-        let estimateRow = (hasFiveHour || hasWeekly) && (isFlipped ? point.y >= bounds.height - 24 : point.y <= 24)
-        let text: String
-        if !estimateRow {
-            let tpsRect = tpsHoverRect
-            text = !tpsRect.isEmpty && tpsRect.insetBy(dx: -3, dy: -5).contains(point) ? TokenUsageHints.tps : TokenUsageHints.today(analysis)
-        } else {
-            let weekly = !hasFiveHour || (hasWeekly && point.x > bounds.midX)
-            text = TokenUsageHints.estimate(weekly ? analysis.weeklyEstimate : analysis.fiveHourEstimate, weekly: weekly)
-        }
+        let tpsRect = tpsHoverRect
+        let text = !tpsRect.isEmpty && tpsRect.insetBy(dx: -3, dy: -5).contains(point) ? TokenUsageHints.tps : TokenUsageHints.today(analysis)
         hoverPanel.show(text, at: point, in: self)
     }
 }
@@ -336,10 +300,10 @@ private struct TokenUsageMetrics: View {
 
     init(analysis: TokenUsageMenuSummary) {
         metrics = TokenUsageMetricsHost(rootView: TokenUsageMetrics(analysis: analysis))
-        super.init(frame: NSRect(x: 0, y: 0, width: 304, height: 234))
-        metrics.frame = NSRect(x: 16, y: 14, width: 272, height: 78)
+        super.init(frame: NSRect(x: 0, y: 0, width: 304, height: 208))
+        metrics.frame = NSRect(x: 16, y: 14, width: 272, height: 52)
         addSubview(metrics)
-        chart.frame = NSRect(x: 16, y: 96, width: 272, height: 124)
+        chart.frame = NSRect(x: 16, y: 70, width: 272, height: 124)
         chart.openHistory = { [weak self] in self?.openHistory?() }
         addSubview(chart)
         update(analysis)
@@ -389,15 +353,6 @@ private struct TokenUsageMetrics: View {
     func update(_ analysis: TokenUsageMenuSummary) {
         metrics.update(analysis)
         chart.days = analysis.days
-        let metricsHeight: CGFloat = analysis.fiveHourEstimate.value != nil || analysis.weeklyEstimate.value != nil ? 78 : 52
-        if metrics.frame.height != metricsHeight {
-            metrics.setFrameSize(NSSize(width: 272, height: metricsHeight))
-            chart.setFrameOrigin(NSPoint(x: 16, y: metrics.frame.maxY + 4))
-            setFrameSize(NSSize(width: 304, height: chart.frame.maxY + 14))
-            lastPointer = nil
-            chart.dismissHover()
-            layoutSubtreeIfNeeded()
-        }
     }
 }
 
@@ -449,14 +404,6 @@ struct TokenUsageHistoryView: View {
             metric("今日 Token", analysis.todayTokens.map(TokenUsageFormat.compact) ?? "—",
                 hint: TokenUsageHints.today(analysis))
             metric("今日 tps", TokenUsageFormat.tps(analysis.todaySpeed.value), hint: TokenUsageHints.tps)
-            if let value = analysis.fiveHourEstimate.value {
-                metric("5小时真实额度估算", TokenUsageFormat.dollars(value),
-                    change: analysis.fiveHourEstimate.change, hint: TokenUsageHints.estimate(analysis.fiveHourEstimate, weekly: false))
-            }
-            if let value = analysis.weeklyEstimate.value {
-                metric("每周真实额度估算", TokenUsageFormat.dollars(value),
-                    change: analysis.weeklyEstimate.change, hint: TokenUsageHints.estimate(analysis.weeklyEstimate, weekly: true))
-            }
         }
     }
     private var trend: some View {
@@ -557,15 +504,12 @@ struct TokenUsageHistoryView: View {
                     }
             }.listStyle(.inset).scrollContentBackground(.hidden)
     }
-    private func metric(_ title: String, _ value: String, change: Double? = nil, hint: String) -> some View {
+    private func metric(_ title: String, _ value: String, hint: String) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 Text(L10n.text(title)).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(value).font(.system(size: 28, weight: .semibold, design: .rounded)).monospacedDigit()
-                        .lineLimit(1).minimumScaleFactor(0.85)
-                    if let change { Text(TokenUsageFormat.change(change)).font(.caption).monospacedDigit().foregroundStyle(.secondary) }
-                }
+                Text(value).font(.system(size: 28, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .lineLimit(1).minimumScaleFactor(0.85)
             }.frame(maxWidth: .infinity, minHeight: 68, alignment: .leading).padding(12)
         }.frame(maxWidth: .infinity, minHeight: 110, maxHeight: 110).help(hint)
     }

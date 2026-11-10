@@ -199,6 +199,8 @@ import Network
     func refresh(manual: Bool = false, source: String = "manual") {
         guard enabled else { return }
         if manual, runtimeReadFailed { try? restoreRuntime() }
+        if manual && (source == "button" || source == "manual") { tokenHistory.refreshNow() }
+        else { tokenHistory.refreshIfDue() }
         usage.refresh(manual: manual, source: source); sessions.refresh(); recompute(source: source)
     }
 
@@ -385,6 +387,7 @@ import Network
 
     func recompute(allowExecution: Bool = true, source: String = "state") {
         synchronizeMonitoring()
+        tokenHistory.refreshIfDue()
         let now = now()
         if monitoring && enabled { execution.maintainKeepAlive() }
         defer {

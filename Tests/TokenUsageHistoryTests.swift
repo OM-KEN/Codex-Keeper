@@ -15,10 +15,10 @@ import Combine
     private var ticks = 0
     private var step = 0
     private var pointer = NSPoint.zero
-    private var expandedHeight: CGFloat = 0
-    private var expandedChartY: CGFloat = 0
-    private var expandedMenuHeight: CGFloat = 0
-    private var expandedFollowingOffset: CGFloat = 0
+    private var compactHeight: CGFloat = 0
+    private var compactChartY: CGFloat = 0
+    private var compactMenuHeight: CGFloat = 0
+    private var compactFollowingOffset: CGFloat = 0
 
     init(menu: NSMenu, view: TokenUsageMenuView, followingView: NSView, availableAnalysis: TokenUsageHistoryAnalysis,
          unavailableAnalysis: TokenUsageHistoryAnalysis, weeklyOnlyAnalysis: TokenUsageHistoryAnalysis) {
@@ -57,8 +57,8 @@ import Combine
             return
         }
         if step == 0 {
-            expandedHeight = view.frame.height; expandedChartY = chart.frame.minY
-            expandedMenuHeight = window.frame.height; expandedFollowingOffset = followingOffset
+            compactHeight = view.frame.height; compactChartY = chart.frame.minY
+            compactMenuHeight = window.frame.height; compactFollowingOffset = followingOffset
             let bitmap = chart.bitmapImageRepForCachingDisplay(in: chart.bounds)!
             chart.cacheDisplay(in: chart.bounds, to: bitmap)
             let point = NSPoint(x: chart.plotRect.minX + chart.plotRect.width * 6.5 / 7, y: 24)
@@ -91,16 +91,15 @@ import Combine
                 pointer = window.convertPoint(toScreen: metrics.convert(NSPoint(x: 20, y: 70), to: nil))
             }
         } else if step == 5 {
-            results.append((view.visibleMetricHoverText == L10n.text("5小时真实额度估算") + "\n8.8K Token",
-                "actual menu tracking preserves the existing hint when an estimate is available"))
+            results.append((view.visibleMetricHoverText == nil,
+                "available estimates have no hidden metric hover in the actual menu loop"))
             view.update(unavailableAnalysis)
         } else if step == 6 {
-            let reduction = expandedHeight - view.frame.height
-            results.append((reduction > 0 && abs(expandedChartY - chart.frame.minY - reduction) < 0.1,
-                "hiding both estimates contracts the custom view and moves its chart up by \(reduction) points"))
-            results.append((abs(expandedMenuHeight - window.frame.height - reduction) < 0.1 &&
-                abs(expandedFollowingOffset - followingOffset - reduction) < 0.1,
-                "the live menu and following row move up with the hidden estimates: menu \(expandedMenuHeight)->\(window.frame.height), row \(expandedFollowingOffset)->\(followingOffset)"))
+            results.append((view.frame.height == compactHeight && chart.frame.minY == compactChartY && chart.frame.height == 124,
+                "removing available estimates preserves the compact menu and full chart height"))
+            results.append((abs(compactMenuHeight - window.frame.height) < 0.1 &&
+                abs(compactFollowingOffset - followingOffset) < 0.1,
+                "estimate availability leaves the live menu and following row at their compact positions"))
             view.hoverMetric(at: NSPoint(x: 20, y: 70))
             results.append((view.visibleMetricHoverText == nil,
                 "the removed estimate row has no invisible metric tooltip at its former position"))
@@ -108,34 +107,31 @@ import Combine
             moveToMetric(NSPoint(x: tpsFrame.midX, y: tpsFrame.midY))
         } else if step == 7 {
             results.append((view.visibleMetricHoverText == L10n.text("tps 表示平均每秒生成的 Token 数，用来衡量输出速度。"),
-                "TPS pointer tracking still works after the estimate row is removed"))
+                "TPS pointer tracking still works when estimate availability changes"))
             view.update(weeklyOnlyAnalysis)
             moveToMetric(NSPoint(x: 20, y: 70))
         } else if step == 8 {
-            results.append((view.frame.height == expandedHeight && chart.frame.minY == expandedChartY &&
-                abs(followingOffset - expandedFollowingOffset) < 0.1,
-                "a single weekly estimate restores one row and the live menu's following-item position"))
-            results.append((view.visibleMetricHoverText == L10n.text("每周真实额度估算") + "\n" +
-                (weeklyOnlyAnalysis.weeklyEstimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token",
-                "a weekly-only row maps its left-hand hover to the weekly estimate"))
+            results.append((view.frame.height == compactHeight && chart.frame.minY == compactChartY &&
+                abs(followingOffset - compactFollowingOffset) < 0.1,
+                "a weekly-only estimate cannot add a row or move the live menu's following item"))
+            results.append((view.visibleMetricHoverText == nil,
+                "a weekly-only estimate has no left-hand metric hover"))
             moveToMetric(NSPoint(x: 240, y: 70))
         } else if step == 9 {
-            results.append((view.visibleMetricHoverText == L10n.text("每周真实额度估算") + "\n" +
-                (weeklyOnlyAnalysis.weeklyEstimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token",
-                "a weekly-only row uses the same weekly hover across its available width"))
+            results.append((view.visibleMetricHoverText == nil,
+                "a weekly-only estimate has no right-hand metric hover"))
             view.update(availableAnalysis)
             moveToMetric(NSPoint(x: 20, y: 70))
         } else if step == 10 {
-            results.append((view.frame.height == expandedHeight && chart.frame.minY == expandedChartY &&
-                abs(window.frame.height - expandedMenuHeight) < 0.1 && abs(followingOffset - expandedFollowingOffset) < 0.1,
-                "restoring both estimates preserves the original chart, menu and following-row layout"))
-            results.append((view.visibleMetricHoverText == L10n.text("5小时真实额度估算") + "\n8.8K Token",
-                "restoring both estimates restores the left-hand five-hour hover"))
+            results.append((view.frame.height == compactHeight && chart.frame.minY == compactChartY &&
+                abs(window.frame.height - compactMenuHeight) < 0.1 && abs(followingOffset - compactFollowingOffset) < 0.1,
+                "restoring both estimates preserves the compact chart, menu and following-row layout"))
+            results.append((view.visibleMetricHoverText == nil,
+                "restoring both estimates cannot restore the left-hand metric hover"))
             moveToMetric(NSPoint(x: 240, y: 70))
         } else {
-            results.append((view.visibleMetricHoverText == L10n.text("每周真实额度估算") + "\n" +
-                (availableAnalysis.weeklyEstimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token",
-                "restoring both estimates restores the right-hand weekly hover"))
+            results.append((view.visibleMetricHoverText == nil,
+                "restoring both estimates cannot restore the right-hand metric hover"))
             timer.invalidate(); menu.cancelTracking()
         }
         step += 1
@@ -665,7 +661,11 @@ import Combine
     check(reader.read(now: now).unreadableFiles > 0, "token evidence without a valid owner header is partial history, never a complete zero")
 
     _ = NSApplication.shared
+    check(weighted.fiveHourEstimate.value != nil && weighted.weeklyEstimate.value != nil,
+        "the UI fixture carries both estimates even though allowance estimates are hidden")
     let menuView = TokenUsageMenuView(analysis: weighted)
+    check(menuView.frame.height == 208 && menuView.chart.frame.minY == 70 && menuView.chart.frame.height == 124,
+        "available estimates leave no blank row above the full-height seven-day chart")
     let window = NSWindow(contentRect: NSRect(origin: NSPoint(x: -10000, y: -10000), size: menuView.frame.size),
         styleMask: .borderless, backing: .buffered, defer: false)
     window.contentView = menuView; window.orderFrontRegardless()
@@ -714,12 +714,12 @@ import Combine
     check(menuView.visibleMetricHoverText?.contains(TokenUsageFormat.compact(10500)) == true,
         "the former right-aligned tps area no longer shows a stale tps tooltip")
     menuView.hoverMetric(at: NSPoint(x: 20, y: 70))
-    check(menuView.visibleMetricHoverText == L10n.text("5小时真实额度估算") + "\n8.8K Token",
-        "five-hour metric hover contains its title and full-window token estimate")
+    check(menuView.visibleMetricHoverText == nil,
+        "a valid five-hour estimate has no tooltip at its former metric position")
     menuView.hoverMetric(at: NSPoint(x: 240, y: 70))
-    check(menuView.visibleMetricHoverText == L10n.text("每周真实额度估算") + "\n" +
-        (weighted.weeklyEstimate.tokens.map(TokenUsageFormat.compact) ?? "—") + " Token",
-        "weekly metric hover uses its own full-window token estimate without extra copy")
+    check(menuView.visibleMetricHoverText == nil,
+        "a valid weekly estimate has no tooltip at its former metric position")
+    menuView.hoverMetric(at: NSPoint(x: tpsFrame.midX, y: tpsFrame.midY))
     menuView.menuDidClose()
     check(menuView.visibleMetricHoverText == nil, "closing the menu hides metric hover panels")
 
@@ -728,8 +728,9 @@ import Combine
     let fiveHourOnly = summarize(fiveHourOnlyRecords)
     menuView.update(fiveHourOnly)
     menuView.hoverMetric(at: NSPoint(x: 240, y: 70))
-    check(menuView.visibleMetricHoverText == L10n.text("5小时真实额度估算") + "\n8.8K Token",
-        "a five-hour-only row uses the available width without leaving a hidden weekly hover")
+    check(fiveHourOnly.fiveHourEstimate.value != nil && fiveHourOnly.weeklyEstimate.value == nil &&
+        menuView.visibleMetricHoverText == nil && menuView.frame.height == 208 && menuView.chart.frame.minY == 70,
+        "a five-hour-only estimate cannot add a metric row or an invisible tooltip")
     menuView.update(weighted)
     var weeklyOnlyRecords = pair
     for index in weeklyOnlyRecords.indices { weeklyOnlyRecords[index].fiveHour = nil }
@@ -1037,4 +1038,110 @@ private func checkCompressedTokenHistory(_ check: (Bool, String) -> Void, root: 
     let updated = await waitFor { observer.analysis.todayTokens == 200 }
     check(updated && observer.pageRevision > firstRevision && observer.analysis.snapshot.records.isEmpty,
         "the hourly batch publishes newly appended usage as a compact menu summary")
+    observer.stop()
+
+    for fail in [false, true] {
+        let blockedSupport = root.appendingPathComponent(fail ? "blocked-failure" : "blocked-success")
+        if fail {
+            try FileManager.default.createDirectory(at: blockedSupport.appendingPathComponent("token-usage.sqlite3"),
+                withIntermediateDirectories: true)
+        }
+        let blocked = TokenUsageHistoryObserver(home: home, support: blockedSupport, now: { clock })
+        defer { blocked.stop() }
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let worker = Mirror(reflecting: blocked).children.first { $0.label == "queue" }!.value as! DispatchQueue
+        worker.async { gate.wait() }
+        blocked.start()
+        let timer = Mirror(reflecting: blocked).children.first { $0.label == "timer" }!.value as! Timer
+        clock = clock.addingTimeInterval(3601)
+        timer.fireDate = Date().addingTimeInterval(0.01)
+        let fired = await waitFor { !timer.isValid }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let inFlight = Mirror(reflecting: blocked).children.first { $0.label == "refreshing" }!.value as! Bool
+        check(fired && inFlight, "a real one-shot history timer expires while its utility queue is blocked: \(fail)")
+        gate.signal()
+        let caughtUp = await waitFor {
+            let reflected = Mirror(reflecting: blocked)
+            let state = reflected.children.first { $0.label == "state" }?.value as? TokenUsageHistoryDatabaseState
+            let replacement = reflected.children.first { $0.label == "timer" }?.value as? Timer
+            let refreshing = reflected.children.first { $0.label == "refreshing" }?.value as? Bool
+            let capturedAt = fail ? blocked.analysis.snapshot.capturedAt : state?.capturedAt
+            return capturedAt == clock && replacement !== timer && replacement?.isValid == true && refreshing == false
+        }
+        check(caughtUp, "a completed history batch catches up and rearms after an in-flight timer expiry: \(fail)")
+    }
+
+    let suite = "keeper.token-refresh." + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set(true, forKey: "enabled")
+    let manualHome = root.appendingPathComponent("manual-home")
+    let manualFile = manualHome.appendingPathComponent("sessions/current.jsonl")
+    try FileManager.default.createDirectory(at: manualFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("{\"tokens\":{\"account_id\":\"account-a\"}}".utf8).write(to: manualHome.appendingPathComponent("auth.json"))
+    try trace("manual", at: Date().addingTimeInterval(-60)).write(to: manualFile)
+    let app = AppState(provider: TokenHistoryTestUsage(), defaults: defaults,
+        runtimeURL: root.appendingPathComponent("manual-support/pending-runtime.json"), codexHome: manualHome, startMonitoring: false)
+    defer { app.tokenHistory.stop(); app.usage.stop(); app.sessions.stop() }
+    app.tokenHistory.start()
+    let appLoaded = await waitFor { app.tokenHistory.analysis.todayTokens == 100 }
+    check(appLoaded, "manual refresh fixture starts with an active local history observer")
+    let append = try FileHandle(forWritingTo: manualFile)
+    defer { try? append.close() }
+    try append.seekToEnd()
+    try append.write(contentsOf: tokens(200, at: Date().addingTimeInterval(-1)))
+    app.refresh(manual: true, source: "menu_open")
+    let menuPage = await app.tokenHistory.page(ending: Date())
+    check(app.tokenHistory.analysis.todayTokens == 100 && menuPage?.days.last?.total == 100,
+        "an ordinary menu opening checks the history deadline without importing before the hour")
+    app.refresh(manual: true, source: "button")
+    let manuallyUpdated = await waitFor { app.tokenHistory.analysis.todayTokens == 200 }
+    check(manuallyUpdated, "the explicit refresh button imports local token statistics before the hour")
+
+    clock = Date()
+    let pending = TokenUsageHistoryObserver(home: manualHome, support: root.appendingPathComponent("pending-support"), now: { clock })
+    defer { pending.stop() }
+    pending.start()
+    let pendingLoaded = await waitFor { pending.analysis.todayTokens == 200 }
+    check(pendingLoaded, "in-flight manual refresh fixture starts from the latest committed statistics")
+    let pendingGate = DispatchSemaphore(value: 0)
+    defer { pendingGate.signal() }
+    let pendingWorker = Mirror(reflecting: pending).children.first { $0.label == "queue" }!.value as! DispatchQueue
+    pendingWorker.async { pendingGate.wait() }
+    pending.refreshNow()
+    clock = clock.addingTimeInterval(1)
+    try append.write(contentsOf: tokens(300, at: clock))
+    pending.refreshNow(); pending.refreshNow()
+    pendingGate.signal()
+    let pendingUpdated = await waitFor { pending.analysis.todayTokens == 300 }
+    check(pendingUpdated,
+        "manual requests during an active history batch coalesce into a subsequent batch with the later cutoff")
+
+    let rollbackSupport = root.appendingPathComponent("failed-clock-rollback")
+    let invalidDatabase = rollbackSupport.appendingPathComponent("token-usage.sqlite3")
+    try FileManager.default.createDirectory(at: invalidDatabase, withIntermediateDirectories: true)
+    let rollback = TokenUsageHistoryObserver(home: manualHome, support: rollbackSupport, now: { clock })
+    defer { rollback.stop() }
+    rollback.start()
+    let failedFirstBatch = await waitFor {
+        rollback.analysis.snapshot.isLoaded && rollback.analysis.snapshot.unreadableFiles > 0
+    }
+    check(failedFirstBatch, "clock rollback fixture publishes its first failed history batch")
+    let failedRevision = rollback.pageRevision
+    try FileManager.default.removeItem(at: invalidDatabase)
+    clock = clock.addingTimeInterval(-7200)
+    rollback.refreshIfDue()
+    let recoveredAfterRollback = await waitFor {
+        rollback.analysis.snapshot.accountID == "account-a" &&
+            rollback.analysis.snapshot.unreadableFiles == 0 && rollback.pageRevision > failedRevision
+    }
+    check(recoveredAfterRollback,
+        "clock rollback retries a failed first history batch before its old future deadline")
+}
+
+private struct TokenHistoryTestUsage: UsageProvider {
+    func read() throws -> UsageSnapshot {
+        UsageSnapshot(fiveHour: nil, weekly: nil, capturedAt: Date(), accountID: "account-a", sourceFile: "app-server")
+    }
 }
