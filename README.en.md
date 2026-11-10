@@ -23,7 +23,7 @@ This is a beta for local Codex tasks. Scheduled keep-alives require access to `g
 
 Keep-alive and auto-resume are enabled by default. Click the menu bar icon to view quota, tasks, and settings. Local quota changes update the display, with periodic online checks. Turning off Enable Keeper pauses keep-alives, auto-resume, and quota monitoring; turning it back on restores them.
 
-The current development branch also provides an independent **Enable Keepalive** switch. Turning it off keeps quota monitoring and auto-resume available. This switch is not yet included in the published v1.1.0 installer.
+The upcoming v1.2.0 provides an independent **Enable Keepalive** switch; turning it off keeps quota monitoring and auto-resume available. It also adds a seven-day local token chart in the menu. Click it to view history, output speed, and the API equivalent of recorded usage. Local statistics update hourly or immediately when you click Refresh, and exclude cloud tasks and tasks on other devices. These features are not yet included in the published v1.1.0 installer.
 
 Keep Keeper running and your Mac awake and online while using it.
 
