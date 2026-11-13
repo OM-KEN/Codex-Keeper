@@ -1,16 +1,23 @@
-# v1.2.0 中文发布说明草稿
+# v1.2.0 发布说明
 
-比较基线为正式标签 v1.1.0。以下中文草稿仅供参考；最终说明待 OM 提供，收到后再补对应英文并按授权发布。本文件不表示已发布。
+比较基线为正式标签 v1.1.0。中文采用 OM 于 2026-11-13 提供的最终文案，英文逐条对应。
 
 <!-- keeper-important-update: 1.1.0 -->
 
+## What's New
+
+- You can now see local Token usage in the menu, along with charts, history, and tps! And if you happen to spot some odd gpt-6-luna usage, don't worry, that's from keepalive!
+- Keepalive can now be turned off on its own, though I haven't yet thought of a reason to do so.
+
+## Fixes
+
+- Improved some performance, fixed some bugs, ate some fruit.
+
 ## 新功能
 
-- 新增本机 Token 用量统计：菜单查看近七日图表，点开查看历史明细、输出速度和已用量的 API 等值。
-- 保活可以单独开关，关闭后仍可查看额度、使用自动续跑。
+- 现在菜单里可以看本机 Token 用量了，还有图表、历史和tps！另外，如果你不小心看到了gpt-6-luna的一些奇怪的使用量，别担心，那是保活用掉的！
+- 保活现在可以单独被关闭了，虽然我暂时还没想到单独关掉它的原因。
 
 ## 修复
 
-- 优化后台资源占用，减少重复读取，历史详情按需加载。
-- 修复部分情况下用量统计停止刷新的问题；每小时自动更新，点击刷新也能立即更新本机用量。
-- 改善压缩会话记录的识别，修正额度耗尽、读取失败和周额度提前重置时的部分提示。
+- 优化了些性能、修了些漏洞、吃了些水果。
